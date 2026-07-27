@@ -6,6 +6,8 @@ currently selected node, so you can return to any earlier state and branch off
 in a new direction. Images, trees, and rendered results persist across
 restarts.
 
+![Picky screenshot: a posterized locomotive photo with its RGB cluster plot and work tree](docs/screenshot.png)
+
 ## Features
 
 - **Image catalog** — upload JPGs (file picker or drag-and-drop); everything

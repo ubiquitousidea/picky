@@ -529,9 +529,15 @@ async function init() {
   });
 
   await refreshGallery();
+  // deep links (?image=2&node=28) win over the last-viewed image
+  const q = new URLSearchParams(location.search);
+  const qImage = Number(q.get("image"));
   const last = Number(localStorage.getItem("picky:lastImage"));
-  const target = state.images.find((i) => i.id === last) || state.images[0];
-  if (target) await selectImage(target.id);
+  const target =
+    state.images.find((i) => i.id === qImage) ||
+    state.images.find((i) => i.id === last) ||
+    state.images[0];
+  if (target) await selectImage(target.id, Number(q.get("node")) || null);
 }
 
 init();
