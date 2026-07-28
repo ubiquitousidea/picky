@@ -6,7 +6,7 @@ currently selected node, so you can return to any earlier state and branch off
 in a new direction. Images, trees, and rendered results persist across
 restarts.
 
-![Picky screenshot: a posterized locomotive photo with its RGB cluster plot and a work tree drawn as a commit-graph DAG with a branch and a blend merge](docs/screenshot.png)
+![Picky screenshot: the effect picker as a row of icon buttons with Posterize selected, a posterized crocus photo, its RGB cluster plot, and a work tree drawn as a commit-graph DAG with a branch and blend merges](docs/screenshot.png)
 
 ## Features
 
