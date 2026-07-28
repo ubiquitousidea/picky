@@ -97,6 +97,21 @@ Key invariants that cut across files:
   coercion from drifting between "create a node" and "edit a node". The blend
   target picker is found by the `.blend-with` class *scoped to its container*,
   not a global id, so two of them can coexist while the modal is open.
+- **The effect picker is a row of icon buttons, and its selection lives in
+  `state.effect`** — not in the DOM, as it did when it was a `<select>`.
+  `EFFECT_BUTTONS` in `web/app.js` maps one button to one or more registry
+  effects, `setEffect()` is the single write path (retoggle buttons → rebuild
+  params → re-preview), and each icon is inline SVG painting with
+  `currentColor` so it takes its hue from the `.fx-<name>` class already on the
+  button. Posterize and Floyd–Steinberg dither share one button with a **Method**
+  dropdown, because they are the same idea with different palette algorithms.
+  That grouping is presentation only: `EFFECTS` still holds two entries, nodes
+  still store `posterize` or `dither`, and the cluster plot is still
+  posterize-only. The Method row is built by `renderEffectControls()`, *not*
+  `buildParamControls()` — the edit modal shares the latter and must never grow
+  the control, since `PATCH` edits params, not a node's effect. Its `<select>`
+  deliberately carries no `data-param`, which is what keeps `readParams()` from
+  posting it as one.
 - **Deletes cascade through both parent links** (`db.delete_node`'s recursive
   CTE), and no deletion order is FK-safe for two-parent graphs, so deletes run
   with `PRAGMA defer_foreign_keys = ON`. File cleanup (render/thumb/clusters)

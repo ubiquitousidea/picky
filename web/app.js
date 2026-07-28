@@ -1,5 +1,6 @@
 const state = {
   effects: [],
+  effect: null,    // name of the effect the Apply panel is set to
   images: [],
   imageId: null,
   nodes: [],       // flat node list for the selected image
@@ -71,7 +72,7 @@ function renderSelection() {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
   }
-  if ($("effect-select").value === "blend") renderEffectControls();
+  if (state.effect === "blend") renderEffectControls();
   renderTree();
   updatePresetControls();
   updateClusterPlot();
@@ -352,6 +353,167 @@ function renderTree() {
   for (const row of rows) container.appendChild(buildTreeRow(row, laneCount, laneWidth));
 }
 
+// ---------- Effect picker ----------
+
+// Each button gets a small graphic of what the effect does. They paint with
+// currentColor, so an icon takes its hue from the .fx-* class already on the
+// button — the same idiom as the work tree's rail dot.
+const iconSvg = () => svgEl("svg", { viewBox: "0 0 24 24" });
+
+// a 2D Gaussian as a monochromatic heatmap; kept smooth on purpose, a cell grid
+// here would read as pixelate
+function iconBlur() {
+  const svg = iconSvg();
+  const grad = svgEl("radialGradient", { id: "fx-gauss" });
+  for (const [offset, opacity] of [[0, 1], [25, 0.78], [50, 0.37], [75, 0.11], [100, 0]]) {
+    grad.appendChild(svgEl("stop", {
+      offset: `${offset}%`, "stop-color": "currentColor", "stop-opacity": opacity,
+    }));
+  }
+  const defs = svgEl("defs", {});
+  defs.appendChild(grad);
+  svg.append(defs, svgEl("rect", { x: 0, y: 0, width: 24, height: 24, fill: "url(#fx-gauss)" }));
+  return svg;
+}
+
+// roughly parallel squiggles — the offsets keep them from looking ruled
+function iconEdges() {
+  const svg = iconSvg();
+  [0, -1.5, 0.8].forEach((dx, i) => {
+    const y = 5.5 + i * 6.5;
+    svg.appendChild(svgEl("path", {
+      d: `M ${1.5 + dx} ${y} q 3.2 -4 6.4 0 t 6.4 0 t 6.4 0`,
+      fill: "none", stroke: "currentColor", "stroke-width": 1.6, "stroke-linecap": "round",
+    }));
+  });
+  return svg;
+}
+
+// bars stepping in tone: the flat color bands posterizing produces
+function iconPosterize() {
+  const svg = iconSvg();
+  [1, 0.75, 0.5, 0.3, 0.15].forEach((opacity, i) => {
+    svg.appendChild(svgEl("rect", {
+      x: 2 + i * 4.2, y: 3, width: 3.4, height: 18, rx: 0.6,
+      fill: "currentColor", "fill-opacity": opacity,
+    }));
+  });
+  return svg;
+}
+
+// a 4x4 grid of blocks, toned like a heavily downsampled image
+function iconPixelate() {
+  const svg = iconSvg();
+  const tones = [
+    0.95, 0.7, 0.45, 0.2,
+    0.75, 0.9, 0.3, 0.5,
+    0.4, 0.55, 0.85, 0.65,
+    0.15, 0.35, 0.6, 1,
+  ];
+  tones.forEach((opacity, i) => {
+    svg.appendChild(svgEl("rect", {
+      x: 1.5 + (i % 4) * 5.4, y: 1.5 + Math.floor(i / 4) * 5.4,
+      width: 5, height: 5, fill: "currentColor", "fill-opacity": opacity,
+    }));
+  });
+  return svg;
+}
+
+// two nodes merging into one, drawn with the same curve the DAG rail uses
+function iconBlend() {
+  const svg = iconSvg();
+  for (const x of [5, 19]) {
+    svg.appendChild(svgEl("path", {
+      d: `M ${x} 5 C ${x} 19, 12 5, 12 19`,
+      fill: "none", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round",
+    }));
+  }
+  for (const [cx, cy] of [[5, 5], [19, 5], [12, 19]]) {
+    svg.appendChild(svgEl("circle", { cx, cy, r: 2.6, fill: "currentColor" }));
+  }
+  return svg;
+}
+
+// The picker groups posterize + dither behind one button — same idea (reduce to
+// N colors), different palette algorithm — so choosing between them is a Method
+// dropdown rather than two icons. Presentation only: the registry, the stored
+// effect names, and the tree still treat them as two separate effects.
+const EFFECT_BUTTONS = [
+  { key: "blur", label: "Gaussian blur", icon: iconBlur, effects: ["blur"] },
+  { key: "edges", label: "Sobel edges", icon: iconEdges, effects: ["edges"] },
+  {
+    key: "posterize",
+    label: "Posterize",
+    icon: iconPosterize,
+    effects: ["posterize", "dither"],
+    methods: { posterize: "k-means clustering", dither: "Floyd–Steinberg dither" },
+  },
+  { key: "pixelate", label: "Pixelate", icon: iconPixelate, effects: ["pixelate"] },
+  { key: "blend", label: "Blend with…", icon: iconBlend, effects: ["blend"] },
+];
+
+const groupFor = (name) => EFFECT_BUTTONS.find((g) => g.effects.includes(name));
+
+// which effect a grouped button was last left on, so leaving posterize on
+// Floyd–Steinberg and coming back does not silently reset to k-means
+const lastMethod = {};
+
+function buildEffectButtons() {
+  const box = $("effect-buttons");
+  for (const group of EFFECT_BUTTONS) {
+    const btn = document.createElement("button");
+    btn.className = `fx-btn fx-${group.key}`;
+    btn.dataset.group = group.key;
+    // an inline <svg> has no alt, so the name of the effect goes on the button
+    btn.title = group.label;
+    btn.setAttribute("aria-label", group.label);
+    const svg = group.icon();
+    svg.setAttribute("aria-hidden", "true");
+    btn.appendChild(svg);
+    btn.onclick = () => setEffect(lastMethod[group.key] || group.effects[0]);
+    box.appendChild(btn);
+  }
+}
+
+// The selected effect lives in state, not in the DOM. Single write path: every
+// change rebuilds the params and re-renders any running preview.
+function setEffect(name) {
+  const group = groupFor(name);
+  state.effect = name;
+  lastMethod[group.key] = name;
+  document.querySelectorAll("#effect-buttons .fx-btn").forEach((btn) => {
+    const on = btn.dataset.group === group.key;
+    btn.classList.toggle("selected", on);
+    btn.setAttribute("aria-pressed", on);
+  });
+  renderEffectControls();
+  if (preview.active) schedulePreview();
+}
+
+// A grouped button picks its effect here rather than in buildParamControls(),
+// which the edit modal shares: PATCH edits params, not the effect, so the modal
+// must never grow this control. No data-param, so readParams() walks past it.
+function buildMethodRow(group) {
+  const row = document.createElement("div");
+  row.className = "param-row";
+  const label = document.createElement("label");
+  const nameSpan = document.createElement("span");
+  nameSpan.textContent = "Method";
+  label.appendChild(nameSpan);
+  const sel = document.createElement("select");
+  sel.className = "fx-method";
+  for (const [name, text] of Object.entries(group.methods)) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = text;
+    sel.appendChild(opt);
+  }
+  sel.value = state.effect;
+  sel.onchange = () => setEffect(sel.value);
+  row.append(label, sel);
+  return row;
+}
+
 // ---------- Effects ----------
 
 // The Apply panel and the edit modal both build their controls here and read
@@ -438,7 +600,7 @@ function appendBlendTarget(container, { text, excludeId, selected = null, maxId 
 
 function renderEffectControls() {
   const box = $("effect-params");
-  const effect = buildParamControls(box, $("effect-select").value);
+  const effect = buildParamControls(box, state.effect);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {
     const hasTarget = appendBlendTarget(box, {
@@ -447,6 +609,8 @@ function renderEffectControls() {
     });
     canApply = canApply && hasTarget;
   }
+  const group = groupFor(state.effect);
+  if (group.methods) box.prepend(buildMethodRow(group));
   $("apply-btn").disabled = !canApply;
   $("preview-btn").disabled = !canApply;
 }
@@ -465,7 +629,7 @@ function readParams(container, effectName) {
 }
 
 function readEffectForm() {
-  return readParams($("effect-params"), $("effect-select").value);
+  return readParams($("effect-params"), state.effect);
 }
 
 async function applyEffect() {
@@ -1025,18 +1189,8 @@ async function deleteImage() {
 
 async function init() {
   state.effects = await api("/api/effects");
-  const select = $("effect-select");
-  for (const e of state.effects) {
-    const opt = document.createElement("option");
-    opt.value = e.name;
-    opt.textContent = e.label;
-    select.appendChild(opt);
-  }
-  select.onchange = () => {
-    renderEffectControls();
-    if (preview.active) schedulePreview();
-  };
-  renderEffectControls();
+  buildEffectButtons();
+  setEffect(EFFECT_BUTTONS[0].effects[0]);
 
   initZoom();
   initClusterPlot();
