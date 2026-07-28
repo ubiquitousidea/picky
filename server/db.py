@@ -135,22 +135,40 @@ def create_node(
     return get_node(node_id)
 
 
-def delete_node(node_id: int) -> list[int]:
-    """Delete a node and everything derived from it — children via either
-    parent link, so blends that used a deleted node go too. Returns deleted ids."""
+def update_node_params(node_id: int, params: dict, parent2_id: int | None) -> dict:
+    """Change an existing node's settings in place. The node keeps its id and its
+    place in the tree, so everything derived from it is now stale — the caller
+    must invalidate the cached renders of its whole descendant closure
+    (see descendant_ids)."""
     with connect() as conn:
-        ids = [
-            r["id"]
-            for r in conn.execute(
-                """WITH RECURSIVE sub(id) AS (
+        conn.execute(
+            "UPDATE nodes SET params = ?, parent2_id = ? WHERE id = ?",
+            (json.dumps(params), parent2_id, node_id),
+        )
+    return get_node(node_id)
+
+
+DESCENDANT_CTE = """WITH RECURSIVE sub(id) AS (
                      SELECT id FROM nodes WHERE id = ?
                      UNION
                      SELECT n.id FROM nodes n
                      JOIN sub s ON n.parent_id = s.id OR n.parent2_id = s.id
-                   ) SELECT id FROM sub""",
-                (node_id,),
-            ).fetchall()
-        ]
+                   ) SELECT id FROM sub"""
+
+
+def descendant_ids(node_id: int) -> list[int]:
+    """The node itself plus everything derived from it, through either parent
+    link. Read-only twin of delete_node's traversal — UNION (not UNION ALL) so a
+    diamond, where two branches meet at a blend, is visited once."""
+    with connect() as conn:
+        return [r["id"] for r in conn.execute(DESCENDANT_CTE, (node_id,)).fetchall()]
+
+
+def delete_node(node_id: int) -> list[int]:
+    """Delete a node and everything derived from it — children via either
+    parent link, so blends that used a deleted node go too. Returns deleted ids."""
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute(DESCENDANT_CTE, (node_id,)).fetchall()]
         # a blend's second parent may appear after the blend in traversal order,
         # so no deletion order is always safe — defer FK checks to commit instead
         conn.execute("PRAGMA defer_foreign_keys = ON")
@@ -231,3 +249,25 @@ def create_preset(name: str, steps: list[dict]) -> dict:
 def delete_preset(preset_id: int) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
+
+
+def stats() -> dict:
+    """Row counts for the library stats screen."""
+    with connect() as conn:
+        def one(sql: str) -> int:
+            return conn.execute(sql).fetchone()[0]
+
+        return {
+            "images": one("SELECT COUNT(*) FROM images"),
+            "nodes": one("SELECT COUNT(*) FROM nodes"),
+            "edits": one("SELECT COUNT(*) FROM nodes WHERE effect IS NOT NULL"),
+            "presets": one("SELECT COUNT(*) FROM presets"),
+            "by_effect": [
+                dict(r)
+                for r in conn.execute(
+                    """SELECT effect, COUNT(*) AS count FROM nodes
+                       WHERE effect IS NOT NULL
+                       GROUP BY effect ORDER BY count DESC, effect"""
+                )
+            ],
+        }

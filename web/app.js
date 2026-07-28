@@ -312,6 +312,16 @@ function buildTreeRow(row, laneCount, laneWidth) {
     div.appendChild(span);
   }
   if (node.parent_id !== null) {
+    const edit = document.createElement("button");
+    edit.className = "node-edit";
+    edit.textContent = "✎";
+    edit.title = "Change this effect's settings (re-renders everything below it)";
+    edit.onclick = (e) => {
+      e.stopPropagation();
+      openEdit(node);
+    };
+    div.appendChild(edit);
+
     const del = document.createElement("button");
     del.className = "node-del";
     del.textContent = "×";
@@ -344,12 +354,15 @@ function renderTree() {
 
 // ---------- Effects ----------
 
-function renderEffectControls() {
-  const select = $("effect-select");
-  const effect = state.effects.find((e) => e.name === select.value);
-  const box = $("effect-params");
-  box.innerHTML = "";
+// The Apply panel and the edit modal both build their controls here and read
+// them back through readParams(), so the two can never disagree about ranges,
+// defaults, or how a value is coerced. `values` seeds the controls — empty for
+// Apply (fresh defaults), an existing node's params when editing.
+function buildParamControls(container, effectName, values = {}) {
+  const effect = state.effects.find((e) => e.name === effectName);
+  container.innerHTML = "";
   for (const p of effect.params) {
+    const current = values[p.name] ?? p.default;
     const row = document.createElement("div");
     row.className = "param-row";
     const label = document.createElement("label");
@@ -365,71 +378,94 @@ function renderEffectControls() {
         opt.textContent = optName;
         sel.appendChild(opt);
       }
-      sel.value = p.default;
+      sel.value = p.options.includes(current) ? current : p.default;
       row.append(label, sel);
     } else {
       const valSpan = document.createElement("span");
-      valSpan.textContent = p.default;
+      valSpan.textContent = current;
       label.appendChild(valSpan);
       const input = document.createElement("input");
       input.type = "range";
       input.min = p.min;
       input.max = p.max;
       if (p.step !== undefined) input.step = p.step;
-      input.value = p.default;
+      input.value = current;
       input.dataset.param = p.name;
       input.oninput = () => (valSpan.textContent = input.value);
       row.append(label, input);
     }
-    box.appendChild(row);
+    container.appendChild(row);
   }
+  return effect;
+}
 
+// Blend's second input is not a registry param (it names a node), so it gets
+// appended separately. `maxId` mirrors the server's cycle guard when editing:
+// ids are topological, so only a smaller id is guaranteed not to be downstream.
+// Returns false when there is nothing to blend with.
+function appendBlendTarget(container, { text, excludeId, selected = null, maxId = null }) {
+  const others = state.nodes.filter(
+    (n) => n.id !== excludeId && (maxId === null || n.id < maxId)
+  );
+  const row = document.createElement("div");
+  row.className = "param-row";
+  const label = document.createElement("label");
+  const nameSpan = document.createElement("span");
+  nameSpan.textContent = text;
+  label.appendChild(nameSpan);
+  const sel = document.createElement("select");
+  sel.className = "blend-with";
+  for (const n of others) {
+    const opt = document.createElement("option");
+    opt.value = n.id;
+    opt.textContent = `#${n.id} ${nodeLabel(n)}${n.params ? " · " + nodeParamsText(n) : ""}`;
+    sel.appendChild(opt);
+  }
+  if (selected !== null && others.some((n) => n.id === selected)) sel.value = selected;
+  row.append(label, sel);
+  container.appendChild(row);
+
+  // the weight param only affects the "average" mode
+  const modeSel = container.querySelector('[data-param="mode"]');
+  const weightRow = container.querySelector('[data-param="weight"]')?.closest(".param-row");
+  if (modeSel && weightRow) {
+    const syncWeight = () => (weightRow.hidden = modeSel.value !== "average");
+    modeSel.addEventListener("change", syncWeight);
+    syncWeight();
+  }
+  return others.length > 0;
+}
+
+function renderEffectControls() {
+  const box = $("effect-params");
+  const effect = buildParamControls(box, $("effect-select").value);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {
-    const others = state.nodes.filter((n) => n.id !== state.nodeId);
-    const row = document.createElement("div");
-    row.className = "param-row";
-    const label = document.createElement("label");
-    const nameSpan = document.createElement("span");
-    nameSpan.textContent = "Blend selected node with";
-    label.appendChild(nameSpan);
-    const sel = document.createElement("select");
-    sel.id = "blend-with";
-    for (const n of others) {
-      const opt = document.createElement("option");
-      opt.value = n.id;
-      opt.textContent = `#${n.id} ${nodeLabel(n)}${n.params ? " · " + nodeParamsText(n) : ""}`;
-      sel.appendChild(opt);
-    }
-    row.append(label, sel);
-    box.appendChild(row);
-    canApply = canApply && others.length > 0;
-
-    // the weight param only affects the "average" mode
-    const modeSel = box.querySelector('[data-param="mode"]');
-    const weightRow = box.querySelector('[data-param="weight"]')?.closest(".param-row");
-    if (modeSel && weightRow) {
-      const syncWeight = () => (weightRow.hidden = modeSel.value !== "average");
-      modeSel.addEventListener("change", syncWeight);
-      syncWeight();
-    }
+    const hasTarget = appendBlendTarget(box, {
+      text: "Blend selected node with",
+      excludeId: state.nodeId,
+    });
+    canApply = canApply && hasTarget;
   }
   $("apply-btn").disabled = !canApply;
   $("preview-btn").disabled = !canApply;
 }
 
-function readEffectForm() {
-  const effect = $("effect-select").value;
+function readParams(container, effectName) {
   const params = {};
-  document.querySelectorAll("#effect-params [data-param]").forEach((el) => {
+  container.querySelectorAll("[data-param]").forEach((el) => {
     params[el.dataset.param] = el.type === "range" ? Number(el.value) : el.value;
   });
   let parent2_id = null;
-  if (effect === "blend") {
-    const withSel = $("blend-with");
+  if (effectName === "blend") {
+    const withSel = container.querySelector(".blend-with");
     parent2_id = withSel && withSel.value ? Number(withSel.value) : null;
   }
-  return { effect, params, parent2_id };
+  return { effect: effectName, params, parent2_id };
+}
+
+function readEffectForm() {
+  return readParams($("effect-params"), $("effect-select").value);
 }
 
 async function applyEffect() {
@@ -460,16 +496,32 @@ async function applyEffect() {
 
 // ---------- Effect preview (uncommitted) ----------
 
-const preview = { active: false, url: null, seq: 0, timer: null };
+// `source` is whatever is currently driving the preview: the Apply panel, or the
+// edit modal. It returns the request to render, or null when the form can't
+// produce one yet. Keeping it a single slot means one debounce, one stale-response
+// counter, and one owner of the blob URL no matter who is previewing.
+const preview = { active: false, url: null, seq: 0, timer: null, source: null };
 
 function togglePreview() {
   if (preview.active) {
     exitPreview(true);
   } else {
     preview.active = true;
+    preview.source = applyPreviewRequest;
     $("preview-btn").classList.add("active");
     refreshPreview();
   }
+}
+
+// Apply composes the effect on top of the selected node, which is exactly what
+// POST /api/nodes/{id}/preview does.
+function applyPreviewRequest() {
+  if (state.nodeId === null) return null;
+  const { effect, params, parent2_id } = readEffectForm();
+  if (effect === "blend" && parent2_id === null) return null;
+  const body = { effect, params };
+  if (parent2_id !== null) body.parent2_id = parent2_id;
+  return { nodeId: state.nodeId, body, busyEl: $("preview-btn") };
 }
 
 function exitPreview(restoreSrc) {
@@ -477,6 +529,7 @@ function exitPreview(restoreSrc) {
   preview.timer = null;
   preview.seq++; // invalidate in-flight fetches
   preview.active = false;
+  preview.source = null;
   $("preview-btn").classList.remove("active");
   if (restoreSrc && state.nodeId !== null) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
@@ -493,19 +546,16 @@ function schedulePreview() {
 }
 
 async function refreshPreview() {
-  if (!preview.active || state.nodeId === null) return;
-  const { effect, params, parent2_id } = readEffectForm();
-  if (effect === "blend" && parent2_id === null) return;
-  const body = { effect, params };
-  if (parent2_id !== null) body.parent2_id = parent2_id;
+  if (!preview.active || !preview.source) return;
+  const req = preview.source();
+  if (!req) return;
   const seq = ++preview.seq;
-  const btn = $("preview-btn");
-  btn.classList.add("busy");
+  req.busyEl?.classList.add("busy");
   try {
-    const res = await fetch(`/api/nodes/${state.nodeId}/preview`, {
+    const res = await fetch(`/api/nodes/${req.nodeId}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(req.body),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
@@ -517,7 +567,7 @@ async function refreshPreview() {
   } catch (err) {
     console.warn("preview failed:", err); // keep the last frame; no alert mid-drag
   } finally {
-    btn.classList.remove("busy");
+    req.busyEl?.classList.remove("busy");
   }
 }
 
@@ -631,6 +681,166 @@ async function deletePreset(preset) {
     await refreshPresets();
   } catch (err) {
     alert(`Could not delete preset: ${err.message}`);
+  }
+}
+
+// ---------- Library stats ----------
+
+function formatBytes(n) {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+function statRow(container, label, value, muted = false) {
+  const row = document.createElement("div");
+  row.className = muted ? "stat-row muted" : "stat-row";
+  const l = document.createElement("span");
+  l.textContent = label;
+  const v = document.createElement("span");
+  v.textContent = value;
+  row.append(l, v);
+  container.appendChild(row);
+}
+
+function statHeading(container, text) {
+  const h = document.createElement("div");
+  h.className = "stat-heading";
+  h.textContent = text;
+  container.appendChild(h);
+}
+
+async function openStats() {
+  const body = $("stats-body");
+  body.textContent = "Loading…";
+  $("stats-modal").showModal();
+  let s;
+  try {
+    s = await api("/api/stats"); // a snapshot — refetched on every open
+  } catch (err) {
+    body.textContent = `Could not load stats: ${err.message}`;
+    return;
+  }
+  body.innerHTML = "";
+  statHeading(body, "Contents");
+  statRow(body, "Images", s.images);
+  statRow(body, "Nodes", `${s.nodes} (${s.edits} effects + ${s.images} originals)`);
+  statRow(body, "Presets", s.presets);
+  for (const e of s.by_effect) {
+    // nodeLabel() wants a node; here we only have the effect name
+    const spec = state.effects.find((x) => x.name === e.effect);
+    const label = e.effect === "blend" ? "Blend" : spec ? spec.label : e.effect;
+    statRow(body, label, e.count, true);
+  }
+
+  const st = s.storage;
+  statHeading(body, "On disk");
+  statRow(body, "Database", formatBytes(st.database.bytes));
+  statRow(body, "Originals", `${formatBytes(st.originals.bytes)} · ${st.originals.files} files`);
+  const cacheBytes = st.renders.bytes + st.thumbs.bytes + st.clusters.bytes;
+  statRow(body, "Render cache", formatBytes(cacheBytes));
+  statRow(body, "renders", `${formatBytes(st.renders.bytes)} · ${st.renders.files} files`, true);
+  statRow(body, "thumbnails", `${formatBytes(st.thumbs.bytes)} · ${st.thumbs.files} files`, true);
+  statRow(body, "cluster data", `${formatBytes(st.clusters.bytes)} · ${st.clusters.files} files`, true);
+  statRow(body, "Total", formatBytes(st.database.bytes + st.originals.bytes + cacheBytes));
+
+  const note = document.createElement("div");
+  note.className = "hint";
+  note.textContent =
+    "The render cache rebuilds itself from the originals and the work tree — only the database and originals are irreplaceable.";
+  body.appendChild(note);
+}
+
+// ---------- Editing an existing node's settings ----------
+
+// Unlike Apply, this changes a node in place: it keeps its id and its children,
+// and every render derived from it is thrown away and rebuilt.
+const edit = { node: null };
+
+function descendantsOf(nodeId) {
+  const found = new Set([nodeId]);
+  // state.nodes is in id order and parents always precede children, so one
+  // forward pass reaches the whole closure
+  for (const n of state.nodes) {
+    if (found.has(n.parent_id) || found.has(n.parent2_id)) found.add(n.id);
+  }
+  found.delete(nodeId);
+  return [...found];
+}
+
+function editPreviewRequest() {
+  const node = edit.node;
+  if (!node) return null;
+  const { effect, params, parent2_id } = readParams($("edit-params"), node.effect);
+  if (effect === "blend" && parent2_id === null) return null;
+  const body = { effect, params };
+  if (parent2_id !== null) body.parent2_id = parent2_id;
+  // previewing an edit to node N means re-applying N's effect to N's *input*
+  return { nodeId: node.parent_id, body, busyEl: $("edit-status") };
+}
+
+function openEdit(node) {
+  // select the node first: renderSelection() is the choke point that exits any
+  // running preview, so it has to happen before the modal starts its own
+  if (state.nodeId !== node.id) {
+    state.nodeId = node.id;
+    renderSelection();
+  } else {
+    exitPreview(false);
+  }
+  edit.node = node;
+  $("edit-title").textContent = `#${node.id} ${nodeLabel(node)}`;
+  buildParamControls($("edit-params"), node.effect, node.params || {});
+  if (node.effect === "blend") {
+    appendBlendTarget($("edit-params"), {
+      text: "Blend with",
+      excludeId: node.id,
+      selected: node.parent2_id,
+      maxId: node.id, // matches the server's cycle guard
+    });
+  }
+  const downstream = descendantsOf(node.id).length;
+  $("edit-warning").textContent = downstream
+    ? `${downstream} downstream effect${downstream === 1 ? "" : "s"} will be re-rendered.`
+    : "";
+  $("edit-modal").showModal();
+  preview.active = true;
+  preview.source = editPreviewRequest;
+  refreshPreview();
+}
+
+function closeEdit(restoreSrc) {
+  edit.node = null;
+  exitPreview(restoreSrc);
+  $("edit-modal").close();
+}
+
+async function saveEdit() {
+  const node = edit.node;
+  if (!node) return;
+  const { params, parent2_id } = readParams($("edit-params"), node.effect);
+  if (node.effect === "blend" && parent2_id === null) return;
+  const btn = $("edit-save-btn");
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = "Saving…";
+  try {
+    await api(`/api/nodes/${node.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ params, parent2_id }),
+    });
+    // the node id did not change, so the cluster plot would otherwise keep
+    // showing the clusters it cached for the old params
+    cluster.nodeId = null;
+    closeEdit(false);
+    await selectImage(state.imageId, node.id);
+  } catch (err) {
+    alert(`Could not save: ${err.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    btn.textContent = "Save";
   }
 }
 
@@ -837,6 +1047,16 @@ async function init() {
   });
   $("delete-btn").onclick = deleteImage;
   $("save-preset-btn").onclick = savePreset;
+
+  $("stats-btn").onclick = openStats;
+  $("stats-close-btn").onclick = () => $("stats-modal").close();
+  $("edit-cancel-btn").onclick = () => closeEdit(true);
+  $("edit-save-btn").onclick = saveEdit;
+  $("edit-params").addEventListener("input", schedulePreview);
+  // Esc closes a <dialog> without going through our buttons, so clean up here too
+  $("edit-modal").addEventListener("close", () => {
+    if (edit.node) closeEdit(true);
+  });
   $("file-input").onchange = (e) => {
     if (e.target.files[0]) uploadFile(e.target.files[0]);
     e.target.value = "";

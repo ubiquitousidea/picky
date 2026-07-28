@@ -40,12 +40,35 @@ JPG), an `effect` name, and JSON `params`. Blend nodes additionally carry
 
 Key invariants that cut across files:
 
-- **Renders are immutable snapshots.** `rendering.render_node()` materializes a
-  node by applying its effect to the parent's *cached* JPEG, recursively, and
-  caches the result; it only recomputes if the cache file is missing. Changing
-  an effect's implementation therefore does NOT retroactively change existing
-  nodes (this is intentional — children were derived from the old pixels).
-  Same for the per-node k-means cluster JSON cache (`renders/<id>.clusters.json`).
+- **A render always matches its node's *current* params.** `rendering.render_node()`
+  materializes a node by applying its effect to the parent's *cached* JPEG,
+  recursively, and caches the result; it only recomputes if the cache file is
+  missing. File-existence is the entire cache key, so **invalidation means
+  deleting files** — that is what `PATCH /api/nodes/{id}` does when it edits
+  params in place: `db.descendant_ids()` (read-only twin of `delete_node`'s
+  recursive CTE, over *both* parent links) plus `rendering.delete_render_files()`
+  drops the node's whole descendant closure, then the edited node alone is
+  re-rendered eagerly so a bad param fails on the PATCH instead of on some later
+  GET. Descendants come back lazily on their next request. Same for the per-node
+  k-means cluster JSON cache (`renders/<id>.clusters.json`).
+  Two things this does NOT cover: changing an effect's *implementation* still
+  does not retroactively change existing nodes (nothing deletes their files), and
+  neither does replaying a preset, which runs today's code to create new nodes.
+- **PATCH updates the row, then invalidates — never the reverse.** These are sync
+  `def` endpoints, so FastAPI runs them concurrently in a threadpool. After the
+  commit, any racing re-render already uses the new params, so the file sweep can
+  only be deleting output from the old ones. Sweeping first would let a
+  concurrent read re-materialize a stale cache that then looks like a valid hit
+  forever. `update_node` also short-circuits when nothing actually changed, so
+  re-saving an unedited form doesn't throw away a subtree of renders.
+- **Editing a blend's second input needs a cycle guard; creating one does not.**
+  `parent2_id` must be `< node_id`. Node ids are topological, so a smaller id
+  cannot be downstream — without this, pointing a blend at its own descendant
+  sends `render_node` into infinite recursion. Creation is safe for free (a new
+  node always has the largest id); an in-place edit is not. The check also
+  preserves the "both parents have smaller ids" property `layoutGraph()` relies
+  on. The frontend's target picker passes the same bound (`maxId`) so the
+  impossible options never appear.
 - **Effects are registry entries.** `server/effects.py` `EFFECTS` maps name →
   `apply(np.uint8 RGB array, params) -> array` plus param specs (`int` ranges,
   `float` ranges with optional `step`, or `choice`). The frontend generates its
@@ -63,7 +86,17 @@ Key invariants that cut across files:
   disagree. Frontend preview mode lives in the `preview` state object in
   `web/app.js`; every path that changes the selection exits preview through the
   `exitPreview()` call at the top of `renderSelection()` — keep that single
-  choke point.
+  choke point. `preview.source` names whoever is currently driving it (the Apply
+  panel or the edit modal) and is the *only* thing that varies: one debounce, one
+  `seq` stale-response counter, one owner of the blob URL. Note the edit modal
+  previews against the edited node's **parent** — re-applying its effect to its
+  own input — because the endpoint composes on *top* of the node you name.
+- **Param controls are built and read in one place.** `buildParamControls()` /
+  `appendBlendTarget()` / `readParams()` in `web/app.js` are shared by the Apply
+  panel and the edit modal, which is what keeps ranges, defaults, and value
+  coercion from drifting between "create a node" and "edit a node". The blend
+  target picker is found by the `.blend-with` class *scoped to its container*,
+  not a global id, so two of them can coexist while the modal is open.
 - **Deletes cascade through both parent links** (`db.delete_node`'s recursive
   CTE), and no deletion order is FK-safe for two-parent graphs, so deletes run
   with `PRAGMA defer_foreign_keys = ON`. File cleanup (render/thumb/clusters)
@@ -90,9 +123,9 @@ Key invariants that cut across files:
   `db.delete_nodes` deletes highest id first — since a node's id always exceeds
   its parents', that removes referrers before referents and needs no deferred-FK
   window (unlike `delete_node`, whose cascade order is arbitrary).
-  Note the deliberate exception to the immutable-render rule: replaying a preset
-  runs *today's* effect code, so it need not reproduce the original node's pixels
-  if an effect implementation changed since the preset was saved.
+  A preset stores params, not pixels: replaying one runs *today's* effect code,
+  so it need not reproduce the original node's pixels if an effect implementation
+  changed since the preset was saved.
 - **Posterize clusters in PCA-whitened RGB space** (`_fit_kmeans`), not raw
   RGB — raw k-means bunches centroids along the luminance diagonal. Whitening
   is manual (`sqrt(explained_variance_ + 1e-4)`) rather than sklearn's
@@ -125,3 +158,20 @@ delete — `renderSelection()` calls the synchronous `updatePresetControls()`, n
 a fetch. Clicking a preset row applies it to the *selected* node and then routes
 through `selectImage()`, which is what refetches the tree so all of the preset's
 new nodes appear.
+
+The two modals are native `<dialog>` elements (Esc and focus trapping for free);
+`prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two gotchas:
+the global `* { margin: 0 }` reset defeats a dialog's centering, so `dialog`
+re-sets `margin: auto`; and Esc closes a dialog without going through the
+buttons, so `#edit-modal` listens for `close` to run the same teardown Cancel
+does. `openEdit()` is the one selection change that must *not* be followed by
+`renderSelection()` — it selects the node first and only then starts its own
+preview, because that choke point would otherwise cancel it immediately. After a
+successful PATCH the node id is unchanged, so `saveEdit()` clears
+`cluster.nodeId` by hand; `updateClusterPlot()` refetches only on an id change
+and would otherwise keep drawing the old centroids.
+
+`GET /api/stats` (`db.stats()` + `rendering.storage_stats()`) backs the Library
+stats modal. It reports the render cache apart from the database and originals
+because the cache is ~85% of the bytes and is fully regenerable — one lumped
+"on disk" number would badly misrepresent what a user would lose.

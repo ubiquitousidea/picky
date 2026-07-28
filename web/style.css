@@ -41,6 +41,8 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
 #tree-section h2 { color: var(--rb-green); }
 #presets-section h2 { color: var(--rb-teal); }
 #cluster-section h2 { color: var(--rb-violet); }
+#stats-modal h2 { color: var(--rb-blue); }
+#edit-modal h2 { color: var(--rb-orange); }
 
 #cluster-canvas {
   width: 100%;
@@ -72,6 +74,18 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
 }
+#gallery-footer { padding: 0.5rem; border-top: 1px solid var(--border); }
+#stats-btn {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.4rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+#stats-btn:hover { border-color: var(--rb-blue); color: var(--rb-blue); }
 .upload-btn {
   background: var(--panel-2);
   border: 1px solid var(--rb-blue);
@@ -232,8 +246,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .fx-edges     { color: var(--rb-yellow); }
 .fx-dither    { color: var(--rb-orange); }
 .fx-pixelate  { color: var(--rb-green); }
+.node-edit,
 .node-del {
-  margin-left: auto;
   border: none;
   background: transparent;
   color: var(--muted);
@@ -244,7 +258,11 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border-radius: 4px;
   visibility: hidden;
 }
+/* the edit button always precedes the delete button, so it carries the push-right */
+.node-edit { margin-left: auto; font-size: 0.8rem; }
+.tree-node:hover .node-edit,
 .tree-node:hover .node-del { visibility: visible; }
+.node-edit:hover { color: var(--rb-yellow); background: var(--panel); }
 .node-del:hover { color: var(--rb-red); background: var(--panel); }
 
 /* Actions */
@@ -319,3 +337,84 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 .preset-row:hover .preset-del { visibility: visible; }
 .preset-del:hover { color: var(--rb-red); background: var(--panel); }
+
+/* Modals — native <dialog>, so Esc and focus trapping come for free */
+dialog {
+  /* the global `* { margin: 0 }` reset would otherwise pin dialogs top-left */
+  margin: auto;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  padding: 1.25rem;
+  width: 320px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
+.modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.modal-actions button {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.modal-actions button:hover:not(:disabled) { background: var(--panel-2); }
+.modal-actions button:disabled { opacity: 0.4; cursor: default; }
+.modal-actions button.busy { opacity: 0.7; }
+
+/* Stats */
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.85rem;
+  padding: 0.15rem 0;
+}
+.stat-row.muted { color: var(--muted); font-size: 0.75rem; padding-left: 0.75rem; }
+.stat-heading {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0.9rem 0 0.3rem;
+}
+.stat-heading:first-child { margin-top: 0; }
+#stats-modal .hint {
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 0.9rem;
+  line-height: 1.4;
+}
+
+/* Edit effect — anchored right so the live preview stays visible behind it */
+#edit-modal {
+  margin-right: 1rem;
+  margin-left: auto;
+}
+#edit-title { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.8rem; }
+#edit-warning {
+  font-size: 0.7rem;
+  color: var(--rb-yellow);
+  min-height: 1em;
+  margin-top: 0.4rem;
+}
+#edit-status {
+  margin-right: auto;
+  font-size: 0.7rem;
+  color: var(--muted);
+  visibility: hidden;
+}
+#edit-status.busy { visibility: visible; }
+#edit-save-btn { border-color: var(--rb-orange); color: var(--rb-orange); }
+#edit-save-btn:hover:not(:disabled) { background: var(--rb-orange); color: var(--bg); }

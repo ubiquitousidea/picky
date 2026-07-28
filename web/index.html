@@ -16,6 +16,9 @@
       </label>
     </header>
     <ul id="gallery"></ul>
+    <footer id="gallery-footer">
+      <button id="stats-btn" title="Images, effects, and disk usage">Library stats</button>
+    </footer>
   </aside>
 
   <main id="preview-panel">
@@ -51,6 +54,26 @@
       <div class="hint">drag to rotate · double-click to pause spin</div>
     </section>
   </aside>
+
+  <dialog id="stats-modal">
+    <h2>Library</h2>
+    <div id="stats-body"></div>
+    <div class="modal-actions">
+      <button id="stats-close-btn">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="edit-modal">
+    <h2>Edit effect</h2>
+    <div id="edit-title"></div>
+    <div id="edit-params"></div>
+    <div id="edit-warning" class="hint"></div>
+    <div class="modal-actions">
+      <span id="edit-status">rendering…</span>
+      <button id="edit-cancel-btn">Cancel</button>
+      <button id="edit-save-btn">Save</button>
+    </div>
+  </dialog>
 
   <script src="app.js"></script>
 </body>

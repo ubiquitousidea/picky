@@ -26,6 +26,11 @@ class NodeCreate(BaseModel):
     params: dict = {}
 
 
+class NodeUpdate(BaseModel):
+    params: dict = {}
+    parent2_id: int | None = None
+
+
 class PreviewRequest(BaseModel):
     effect: str
     params: dict = {}
@@ -100,6 +105,53 @@ def create_node(image_id: int, body: NodeCreate):
     except Exception as exc:
         raise HTTPException(500, f"render failed: {exc}")
     return node
+
+
+@app.patch("/api/nodes/{node_id}")
+def update_node(node_id: int, body: NodeUpdate):
+    """Change an existing node's settings in place. Unlike Apply, this does not
+    add a node — the node keeps its id and its children, which are re-rendered
+    from the new pixels."""
+    node = db.get_node(node_id)
+    if node is None:
+        raise HTTPException(404, "node not found")
+    if node["parent_id"] is None:
+        raise HTTPException(400, "the original has no parameters to edit")
+    effect = node["effect"]
+    if effect not in EFFECTS and effect != "blend":
+        raise HTTPException(400, f"effect '{effect}' no longer exists")
+    params = validate_params(effect, body.params)
+
+    parent2_id = None
+    if effect == "blend":
+        if body.parent2_id is None:
+            raise HTTPException(400, "blend requires a second node (parent2_id)")
+        other = db.get_node(body.parent2_id)
+        if other is None or other["image_id"] != node["image_id"]:
+            raise HTTPException(400, "blend node does not belong to this image")
+        # Ids are topological, so anything with a smaller id cannot be downstream
+        # of this node. Creation gets that for free (a new node always has the
+        # largest id); an edit does not, and pointing a blend at its own
+        # descendant would send render_node into infinite recursion.
+        if body.parent2_id >= node_id:
+            raise HTTPException(400, "a blend cannot use a node derived from itself")
+        parent2_id = body.parent2_id
+
+    if params == node["params"] and parent2_id == node["parent2_id"]:
+        return {"node": node, "invalidated": []}
+
+    # Update first, then invalidate: these endpoints run concurrently in a
+    # threadpool, and after the commit any re-render already uses the new params,
+    # so the sweep below can only be removing files written from the old ones.
+    # The reverse order would let a concurrent read repopulate a stale cache.
+    updated = db.update_node_params(node_id, params, parent2_id)
+    invalidated = db.descendant_ids(node_id)
+    rendering.delete_render_files(invalidated)
+    try:
+        rendering.render_node(node_id)  # fail loudly here rather than on next GET
+    except Exception as exc:
+        raise HTTPException(500, f"render failed: {exc}")
+    return {"node": updated, "invalidated": invalidated}
 
 
 def _effect_chain(node: dict) -> list[str]:
@@ -346,6 +398,11 @@ def apply_preset(node_id: int, body: PresetApply):
         raise HTTPException(500, f"applying preset failed: {exc}")
 
     return {"created": created, "terminal_node_id": created[-1]}
+
+
+@app.get("/api/stats")
+def get_stats():
+    return {**db.stats(), "storage": rendering.storage_stats()}
 
 
 class NoCacheStaticFiles(StaticFiles):

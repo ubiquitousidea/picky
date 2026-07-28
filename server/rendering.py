@@ -99,3 +99,28 @@ def delete_render_files(node_ids: list[int]) -> None:
         render_path(node_id).unlink(missing_ok=True)
         thumb_path(node_id).unlink(missing_ok=True)
         clusters_path(node_id).unlink(missing_ok=True)
+
+
+def _totals(paths) -> dict:
+    files = [p for p in paths if p.is_file()]
+    return {"files": len(files), "bytes": sum(p.stat().st_size for p in files)}
+
+
+def storage_stats() -> dict:
+    """Bytes on disk, split by kind. Everything under `renders` is a cache that
+    rebuilds from the originals plus the node rows, so it is reported apart from
+    the data that cannot be regenerated."""
+    renders = list(db.RENDERS_DIR.iterdir())
+    thumbs = [p for p in renders if p.name.endswith(".thumb.jpg")]
+    clusters = [p for p in renders if p.name.endswith(".clusters.json")]
+    return {
+        # glob, not DB_PATH.stat(), so a future WAL journal mode still adds up
+        "database": _totals(db.DATA_DIR.glob("picky.db*")),
+        "originals": _totals(db.ORIGINALS_DIR.iterdir()),
+        # a thumb is also a .jpg, so exclude it rather than matching on suffix
+        "renders": _totals(
+            p for p in renders if p.suffix == ".jpg" and not p.name.endswith(".thumb.jpg")
+        ),
+        "thumbs": _totals(thumbs),
+        "clusters": _totals(clusters),
+    }
