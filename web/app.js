@@ -4,6 +4,7 @@ const state = {
   imageId: null,
   nodes: [],       // flat node list for the selected image
   nodeId: null,    // selected node
+  presets: [],     // saved effect chains, reusable across images
 };
 
 const $ = (id) => document.getElementById(id);
@@ -72,6 +73,7 @@ function renderSelection() {
   }
   if ($("effect-select").value === "blend") renderEffectControls();
   renderTree();
+  updatePresetControls();
   updateClusterPlot();
 }
 
@@ -519,6 +521,119 @@ async function refreshPreview() {
   }
 }
 
+// ---------- Presets (saved effect chains, reusable across images) ----------
+
+let presetBusy = false;
+
+async function refreshPresets() {
+  state.presets = await api("/api/presets");
+  renderPresets();
+}
+
+function renderPresets() {
+  const list = $("preset-list");
+  list.innerHTML = "";
+  if (!state.presets.length) {
+    const empty = document.createElement("li");
+    empty.className = "hint";
+    empty.textContent = "Pick a node, then save its chain to reuse it here.";
+    list.appendChild(empty);
+    return;
+  }
+  for (const preset of state.presets) {
+    const li = document.createElement("li");
+    li.className = "preset-row";
+    li.title = `Apply to the selected node: ${preset.summary}`;
+
+    const text = document.createElement("div");
+    text.className = "preset-text";
+    const name = document.createElement("div");
+    name.className = "preset-name";
+    name.textContent = preset.name;
+    const summary = document.createElement("div");
+    summary.className = "preset-summary";
+    summary.textContent = preset.summary;
+    text.append(name, summary);
+
+    const del = document.createElement("button");
+    del.className = "preset-del";
+    del.textContent = "×";
+    del.title = "Delete preset";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      deletePreset(preset);
+    };
+
+    li.append(text, del);
+    li.onclick = () => applyPreset(preset, li);
+    list.appendChild(li);
+  }
+  updatePresetControls();
+}
+
+function updatePresetControls() {
+  const node = state.nodes.find((n) => n.id === state.nodeId);
+  const canSave = state.imageId !== null && !!node && node.parent_id !== null;
+  const saveBtn = $("save-preset-btn");
+  saveBtn.disabled = !canSave || presetBusy;
+  saveBtn.title = canSave
+    ? "Save the edits leading to the selected node"
+    : "Select an edited node — the original has no chain to save";
+  document.querySelectorAll("#preset-list .preset-row").forEach((li) => {
+    li.classList.toggle("disabled", state.imageId === null || presetBusy);
+  });
+}
+
+async function savePreset() {
+  const node = state.nodes.find((n) => n.id === state.nodeId);
+  if (!node || node.parent_id === null) return;
+  const name = prompt("Name this preset:", "");
+  if (name === null || !name.trim()) return;
+  try {
+    await api("/api/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim(), node_id: state.nodeId }),
+    });
+    await refreshPresets();
+  } catch (err) {
+    alert(`Could not save preset: ${err.message}`);
+  }
+}
+
+async function applyPreset(preset, row) {
+  if (presetBusy || state.imageId === null) return;
+  exitPreview(false);
+  presetBusy = true;
+  row.classList.add("busy");
+  updatePresetControls();
+  try {
+    const res = await api(`/api/nodes/${state.nodeId}/apply-preset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preset_id: preset.id }),
+    });
+    // selectImage refetches the tree, so all of the preset's new nodes show up
+    await selectImage(state.imageId, res.terminal_node_id);
+  } catch (err) {
+    alert(`Could not apply preset: ${err.message}`);
+  } finally {
+    presetBusy = false;
+    row.classList.remove("busy");
+    updatePresetControls();
+  }
+}
+
+async function deletePreset(preset) {
+  if (!confirm(`Delete the preset “${preset.name}”?`)) return;
+  try {
+    await api(`/api/presets/${preset.id}`, { method: "DELETE" });
+    await refreshPresets();
+  } catch (err) {
+    alert(`Could not delete preset: ${err.message}`);
+  }
+}
+
 // ---------- Cluster plot (3D RGB scatter for posterize nodes) ----------
 
 const cluster = {
@@ -721,6 +836,7 @@ async function init() {
     if (preview.active) schedulePreview();
   });
   $("delete-btn").onclick = deleteImage;
+  $("save-preset-btn").onclick = savePreset;
   $("file-input").onchange = (e) => {
     if (e.target.files[0]) uploadFile(e.target.files[0]);
     e.target.value = "";
@@ -743,6 +859,7 @@ async function init() {
   });
 
   await refreshGallery();
+  await refreshPresets();
   // deep links (?image=2&node=28) win over the last-viewed image
   const q = new URLSearchParams(location.search);
   const qImage = Number(q.get("image"));

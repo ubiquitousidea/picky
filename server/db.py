@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS nodes (
   params TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS presets (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  steps TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -152,6 +158,24 @@ def delete_node(node_id: int) -> list[int]:
     return ids
 
 
+def delete_nodes(node_ids: list[int]) -> None:
+    """Delete exactly these nodes and nothing else — used to unwind a partially
+    applied preset. Unlike delete_node this does not cascade: the caller already
+    knows the full set, and a preset's side branches hang off the base node, so a
+    cascade from the first created node would miss them.
+
+    Deleting highest id first is what keeps this FK-safe: a node's id always
+    exceeds both its parents', so this removes every referrer before its referent
+    and needs no deferred-FK window."""
+    if not node_ids:
+        return
+    with connect() as conn:
+        conn.executemany(
+            "DELETE FROM nodes WHERE id = ?",
+            [(i,) for i in sorted(node_ids, reverse=True)],
+        )
+
+
 def delete_image(image_id: int) -> list[int]:
     """Delete an image and its nodes; returns the deleted node ids."""
     with connect() as conn:
@@ -164,3 +188,46 @@ def delete_image(image_id: int) -> list[int]:
         conn.execute("PRAGMA defer_foreign_keys = ON")
         conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
     return node_ids
+
+
+def preset_dict(row: sqlite3.Row) -> dict:
+    # stored as {"version": n, "steps": [...]} so the format can evolve; callers
+    # only ever see the unwrapped list
+    doc = json.loads(row["steps"])
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "version": doc.get("version", 1),
+        "steps": doc.get("steps", []),
+        "created_at": row["created_at"],
+    }
+
+
+def list_presets() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM presets ORDER BY name").fetchall()
+    return [preset_dict(r) for r in rows]
+
+
+def get_preset(preset_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM presets WHERE id = ?", (preset_id,)
+        ).fetchone()
+    return preset_dict(row) if row else None
+
+
+def create_preset(name: str, steps: list[dict]) -> dict:
+    """Raises sqlite3.IntegrityError if the name is already taken."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO presets (name, steps, created_at) VALUES (?, ?, ?)",
+            (name, json.dumps({"version": 1, "steps": steps}), _now()),
+        )
+        preset_id = cur.lastrowid
+    return get_preset(preset_id)
+
+
+def delete_preset(preset_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))

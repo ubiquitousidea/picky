@@ -68,6 +68,31 @@ Key invariants that cut across files:
   CTE), and no deletion order is FK-safe for two-parent graphs, so deletes run
   with `PRAGMA defer_foreign_keys = ON`. File cleanup (render/thumb/clusters)
   happens in `rendering.delete_render_files` from the returned id list.
+- **Presets store a sub-DAG with relative parent indices**, never node ids.
+  `main.capture_steps()` collects the selected node's ancestor closure over
+  *both* parent links (that closure is exactly its pixel-dependency set) in id
+  order, and rewrites each parent reference as an index: `0` = whatever node the
+  preset is applied to, `1..i-1` = an earlier step. That is what makes an
+  `edges` → `blend with the original` chain replay correctly on a different
+  image. Absolute ids would be wrong across images and unsafe even within one,
+  since SQLite reuses rowids — hence no FK from `presets` to `nodes`. Steps are
+  stored as `{"version": n, "steps": [...]}` and params are re-normalized through
+  `validate_params` at both save and apply, which also backfills params added
+  since the node was made (e.g. blend's `weight`).
+- **Applying a preset is all-or-nothing, and cannot be one transaction.**
+  `rendering.render_node` reads through its own connection, so a step's row must
+  be committed before the next step can reference it — the loop is
+  create → commit → render per step, with `_validate_steps` pre-flighting the
+  whole recipe first and a compensating `db.delete_nodes` +
+  `rendering.delete_render_files` unwinding on failure. The file sweep is not
+  optional: `render_node` treats any existing file at the render path as a cache
+  hit, so an orphaned render would later be served as a different node's pixels.
+  `db.delete_nodes` deletes highest id first — since a node's id always exceeds
+  its parents', that removes referrers before referents and needs no deferred-FK
+  window (unlike `delete_node`, whose cascade order is arbitrary).
+  Note the deliberate exception to the immutable-render rule: replaying a preset
+  runs *today's* effect code, so it need not reproduce the original node's pixels
+  if an effect implementation changed since the preset was saved.
 - **Posterize clusters in PCA-whitened RGB space** (`_fit_kmeans`), not raw
   RGB — raw k-means bunches centroids along the luminance diagonal. Whitening
   is manual (`sqrt(explained_variance_ + 1e-4)`) rather than sklearn's
@@ -94,3 +119,9 @@ link, tree, effect controls (blend's target picker depends on the tree), and
 the cluster plot (a hand-rolled canvas 3D scatter, shown only for posterize
 nodes, placed last in the side panel so its appearance doesn't shift the tree).
 Deep links `?image=N&node=M` override the localStorage last-image.
+
+`state.presets` is fetched once in `init()` and refreshed only after a save or
+delete — `renderSelection()` calls the synchronous `updatePresetControls()`, not
+a fetch. Clicking a preset row applies it to the *selected* node and then routes
+through `selectImage()`, which is what refetches the tree so all of the preset's
+new nodes appear.
