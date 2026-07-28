@@ -159,6 +159,175 @@ function nodeParamsText(node) {
     .join(", ");
 }
 
+// The work tree is a DAG (blend nodes have two parents), drawn like a git
+// commit graph: one row per node in id order (ids are topological — parents
+// always precede children), with colored lanes in a left gutter that fork at
+// branches and merge into blend rows.
+
+const RAIL = { rowH: 28, dotR: 4 };
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+let lanePaletteCache = null;
+function laneColor(k) {
+  if (!lanePaletteCache) {
+    const cs = getComputedStyle(document.documentElement);
+    lanePaletteCache = ["red", "orange", "yellow", "green", "teal", "blue", "violet"]
+      .map((c) => cs.getPropertyValue(`--rb-${c}`).trim());
+  }
+  return lanePaletteCache[k % lanePaletteCache.length];
+}
+
+function layoutGraph(nodes) {
+  const childCount = new Map();
+  for (const n of nodes) {
+    if (n.parent_id !== null) childCount.set(n.parent_id, (childCount.get(n.parent_id) || 0) + 1);
+    if (n.parent2_id !== null) childCount.set(n.parent2_id, (childCount.get(n.parent2_id) || 0) + 1);
+  }
+  // lanes[k] = {nodeId, remaining}: edges from nodeId down to its `remaining`
+  // not-yet-rendered children pass through lane k. null = free.
+  const lanes = [];
+  const rows = [];
+  let laneCount = 0;
+  for (const n of nodes) {
+    const activeAbove = [];
+    lanes.forEach((s, k) => { if (s) activeAbove.push(k); });
+
+    const parentIds = [];
+    if (n.parent_id !== null) parentIds.push(n.parent_id);
+    if (n.parent2_id !== null) parentIds.push(n.parent2_id);
+    // a self-pair blend (parent_id === parent2_id) hits the same slot twice
+    const parentLanes = parentIds.map((pid) => {
+      const k = lanes.findIndex((s) => s && s.nodeId === pid);
+      if (k !== -1) lanes[k].remaining--;
+      return k;
+    });
+
+    // take over an exhausted parent lane (primary first), else leftmost free
+    let lane = parentLanes.find((k) => k !== -1 && lanes[k].remaining === 0) ?? -1;
+    if (lane === -1) {
+      lane = lanes.findIndex((s) => s === null);
+      if (lane === -1) lane = lanes.push(null) - 1;
+    }
+    for (const k of parentLanes) {
+      if (k !== -1 && k !== lane && lanes[k] && lanes[k].remaining === 0) lanes[k] = null;
+    }
+
+    const kids = childCount.get(n.id) || 0;
+    lanes[lane] = kids > 0 ? { nodeId: n.id, remaining: kids } : null;
+    while (lanes.length && lanes[lanes.length - 1] === null) lanes.pop();
+    laneCount = Math.max(laneCount, lanes.length, lane + 1);
+
+    const passThrough = activeAbove.filter((k) => k !== lane && lanes[k]);
+    const parentLinks = [];
+    for (const k of parentLanes) {
+      if (k === -1 || parentLinks.some((l) => l.fromLane === k)) continue;
+      // fork (parent lane survives below): the peeling branch gets the child's
+      // lane color; merge (lane ended here): the dying lane flows into the dot
+      const colorLane = k !== lane && lanes[k] ? lane : k;
+      parentLinks.push({ fromLane: k, colorLane });
+    }
+    rows.push({ node: n, lane, continues: kids > 0, passThrough, parentLinks });
+  }
+  return { rows, laneCount };
+}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+function buildRailCell(row, laneCount, laneWidth) {
+  const H = RAIL.rowH;
+  const mid = H / 2;
+  const laneX = (k) => laneWidth / 2 + k * laneWidth;
+  const svg = svgEl("svg", {
+    width: laneCount * laneWidth,
+    height: H,
+    class: `tree-rail fx-${row.node.effect || "original"}`,
+  });
+  for (const k of row.passThrough) {
+    svg.appendChild(svgEl("line", {
+      x1: laneX(k), y1: 0, x2: laneX(k), y2: H,
+      stroke: laneColor(k), "stroke-width": 2,
+    }));
+  }
+  for (const { fromLane, colorLane } of row.parentLinks) {
+    if (fromLane === row.lane) {
+      svg.appendChild(svgEl("line", {
+        x1: laneX(fromLane), y1: 0, x2: laneX(fromLane), y2: mid,
+        stroke: laneColor(colorLane), "stroke-width": 2,
+      }));
+    } else {
+      const x1 = laneX(fromLane);
+      const x2 = laneX(row.lane);
+      svg.appendChild(svgEl("path", {
+        d: `M ${x1} 0 C ${x1} ${mid}, ${x2} 0, ${x2} ${mid}`,
+        stroke: laneColor(colorLane), "stroke-width": 2,
+        fill: "none", "stroke-linecap": "round",
+      }));
+    }
+  }
+  if (row.continues) {
+    svg.appendChild(svgEl("line", {
+      x1: laneX(row.lane), y1: mid, x2: laneX(row.lane), y2: H,
+      stroke: laneColor(row.lane), "stroke-width": 2,
+    }));
+  }
+  const dot = svgEl("circle", {
+    cx: laneX(row.lane), cy: mid, r: RAIL.dotR, fill: "currentColor",
+  });
+  if (row.node.id === state.nodeId) {
+    dot.setAttribute("stroke", "#e6e9ef");
+    dot.setAttribute("stroke-width", 1.5);
+  }
+  svg.appendChild(dot);
+  return svg;
+}
+
+function buildTreeRow(row, laneCount, laneWidth) {
+  const node = row.node;
+  const wrap = document.createElement("div");
+  wrap.className = "tree-row";
+  wrap.style.height = `${RAIL.rowH}px`;
+  wrap.appendChild(buildRailCell(row, laneCount, laneWidth));
+
+  const div = document.createElement("div");
+  div.className = `tree-node fx-${node.effect || "original"}`;
+  div.classList.toggle("selected", node.id === state.nodeId);
+  const idSpan = document.createElement("span");
+  idSpan.className = "node-id";
+  idSpan.textContent = `#${node.id}`;
+  const label = document.createElement("span");
+  label.className = "fx-label";
+  label.textContent = nodeLabel(node);
+  div.append(idSpan, label);
+  div.title = `#${node.id} ${nodeLabel(node)}${node.params ? " · " + nodeParamsText(node) : ""}`;
+  if (node.params) {
+    const span = document.createElement("span");
+    span.className = "params";
+    span.textContent = nodeParamsText(node);
+    div.appendChild(span);
+  }
+  if (node.parent_id !== null) {
+    const del = document.createElement("button");
+    del.className = "node-del";
+    del.textContent = "×";
+    del.title = "Delete this effect (and everything below it)";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      deleteNode(node);
+    };
+    div.appendChild(del);
+  }
+  div.onclick = () => {
+    state.nodeId = node.id;
+    renderSelection();
+  };
+  wrap.appendChild(div);
+  return wrap;
+}
+
 function renderTree() {
   const container = $("tree");
   container.innerHTML = "";
@@ -166,57 +335,9 @@ function renderTree() {
     container.textContent = "No image selected.";
     return;
   }
-  const byParent = new Map();
-  for (const n of state.nodes) {
-    const key = n.parent_id ?? "root";
-    if (!byParent.has(key)) byParent.set(key, []);
-    byParent.get(key).push(n);
-  }
-  const build = (parentKey) => {
-    const children = byParent.get(parentKey) || [];
-    if (!children.length) return null;
-    const ul = document.createElement("ul");
-    for (const node of children) {
-      const li = document.createElement("li");
-      const div = document.createElement("div");
-      div.className = `tree-node fx-${node.effect || "original"}`;
-      div.classList.toggle("selected", node.id === state.nodeId);
-      const idSpan = document.createElement("span");
-      idSpan.className = "node-id";
-      idSpan.textContent = `#${node.id}`;
-      const label = document.createElement("span");
-      label.className = "fx-label";
-      label.textContent = nodeLabel(node);
-      div.append(idSpan, label);
-      if (node.params) {
-        const span = document.createElement("span");
-        span.className = "params";
-        span.textContent = nodeParamsText(node);
-        div.appendChild(span);
-      }
-      if (node.parent_id !== null) {
-        const del = document.createElement("button");
-        del.className = "node-del";
-        del.textContent = "×";
-        del.title = "Delete this effect (and everything below it)";
-        del.onclick = (e) => {
-          e.stopPropagation();
-          deleteNode(node);
-        };
-        div.appendChild(del);
-      }
-      div.onclick = () => {
-        state.nodeId = node.id;
-        renderSelection();
-      };
-      li.appendChild(div);
-      const sub = build(node.id);
-      if (sub) li.appendChild(sub);
-      ul.appendChild(li);
-    }
-    return ul;
-  };
-  container.appendChild(build("root"));
+  const { rows, laneCount } = layoutGraph(state.nodes);
+  const laneWidth = laneCount <= 8 ? 12 : Math.max(8, Math.floor(96 / laneCount));
+  for (const row of rows) container.appendChild(buildTreeRow(row, laneCount, laneWidth));
 }
 
 // ---------- Effects ----------
@@ -552,7 +673,9 @@ async function uploadFile(file) {
 }
 
 async function deleteNode(node) {
-  const hasChildren = state.nodes.some((n) => n.parent_id === node.id);
+  const hasChildren = state.nodes.some(
+    (n) => n.parent_id === node.id || n.parent2_id === node.id
+  );
   const msg = hasChildren
     ? "Delete this effect and all effects branching from it?"
     : "Delete this effect?";

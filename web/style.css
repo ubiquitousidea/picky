@@ -198,22 +198,31 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #preview-btn.active { background: var(--rb-blue); color: var(--bg); }
 
 /* Work tree */
-#tree { font-size: 0.85rem; color: var(--muted); }
-#tree ul { list-style: none; padding-left: 1rem; border-left: 1px solid var(--border); }
-#tree > ul { padding-left: 0; border-left: none; }
+#tree { font-size: 0.85rem; color: var(--muted); overflow-x: auto; }
+.tree-row { display: flex; align-items: stretch; }
+.tree-rail { flex: none; display: block; }
 .tree-node {
   display: flex;
   align-items: center;
+  flex: 1;
+  min-width: 0;
   gap: 0.35rem;
-  padding: 0.3rem 0.5rem;
+  padding: 0 0.5rem;
   border-radius: 6px;
   cursor: pointer;
-  margin: 0.15rem 0;
   border: 1px solid transparent;
 }
 .tree-node:hover { background: var(--panel-2); }
 .tree-node.selected { background: var(--panel-2); border-color: currentColor; }
-.tree-node .params { color: var(--muted); font-size: 0.75rem; }
+.tree-node .fx-label { white-space: nowrap; flex-shrink: 0; }
+.tree-node .params {
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
 .tree-node .node-id { color: var(--muted); font-size: 0.7rem; }
 .fx-blend     { color: var(--rb-red); }
 .fx-original  { color: var(--rb-teal); }
