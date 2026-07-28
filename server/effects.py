@@ -99,11 +99,12 @@ def pixelate(img: np.ndarray, params: dict) -> np.ndarray:
 BLEND_MODES = ["average", "additive", "multiplicative", "subtractive"]
 
 
-def apply_blend(a: np.ndarray, b: np.ndarray, mode: str) -> np.ndarray:
+def apply_blend(a: np.ndarray, b: np.ndarray, mode: str, weight: float = 0.5) -> np.ndarray:
     ai = a.astype(np.int32)
     bi = b.astype(np.int32)
     if mode == "average":
-        out = (ai + bi) // 2
+        # weight is the share of b (the "blend with" target)
+        out = np.rint(a.astype(np.float32) * (1.0 - weight) + b.astype(np.float32) * weight)
     elif mode == "additive":
         out = ai + bi
     elif mode == "multiplicative":
@@ -164,6 +165,15 @@ BLEND_SPEC = {
             "options": BLEND_MODES,
             "default": "average",
         },
+        {
+            "name": "weight",
+            "label": "Blend weight",
+            "type": "float",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.01,
+            "default": 0.5,
+        },
     ],
 }
 
@@ -186,6 +196,9 @@ def validate_params(effect: str, params: dict) -> dict:
         value = params.get(p["name"], p["default"])
         if p["type"] == "choice":
             clean[p["name"]] = value if value in p["options"] else p["default"]
+        elif p["type"] == "float":
+            value = float(value)
+            clean[p["name"]] = max(p["min"], min(p["max"], value))
         else:
             value = int(value)
             clean[p["name"]] = max(p["min"], min(p["max"], value))

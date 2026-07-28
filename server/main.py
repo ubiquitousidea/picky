@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -23,6 +23,12 @@ class NodeCreate(BaseModel):
     parent2_id: int | None = None
     effect: str
     params: dict = {}
+
+
+class PreviewRequest(BaseModel):
+    effect: str
+    params: dict = {}
+    parent2_id: int | None = None
 
 
 @app.get("/api/effects")
@@ -111,6 +117,31 @@ def get_render(node_id: int, thumb: bool = False, download: bool = False):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.post("/api/nodes/{node_id}/preview")
+def preview_node(node_id: int, body: PreviewRequest):
+    node = db.get_node(node_id)
+    if node is None:
+        raise HTTPException(404, "node not found")
+    if body.effect not in EFFECTS and body.effect != "blend":
+        raise HTTPException(400, f"unknown effect '{body.effect}'")
+    params = validate_params(body.effect, body.params)
+
+    parent2_id = None
+    if body.effect == "blend":
+        if body.parent2_id is None:
+            raise HTTPException(400, "blend requires a second node (parent2_id)")
+        other = db.get_node(body.parent2_id)
+        if other is None or other["image_id"] != node["image_id"]:
+            raise HTTPException(400, "blend node does not belong to this image")
+        parent2_id = body.parent2_id
+
+    try:
+        data = rendering.render_preview(node_id, body.effect, params, parent2_id)
+    except Exception as exc:
+        raise HTTPException(500, f"preview failed: {exc}")
+    return Response(content=data, media_type="image/jpeg")
+
+
 @app.get("/api/nodes/{node_id}/clusters")
 def get_clusters(node_id: int):
     node = db.get_node(node_id)
@@ -143,4 +174,14 @@ def delete_image(image_id: int):
     return {"deleted": image_id}
 
 
-app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
+class NoCacheStaticFiles(StaticFiles):
+    """Make browsers revalidate frontend files on every load (cheap 304s via
+    ETag) so app.js/style.css edits are picked up without a hard refresh."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", NoCacheStaticFiles(directory=WEB_DIR, html=True), name="web")

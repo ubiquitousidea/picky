@@ -1,5 +1,6 @@
 """Render pipeline: materialize a node's image by applying its effect chain."""
 
+import io
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,18 @@ def thumb_path(node_id: int) -> Path:
     return db.RENDERS_DIR / f"{node_id}.thumb.jpg"
 
 
+def _apply(source_file: Path, effect: str, params: dict, parent2_id: int | None) -> np.ndarray:
+    img = np.asarray(Image.open(source_file).convert("RGB"))
+    if effect == "blend":
+        other = Image.open(render_node(parent2_id)).convert("RGB")
+        if other.size != (img.shape[1], img.shape[0]):
+            other = other.resize((img.shape[1], img.shape[0]))
+        return apply_blend(
+            img, np.asarray(other), params["mode"], float(params.get("weight", 0.5))
+        )
+    return EFFECTS[effect]["apply"](img, params)
+
+
 def render_node(node_id: int) -> Path:
     """Return the path of the node's rendered JPEG, rendering (recursively) if
     the cache file is missing."""
@@ -40,16 +53,18 @@ def render_node(node_id: int) -> Path:
         return out
 
     parent_file = render_node(node["parent_id"])
-    img = np.asarray(Image.open(parent_file).convert("RGB"))
-    if node["effect"] == "blend":
-        other = Image.open(render_node(node["parent2_id"])).convert("RGB")
-        if other.size != (img.shape[1], img.shape[0]):
-            other = other.resize((img.shape[1], img.shape[0]))
-        result = apply_blend(img, np.asarray(other), node["params"]["mode"])
-    else:
-        result = EFFECTS[node["effect"]]["apply"](img, node["params"])
+    result = _apply(parent_file, node["effect"], node["params"], node["parent2_id"])
     Image.fromarray(result).save(out, quality=JPEG_QUALITY)
     return out
+
+
+def render_preview(node_id: int, effect: str, params: dict, parent2_id: int | None = None) -> bytes:
+    """Render an effect applied to a node's image in memory — no node row, no
+    cache file. Shows exactly what a child created by Apply would look like."""
+    result = _apply(render_node(node_id), effect, params, parent2_id)
+    buf = io.BytesIO()
+    Image.fromarray(result).save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
 
 
 def render_thumb(node_id: int) -> Path:

@@ -54,6 +54,7 @@ async function selectImage(imageId, nodeId = null) {
 }
 
 function renderSelection() {
+  exitPreview(false);
   document.querySelectorAll("#gallery li").forEach((li, i) => {
     li.classList.toggle("selected", state.images[i]?.id === state.imageId);
   });
@@ -64,6 +65,7 @@ function renderSelection() {
   $("delete-btn").hidden = !hasImage;
   $("export-btn").hidden = !hasImage;
   $("apply-btn").disabled = !hasImage;
+  $("preview-btn").disabled = !hasImage;
   if (hasImage) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
@@ -250,6 +252,7 @@ function renderEffectControls() {
       input.type = "range";
       input.min = p.min;
       input.max = p.max;
+      if (p.step !== undefined) input.step = p.step;
       input.value = p.default;
       input.dataset.param = p.name;
       input.oninput = () => (valSpan.textContent = input.value);
@@ -278,23 +281,41 @@ function renderEffectControls() {
     row.append(label, sel);
     box.appendChild(row);
     canApply = canApply && others.length > 0;
+
+    // the weight param only affects the "average" mode
+    const modeSel = box.querySelector('[data-param="mode"]');
+    const weightRow = box.querySelector('[data-param="weight"]')?.closest(".param-row");
+    if (modeSel && weightRow) {
+      const syncWeight = () => (weightRow.hidden = modeSel.value !== "average");
+      modeSel.addEventListener("change", syncWeight);
+      syncWeight();
+    }
   }
   $("apply-btn").disabled = !canApply;
+  $("preview-btn").disabled = !canApply;
 }
 
-async function applyEffect() {
-  const btn = $("apply-btn");
+function readEffectForm() {
   const effect = $("effect-select").value;
   const params = {};
   document.querySelectorAll("#effect-params [data-param]").forEach((el) => {
     params[el.dataset.param] = el.type === "range" ? Number(el.value) : el.value;
   });
-  const body = { parent_id: state.nodeId, effect, params };
+  let parent2_id = null;
   if (effect === "blend") {
     const withSel = $("blend-with");
-    if (!withSel || !withSel.value) return;
-    body.parent2_id = Number(withSel.value);
+    parent2_id = withSel && withSel.value ? Number(withSel.value) : null;
   }
+  return { effect, params, parent2_id };
+}
+
+async function applyEffect() {
+  const btn = $("apply-btn");
+  const { effect, params, parent2_id } = readEffectForm();
+  if (effect === "blend" && parent2_id === null) return;
+  exitPreview(false);
+  const body = { parent_id: state.nodeId, effect, params };
+  if (effect === "blend") body.parent2_id = parent2_id;
   btn.disabled = true;
   btn.classList.add("busy");
   btn.textContent = "Applying…";
@@ -311,6 +332,69 @@ async function applyEffect() {
     btn.disabled = state.imageId === null;
     btn.classList.remove("busy");
     btn.textContent = "Apply";
+  }
+}
+
+// ---------- Effect preview (uncommitted) ----------
+
+const preview = { active: false, url: null, seq: 0, timer: null };
+
+function togglePreview() {
+  if (preview.active) {
+    exitPreview(true);
+  } else {
+    preview.active = true;
+    $("preview-btn").classList.add("active");
+    refreshPreview();
+  }
+}
+
+function exitPreview(restoreSrc) {
+  clearTimeout(preview.timer);
+  preview.timer = null;
+  preview.seq++; // invalidate in-flight fetches
+  preview.active = false;
+  $("preview-btn").classList.remove("active");
+  if (restoreSrc && state.nodeId !== null) {
+    $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
+  }
+  if (preview.url) {
+    URL.revokeObjectURL(preview.url);
+    preview.url = null;
+  }
+}
+
+function schedulePreview() {
+  clearTimeout(preview.timer);
+  preview.timer = setTimeout(refreshPreview, 250);
+}
+
+async function refreshPreview() {
+  if (!preview.active || state.nodeId === null) return;
+  const { effect, params, parent2_id } = readEffectForm();
+  if (effect === "blend" && parent2_id === null) return;
+  const body = { effect, params };
+  if (parent2_id !== null) body.parent2_id = parent2_id;
+  const seq = ++preview.seq;
+  const btn = $("preview-btn");
+  btn.classList.add("busy");
+  try {
+    const res = await fetch(`/api/nodes/${state.nodeId}/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (seq !== preview.seq || !preview.active) return; // stale response or exited
+    const url = URL.createObjectURL(blob);
+    $("preview").src = url;
+    if (preview.url) URL.revokeObjectURL(preview.url);
+    preview.url = url;
+  } catch (err) {
+    console.warn("preview failed:", err); // keep the last frame; no alert mid-drag
+  } finally {
+    btn.classList.remove("busy");
   }
 }
 
@@ -500,12 +584,19 @@ async function init() {
     opt.textContent = e.label;
     select.appendChild(opt);
   }
-  select.onchange = renderEffectControls;
+  select.onchange = () => {
+    renderEffectControls();
+    if (preview.active) schedulePreview();
+  };
   renderEffectControls();
 
   initZoom();
   initClusterPlot();
   $("apply-btn").onclick = applyEffect;
+  $("preview-btn").onclick = togglePreview;
+  $("effect-params").addEventListener("input", () => {
+    if (preview.active) schedulePreview();
+  });
   $("delete-btn").onclick = deleteImage;
   $("file-input").onchange = (e) => {
     if (e.target.files[0]) uploadFile(e.target.files[0]);

@@ -175,7 +175,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   color: var(--text);
   border: 1px solid var(--border);
 }
-#apply-btn {
+#apply-btn,
+#preview-btn {
   width: 100%;
   padding: 0.5rem;
   border: 1px solid var(--rb-orange);
@@ -186,8 +187,15 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   cursor: pointer;
 }
 #apply-btn:hover:not(:disabled) { background: var(--rb-orange); color: var(--bg); }
-#apply-btn:disabled { opacity: 0.4; cursor: default; }
-#apply-btn.busy { opacity: 0.7; }
+#apply-btn:disabled, #preview-btn:disabled { opacity: 0.4; cursor: default; }
+#apply-btn.busy, #preview-btn.busy { opacity: 0.7; }
+#preview-btn {
+  border-color: var(--rb-blue);
+  color: var(--rb-blue);
+  margin-bottom: 0.5rem;
+}
+#preview-btn:hover:not(:disabled) { background: var(--rb-blue); color: var(--bg); }
+#preview-btn.active { background: var(--rb-blue); color: var(--bg); }
 
 /* Work tree */
 #tree { font-size: 0.85rem; color: var(--muted); }
