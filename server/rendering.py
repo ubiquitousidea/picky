@@ -1,6 +1,8 @@
 """Render pipeline: materialize a node's image by applying its effect chain."""
 
 import io
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +10,7 @@ from PIL import Image
 
 import json
 
-from . import db
+from . import db, sam
 from .effects import EFFECTS, apply_blend, kmeans_cluster_data
 
 THUMB_SIZE = 320
@@ -27,16 +29,31 @@ def thumb_path(node_id: int) -> Path:
     return db.RENDERS_DIR / f"{node_id}.thumb.jpg"
 
 
-def _apply(source_file: Path, effect: str, params: dict, parent2_id: int | None) -> np.ndarray:
+def _apply(
+    source_file: Path,
+    effect: str,
+    params: dict,
+    parent2_id: int | None,
+    selection: dict | None = None,
+    source_node_id: int | None = None,
+) -> np.ndarray:
     img = np.asarray(Image.open(source_file).convert("RGB"))
     if effect == "blend":
         other = Image.open(render_node(parent2_id)).convert("RGB")
         if other.size != (img.shape[1], img.shape[0]):
             other = other.resize((img.shape[1], img.shape[0]))
-        return apply_blend(
+        out = apply_blend(
             img, np.asarray(other), params["mode"], float(params.get("weight", 0.5))
         )
-    return EFFECTS[effect]["apply"](img, params)
+    else:
+        out = EFFECTS[effect]["apply"](img, params)
+    if selection is not None:
+        # masked apply: effect pixels inside the selection, source outside.
+        # The mask comes from the same node whose pixels `img` holds, so the
+        # shapes always agree.
+        mask = compute_mask(source_node_id, selection)
+        out = np.where(mask[:, :, None], out, img)
+    return out
 
 
 def render_node(node_id: int) -> Path:
@@ -53,15 +70,28 @@ def render_node(node_id: int) -> Path:
         return out
 
     parent_file = render_node(node["parent_id"])
-    result = _apply(parent_file, node["effect"], node["params"], node["parent2_id"])
+    result = _apply(
+        parent_file,
+        node["effect"],
+        node["params"],
+        node["parent2_id"],
+        node["selection"],
+        node["parent_id"],
+    )
     Image.fromarray(result).save(out, quality=JPEG_QUALITY)
     return out
 
 
-def render_preview(node_id: int, effect: str, params: dict, parent2_id: int | None = None) -> bytes:
+def render_preview(
+    node_id: int,
+    effect: str,
+    params: dict,
+    parent2_id: int | None = None,
+    selection: dict | None = None,
+) -> bytes:
     """Render an effect applied to a node's image in memory — no node row, no
     cache file. Shows exactly what a child created by Apply would look like."""
-    result = _apply(render_node(node_id), effect, params, parent2_id)
+    result = _apply(render_node(node_id), effect, params, parent2_id, selection, node_id)
     buf = io.BytesIO()
     Image.fromarray(result).save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
@@ -94,6 +124,61 @@ def cluster_data(node_id: int) -> Path:
     return out
 
 
+# ---------- Click-to-segment (SAM) ----------
+
+
+def embedding_path(node_id: int) -> Path:
+    return db.RENDERS_DIR / f"{node_id}.embedding.npy"
+
+
+def node_embedding(node_id: int) -> np.ndarray:
+    """The SAM image-encoder embedding of a node's rendered pixels, cached on
+    disk like renders and cluster data (file existence is the cache key).
+
+    Written atomically, unlike the JPEG renders: np.load of a half-written
+    .npy raises, whereas a truncated JPEG merely looks bad — and two racing
+    mask requests may both compute, so the tmp + os.replace also keeps them
+    from interleaving writes.
+    """
+    out = embedding_path(node_id)
+    if out.exists():
+        return np.load(out)
+    img = np.asarray(Image.open(render_node(node_id)).convert("RGB"))
+    embedding = sam.compute_embedding(img)
+    fd, tmp = tempfile.mkstemp(dir=out.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            np.save(f, embedding)
+        os.replace(tmp, out)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return embedding
+
+
+def compute_mask(node_id: int, selection: dict) -> np.ndarray:
+    """Boolean mask for a click on a node's rendered pixels."""
+    with Image.open(render_node(node_id)) as im:
+        w, h = im.size  # header-only read; no full decode
+    mask = sam.decode_mask(
+        node_embedding(node_id), h, w, selection["x"], selection["y"], selection["level"]
+    )
+    if selection.get("invert"):
+        mask = ~mask
+    return mask
+
+
+def mask_png(node_id: int, selection: dict) -> bytes:
+    """The mask as a white-where-selected RGBA PNG for the frontend overlay
+    (translucency is the frontend's job — CSS opacity on the whole image)."""
+    mask = compute_mask(node_id, selection)
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    rgba[mask] = 255
+    buf = io.BytesIO()
+    Image.fromarray(rgba).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 HIST_SAMPLE = 512
 
 
@@ -119,6 +204,7 @@ def delete_render_files(node_ids: list[int]) -> None:
         render_path(node_id).unlink(missing_ok=True)
         thumb_path(node_id).unlink(missing_ok=True)
         clusters_path(node_id).unlink(missing_ok=True)
+        embedding_path(node_id).unlink(missing_ok=True)
 
 
 def _totals(paths) -> dict:
@@ -133,6 +219,7 @@ def storage_stats() -> dict:
     renders = list(db.RENDERS_DIR.iterdir())
     thumbs = [p for p in renders if p.name.endswith(".thumb.jpg")]
     clusters = [p for p in renders if p.name.endswith(".clusters.json")]
+    embeddings = [p for p in renders if p.name.endswith(".embedding.npy")]
     return {
         # glob, not DB_PATH.stat(), so a future WAL journal mode still adds up
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
@@ -143,4 +230,6 @@ def storage_stats() -> dict:
         ),
         "thumbs": _totals(thumbs),
         "clusters": _totals(clusters),
+        # SAM image embeddings, ~4 MB apiece — big enough to deserve a line
+        "embeddings": _totals(embeddings),
     }

@@ -11,7 +11,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import db, rendering
-from .effects import EFFECTS, effect_specs, validate_params
+from .effects import EFFECTS, effect_specs, validate_params, validate_selection
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -24,17 +24,27 @@ class NodeCreate(BaseModel):
     parent2_id: int | None = None
     effect: str
     params: dict = {}
+    selection: dict | None = None
 
 
 class NodeUpdate(BaseModel):
     params: dict = {}
     parent2_id: int | None = None
+    selection: dict | None = None
 
 
 class PreviewRequest(BaseModel):
     effect: str
     params: dict = {}
     parent2_id: int | None = None
+    selection: dict | None = None
+
+
+class MaskRequest(BaseModel):
+    x: int
+    y: int
+    invert: bool = False
+    level: str = "auto"
 
 
 class PresetCreate(BaseModel):
@@ -89,6 +99,7 @@ def create_node(image_id: int, body: NodeCreate):
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
     params = validate_params(body.effect, body.params)
+    selection = validate_selection(body.selection)
 
     parent2_id = None
     if body.effect == "blend":
@@ -99,7 +110,9 @@ def create_node(image_id: int, body: NodeCreate):
             raise HTTPException(400, "blend node does not belong to this image")
         parent2_id = body.parent2_id
 
-    node = db.create_node(image_id, body.parent_id, body.effect, params, parent2_id)
+    node = db.create_node(
+        image_id, body.parent_id, body.effect, params, parent2_id, selection
+    )
     try:
         rendering.render_node(node["id"])
     except Exception as exc:
@@ -121,6 +134,7 @@ def update_node(node_id: int, body: NodeUpdate):
     if effect not in EFFECTS and effect != "blend":
         raise HTTPException(400, f"effect '{effect}' no longer exists")
     params = validate_params(effect, body.params)
+    selection = validate_selection(body.selection)
 
     parent2_id = None
     if effect == "blend":
@@ -137,14 +151,18 @@ def update_node(node_id: int, body: NodeUpdate):
             raise HTTPException(400, "a blend cannot use a node derived from itself")
         parent2_id = body.parent2_id
 
-    if params == node["params"] and parent2_id == node["parent2_id"]:
+    if (
+        params == node["params"]
+        and parent2_id == node["parent2_id"]
+        and selection == node["selection"]
+    ):
         return {"node": node, "invalidated": []}
 
     # Update first, then invalidate: these endpoints run concurrently in a
     # threadpool, and after the commit any re-render already uses the new params,
     # so the sweep below can only be removing files written from the old ones.
     # The reverse order would let a concurrent read repopulate a stale cache.
-    updated = db.update_node_params(node_id, params, parent2_id)
+    updated = db.update_node_params(node_id, params, parent2_id, selection)
     invalidated = db.descendant_ids(node_id)
     rendering.delete_render_files(invalidated)
     try:
@@ -187,6 +205,7 @@ def preview_node(node_id: int, body: PreviewRequest):
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
     params = validate_params(body.effect, body.params)
+    selection = validate_selection(body.selection)
 
     parent2_id = None
     if body.effect == "blend":
@@ -198,10 +217,25 @@ def preview_node(node_id: int, body: PreviewRequest):
         parent2_id = body.parent2_id
 
     try:
-        data = rendering.render_preview(node_id, body.effect, params, parent2_id)
+        data = rendering.render_preview(node_id, body.effect, params, parent2_id, selection)
     except Exception as exc:
         raise HTTPException(500, f"preview failed: {exc}")
     return Response(content=data, media_type="image/jpeg")
+
+
+@app.post("/api/nodes/{node_id}/mask")
+def get_mask(node_id: int, body: MaskRequest):
+    """The segmentation mask for a click on a node's pixels, as a PNG for the
+    frontend's overlay. Persists nothing but the node's cached embedding —
+    like preview, the selection itself only exists in the request."""
+    if db.get_node(node_id) is None:
+        raise HTTPException(404, "node not found")
+    selection = validate_selection(body.model_dump())
+    try:
+        data = rendering.mask_png(node_id, selection)
+    except Exception as exc:
+        raise HTTPException(500, f"segmentation failed: {exc}")
+    return Response(content=data, media_type="image/png")
 
 
 @app.get("/api/nodes/{node_id}/clusters")
@@ -286,6 +320,9 @@ def capture_steps(node_id: int) -> list[dict]:
             "params": params,
             "parent": index[node["parent_id"]],
             "parent2": index[node["parent2_id"]] if node["effect"] == "blend" else None,
+            # click coords ride along verbatim; they are in the parent's pixel
+            # space and clamp to the target image's bounds at mask time
+            "selection": validate_selection(node["selection"]),
         }
         steps.append(step)
     return steps
@@ -366,7 +403,15 @@ def _validate_steps(steps: list[dict]) -> list[dict]:
         except (ValueError, TypeError) as exc:
             raise HTTPException(400, f"step {i}: bad params ({exc})")
         checked.append(
-            {"effect": effect, "params": params, "parent": parent, "parent2": parent2}
+            {
+                "effect": effect,
+                "params": params,
+                "parent": parent,
+                "parent2": parent2,
+                # total: presets saved before selections existed, or with
+                # malformed data, replay unmasked rather than failing
+                "selection": validate_selection(step.get("selection")),
+            }
         )
     return checked
 
@@ -391,7 +436,12 @@ def apply_preset(node_id: int, body: PresetApply):
         for i, step in enumerate(steps, start=1):
             parent2_id = None if step["parent2"] is None else node_at[step["parent2"]]
             node = db.create_node(
-                image_id, node_at[step["parent"]], step["effect"], step["params"], parent2_id
+                image_id,
+                node_at[step["parent"]],
+                step["effect"],
+                step["params"],
+                parent2_id,
+                step["selection"],
             )
             created.append(node["id"])
             node_at[i] = node["id"]

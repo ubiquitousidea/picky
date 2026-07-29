@@ -44,6 +44,8 @@ def init() -> None:
             conn.execute(
                 "ALTER TABLE nodes ADD COLUMN parent2_id INTEGER REFERENCES nodes(id)"
             )
+        if "selection" not in cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN selection TEXT")
 
 
 def connect() -> sqlite3.Connection:
@@ -65,6 +67,7 @@ def node_dict(row: sqlite3.Row) -> dict:
         "parent2_id": row["parent2_id"],
         "effect": row["effect"],
         "params": json.loads(row["params"]) if row["params"] else None,
+        "selection": json.loads(row["selection"]) if row["selection"] else None,
         "created_at": row["created_at"],
     }
 
@@ -124,26 +127,42 @@ def create_node(
     effect: str,
     params: dict,
     parent2_id: int | None = None,
+    selection: dict | None = None,
 ) -> dict:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO nodes (image_id, parent_id, parent2_id, effect, params, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (image_id, parent_id, parent2_id, effect, json.dumps(params), _now()),
+            "INSERT INTO nodes (image_id, parent_id, parent2_id, effect, params, selection, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                image_id,
+                parent_id,
+                parent2_id,
+                effect,
+                json.dumps(params),
+                json.dumps(selection) if selection else None,
+                _now(),
+            ),
         )
         node_id = cur.lastrowid
     return get_node(node_id)
 
 
-def update_node_params(node_id: int, params: dict, parent2_id: int | None) -> dict:
+def update_node_params(
+    node_id: int, params: dict, parent2_id: int | None, selection: dict | None = None
+) -> dict:
     """Change an existing node's settings in place. The node keeps its id and its
     place in the tree, so everything derived from it is now stale — the caller
     must invalidate the cached renders of its whole descendant closure
     (see descendant_ids)."""
     with connect() as conn:
         conn.execute(
-            "UPDATE nodes SET params = ?, parent2_id = ? WHERE id = ?",
-            (json.dumps(params), parent2_id, node_id),
+            "UPDATE nodes SET params = ?, parent2_id = ?, selection = ? WHERE id = ?",
+            (
+                json.dumps(params),
+                parent2_id,
+                json.dumps(selection) if selection else None,
+                node_id,
+            ),
         )
     return get_node(node_id)
 

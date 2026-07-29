@@ -23,7 +23,10 @@
 
   <main id="preview-panel">
     <div id="drop-hint">Drop a JPG anywhere, or use “Add JPG”</div>
-    <img id="preview" hidden alt="preview" draggable="false">
+    <div id="preview-wrap" hidden>
+      <img id="preview" alt="preview" draggable="false">
+      <img id="mask-overlay" hidden alt="" draggable="false">
+    </div>
     <div id="zoom-hud" hidden>scroll to zoom · drag to pan · double-click to reset</div>
   </main>
 

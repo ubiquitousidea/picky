@@ -133,16 +133,43 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
   overflow: hidden;
   padding: 1rem;
 }
+/* The wrapper fills the panel and carries the zoom/pan transform, so the
+   image and the mask overlay move as one. It has to fill (not shrink-wrap):
+   the img's percentage max-height can only resolve against a definite box,
+   and the wrapper's center coincides with the flex-centered image's center,
+   which keeps the transform math identical to when the img was transformed. */
+#preview-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center;
+}
+#preview-wrap[hidden] { display: none; } /* the id rule above beats UA [hidden] */
 #preview {
   max-width: 100%;
   max-height: 100%;
   border-radius: 4px;
   box-shadow: 0 4px 24px rgba(0,0,0,0.5);
-  transform-origin: center;
   cursor: grab;
   user-select: none;
 }
 #preview:active { cursor: grabbing; }
+/* Same intrinsic dimensions as the render + the same max constraints
+   + inset/margin centering = the exact box the flexed img resolves to. */
+#mask-overlay {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 4px;
+  opacity: 0.45;
+  pointer-events: none;
+}
+#preview-wrap.picking #preview { cursor: crosshair; }
 #drop-hint { color: var(--muted); font-size: 1.1rem; }
 #zoom-hud {
   position: absolute;
@@ -234,6 +261,48 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   text-align: center;
   margin-top: 0.3rem;
 }
+/* Click-to-segment selection controls */
+.sel-row { display: flex; align-items: center; gap: 0.4rem; }
+.sel-row + .sel-row { margin-top: 0.35rem; }
+.sel-coords { color: var(--muted); }
+.sel-pick {
+  flex: 1;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--rb-teal);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--rb-teal);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.sel-pick:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
+.sel-pick.armed { background: var(--rb-teal); color: var(--bg); }
+.sel-pick.busy { opacity: 0.7; }
+.sel-pick:disabled { opacity: 0.4; cursor: default; }
+.sel-clear {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.sel-clear:hover:not(:disabled) { color: var(--text); }
+.sel-clear:disabled { opacity: 0.4; cursor: default; }
+.sel-level { flex: 1; min-width: 0; }
+/* .param-row .sel-invert outranks the `.param-row label` header styling,
+   which would otherwise paint this yellow and spread it apart */
+.param-row .sel-invert {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.3rem;
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+.sel-invert input { accent-color: var(--rb-teal); }
 #apply-btn,
 #preview-btn {
   width: 100%;
@@ -258,6 +327,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 
 /* Work tree */
 #tree { font-size: 0.85rem; color: var(--muted); overflow-x: auto; }
+.sel-badge { flex: none; color: var(--rb-teal); }
 .tree-row { display: flex; align-items: stretch; }
 .tree-rail { flex: none; display: block; }
 .tree-node {

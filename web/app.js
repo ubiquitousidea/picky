@@ -61,7 +61,7 @@ function renderSelection() {
     li.classList.toggle("selected", state.images[i]?.id === state.imageId);
   });
   const hasImage = state.imageId !== null;
-  $("preview").hidden = !hasImage;
+  $("preview-wrap").hidden = !hasImage;
   $("drop-hint").hidden = hasImage;
   $("zoom-hud").hidden = !hasImage;
   $("delete-btn").hidden = !hasImage;
@@ -86,7 +86,8 @@ function renderSelection() {
 const view = { zoom: 1, panX: 0, panY: 0 };
 
 function applyViewTransform() {
-  $("preview").style.transform =
+  // the wrapper, not the img, so the mask overlay zooms and pans in lockstep
+  $("preview-wrap").style.transform =
     `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
 }
 
@@ -99,10 +100,12 @@ function resetZoom() {
 
 function initZoom() {
   const panel = $("preview-panel");
-  const preview = $("preview");
+  const wrap = $("preview-wrap");
   let dragging = false;
   let lastX = 0;
   let lastY = 0;
+  let downX = 0;
+  let downY = 0;
 
   panel.addEventListener(
     "wheel",
@@ -128,7 +131,9 @@ function initZoom() {
     { passive: false }
   );
 
-  preview.addEventListener("mousedown", (e) => {
+  wrap.addEventListener("mousedown", (e) => {
+    downX = e.clientX; // remembered even unzoomed, to tell a pick from a pan
+    downY = e.clientY;
     if (view.zoom === 1) return;
     e.preventDefault();
     dragging = true;
@@ -144,7 +149,30 @@ function initZoom() {
     applyViewTransform();
   });
   window.addEventListener("mouseup", () => (dragging = false));
-  preview.addEventListener("dblclick", resetZoom);
+  wrap.addEventListener("dblclick", resetZoom);
+
+  // Click-to-segment picking. The img's bounding rect is post-transform, so
+  // mapping client -> full-res pixel needs no pan/zoom inversion (the same
+  // reasoning as the curve editor's atEvent); a drag beyond a few px is a
+  // pan that happened to end on the image, not a pick.
+  wrap.addEventListener("click", (e) => {
+    if (!selPicker.armed) return;
+    if (Math.hypot(e.clientX - downX, e.clientY - downY) > 3) return;
+    const img = $("preview");
+    const rect = img.getBoundingClientRect();
+    if (
+      e.clientX < rect.left || e.clientX >= rect.right ||
+      e.clientY < rect.top || e.clientY >= rect.bottom
+    ) {
+      return; // letterbox area around the image
+    }
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * img.naturalWidth);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * img.naturalHeight);
+    selPicker.armed.pick(
+      Math.min(x, img.naturalWidth - 1),
+      Math.min(y, img.naturalHeight - 1)
+    );
+  });
 }
 
 // ---------- Work tree ----------
@@ -157,16 +185,21 @@ function nodeLabel(node) {
 }
 
 function nodeParamsText(node) {
+  let text;
   if (node.effect === "blend") {
-    return `${node.params.mode} · with #${node.parent2_id}`;
+    text = `${node.params.mode} · with #${node.parent2_id}`;
+  } else if (node.effect === "curves") {
+    // spelling out every control point would swamp the row and its tooltip
+    text = `${node.params.points.length} points`;
+  } else {
+    text = Object.entries(node.params)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(", ");
   }
-  // spelling out every control point would swamp the row and its tooltip
-  if (node.effect === "curves") {
-    return `${node.params.points.length} points`;
+  if (node.selection) {
+    text += node.selection.invert ? " · masked (inverted)" : " · masked";
   }
-  return Object.entries(node.params)
-    .map(([k, v]) => `${k}=${v}`)
-    .join(", ");
+  return text;
 }
 
 // The work tree is a DAG (blend nodes have two parents), drawn like a git
@@ -312,6 +345,12 @@ function buildTreeRow(row, laneCount, laneWidth) {
   label.className = "fx-label";
   label.textContent = nodeLabel(node);
   div.append(idSpan, label);
+  if (node.selection) {
+    const badge = document.createElement("span");
+    badge.className = "sel-badge";
+    badge.textContent = "◎";
+    div.appendChild(badge);
+  }
   div.title = `#${node.id} ${nodeLabel(node)}${node.params ? " · " + nodeParamsText(node) : ""}`;
   if (node.params) {
     const span = document.createElement("span");
@@ -901,6 +940,9 @@ function renderEffectControls() {
     });
     canApply = canApply && hasTarget;
   }
+  if (state.nodeId !== null) {
+    appendSelectionControls(box, { sourceNodeId: state.nodeId });
+  }
   const group = groupFor(state.effect);
   if (group.methods) box.prepend(buildMethodRow(group));
   $("apply-btn").disabled = !canApply;
@@ -920,7 +962,9 @@ function readParams(container, effectName) {
     const withSel = container.querySelector(".blend-with");
     parent2_id = withSel && withSel.value ? Number(withSel.value) : null;
   }
-  return { effect: effectName, params, parent2_id };
+  const selInput = container.querySelector("[data-selection]");
+  const selection = selInput && selInput.value ? JSON.parse(selInput.value) : null;
+  return { effect: effectName, params, parent2_id, selection };
 }
 
 function readEffectForm() {
@@ -929,11 +973,12 @@ function readEffectForm() {
 
 async function applyEffect() {
   const btn = $("apply-btn");
-  const { effect, params, parent2_id } = readEffectForm();
+  const { effect, params, parent2_id, selection } = readEffectForm();
   if (effect === "blend" && parent2_id === null) return;
   exitPreview(false);
   const body = { parent_id: state.nodeId, effect, params };
   if (effect === "blend") body.parent2_id = parent2_id;
+  if (selection) body.selection = selection;
   btn.disabled = true;
   btn.classList.add("busy");
   btn.textContent = "Applying…";
@@ -976,10 +1021,11 @@ function togglePreview() {
 // POST /api/nodes/{id}/preview does.
 function applyPreviewRequest() {
   if (state.nodeId === null) return null;
-  const { effect, params, parent2_id } = readEffectForm();
+  const { effect, params, parent2_id, selection } = readEffectForm();
   if (effect === "blend" && parent2_id === null) return null;
   const body = { effect, params };
   if (parent2_id !== null) body.parent2_id = parent2_id;
+  if (selection) body.selection = selection;
   return { nodeId: state.nodeId, body, busyEl: $("preview-btn") };
 }
 
@@ -989,6 +1035,9 @@ function exitPreview(restoreSrc) {
   preview.seq++; // invalidate in-flight fetches
   preview.active = false;
   preview.source = null;
+  // overlay teardown rides the same choke point every selection change funnels
+  // through, so a stale mask can never outlive the node it was picked on
+  clearMaskOverlay();
   $("preview-btn").classList.remove("active");
   if (restoreSrc && state.nodeId !== null) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
@@ -1028,6 +1077,164 @@ async function refreshPreview() {
   } finally {
     req.busyEl?.classList.remove("busy");
   }
+}
+
+// ---------- Click-to-segment selection ----------
+
+// One overlay, one armed picker, one blob URL — the same single-slot model as
+// `preview`: whichever controls instance (Apply panel or edit modal) last drove
+// it owns it, and every selection change tears it down through exitPreview().
+const selPicker = { armed: null, url: null, seq: 0 };
+
+function disarmPick() {
+  selPicker.armed = null;
+  $("preview-wrap").classList.remove("picking");
+  document.querySelectorAll(".sel-pick").forEach((b) => b.classList.remove("armed"));
+}
+
+async function updateMaskOverlay(sourceNodeId, selection, busyEl) {
+  const seq = ++selPicker.seq;
+  busyEl?.classList.add("busy");
+  try {
+    const res = await fetch(`/api/nodes/${sourceNodeId}/mask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(selection),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (seq !== selPicker.seq) return; // stale response
+    const overlay = $("mask-overlay");
+    const url = URL.createObjectURL(blob);
+    overlay.src = url;
+    overlay.hidden = false;
+    if (selPicker.url) URL.revokeObjectURL(selPicker.url);
+    selPicker.url = url;
+  } catch (err) {
+    console.warn("mask failed:", err); // the live preview still shows the result
+  } finally {
+    busyEl?.classList.remove("busy");
+  }
+}
+
+function clearMaskOverlay() {
+  selPicker.seq++; // invalidate in-flight fetches
+  const overlay = $("mask-overlay");
+  overlay.hidden = true;
+  overlay.removeAttribute("src");
+  if (selPicker.url) {
+    URL.revokeObjectURL(selPicker.url);
+    selPicker.url = null;
+  }
+  disarmPick();
+}
+
+// The appendBlendTarget analogue for selections: any effect can be masked, so
+// like blend's target this is not a registry param. The state rides on a
+// hidden input tagged `data-selection` — NOT `data-param`, which is what keeps
+// readParams() from posting it as an effect param — scoped to its container so
+// the Apply panel's and the modal's can coexist. Every user change dispatches
+// a bubbling `input` event, so the existing delegated listeners drive the
+// shared preview debounce with no new wiring.
+function appendSelectionControls(container, { selected = null, sourceNodeId, allowPick = true }) {
+  const row = document.createElement("div");
+  row.className = "param-row";
+
+  const label = document.createElement("label");
+  const nameSpan = document.createElement("span");
+  nameSpan.textContent = "Limit to object";
+  const coords = document.createElement("span");
+  coords.className = "sel-coords";
+  label.append(nameSpan, coords);
+
+  const input = document.createElement("input");
+  input.type = "hidden";
+  input.className = "sel-state";
+  input.setAttribute("data-selection", "");
+
+  const pick = document.createElement("button");
+  pick.type = "button";
+  pick.className = "sel-pick";
+  const clear = document.createElement("button");
+  pick.title = allowPick
+    ? "Then click an object in the image to select it"
+    : "The click point was made on this node's input — re-picking needs a new node from the Apply panel";
+  clear.type = "button";
+  clear.className = "sel-clear";
+  clear.textContent = "clear";
+  const pickRow = document.createElement("div");
+  pickRow.className = "sel-row";
+  pickRow.append(pick, clear);
+
+  const level = document.createElement("select");
+  level.className = "sel-level";
+  for (const name of ["auto", "whole", "part", "subpart"]) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name === "auto" ? "auto (best match)" : name;
+    level.appendChild(opt);
+  }
+  const invertLabel = document.createElement("label");
+  invertLabel.className = "sel-invert";
+  const invert = document.createElement("input");
+  invert.type = "checkbox";
+  invertLabel.append(invert, document.createTextNode("invert"));
+  const optRow = document.createElement("div");
+  optRow.className = "sel-row";
+  optRow.append(level, invertLabel);
+
+  row.append(label, input, pickRow, optRow);
+  container.appendChild(row);
+
+  const current = () => (input.value ? JSON.parse(input.value) : null);
+  const render = (sel) => {
+    coords.textContent = sel ? `@ ${sel.x}, ${sel.y}` : "";
+    pick.textContent = sel ? "Re-pick object" : "Select object";
+    pick.disabled = !allowPick;
+    level.value = sel ? sel.level : "auto";
+    invert.checked = sel ? !!sel.invert : false;
+    level.disabled = invert.disabled = clear.disabled = !sel;
+  };
+  const commit = (sel) => {
+    input.value = sel ? JSON.stringify(sel) : "";
+    render(sel);
+    if (sel) updateMaskOverlay(sourceNodeId, sel, pick);
+    else clearMaskOverlay();
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  if (allowPick) {
+    pick.onclick = () => {
+      if (selPicker.armed) {
+        disarmPick();
+        return;
+      }
+      // single-shot: the click handler in initZoom calls pick() then disarms
+      selPicker.armed = {
+        pick: (x, y) => {
+          disarmPick();
+          commit({ x, y, invert: invert.checked, level: level.value });
+        },
+      };
+      pick.classList.add("armed");
+      $("preview-wrap").classList.add("picking");
+    };
+  }
+  level.onchange = () => {
+    const sel = current();
+    if (sel) commit({ ...sel, level: level.value });
+  };
+  invert.onchange = () => {
+    const sel = current();
+    if (sel) commit({ ...sel, invert: invert.checked });
+  };
+  clear.onclick = () => commit(null);
+
+  // seed without dispatching `input` — nothing user-driven happened yet — but
+  // do show the stored mask, so opening the edit modal lights its selection up
+  input.value = selected ? JSON.stringify(selected) : "";
+  render(selected);
+  if (selected) updateMaskOverlay(sourceNodeId, selected, pick);
 }
 
 // ---------- Presets (saved effect chains, reusable across images) ----------
@@ -1196,11 +1403,13 @@ async function openStats() {
   statHeading(body, "On disk");
   statRow(body, "Database", formatBytes(st.database.bytes));
   statRow(body, "Originals", `${formatBytes(st.originals.bytes)} · ${st.originals.files} files`);
-  const cacheBytes = st.renders.bytes + st.thumbs.bytes + st.clusters.bytes;
+  const cacheBytes =
+    st.renders.bytes + st.thumbs.bytes + st.clusters.bytes + st.embeddings.bytes;
   statRow(body, "Render cache", formatBytes(cacheBytes));
   statRow(body, "renders", `${formatBytes(st.renders.bytes)} · ${st.renders.files} files`, true);
   statRow(body, "thumbnails", `${formatBytes(st.thumbs.bytes)} · ${st.thumbs.files} files`, true);
   statRow(body, "cluster data", `${formatBytes(st.clusters.bytes)} · ${st.clusters.files} files`, true);
+  statRow(body, "embeddings", `${formatBytes(st.embeddings.bytes)} · ${st.embeddings.files} files`, true);
   statRow(body, "Total", formatBytes(st.database.bytes + st.originals.bytes + cacheBytes));
 
   const note = document.createElement("div");
@@ -1230,10 +1439,11 @@ function descendantsOf(nodeId) {
 function editPreviewRequest() {
   const node = edit.node;
   if (!node) return null;
-  const { effect, params, parent2_id } = readParams($("edit-params"), node.effect);
+  const { effect, params, parent2_id, selection } = readParams($("edit-params"), node.effect);
   if (effect === "blend" && parent2_id === null) return null;
   const body = { effect, params };
   if (parent2_id !== null) body.parent2_id = parent2_id;
+  if (selection) body.selection = selection;
   // previewing an edit to node N means re-applying N's effect to N's *input*
   return { nodeId: node.parent_id, body, busyEl: $("edit-status") };
 }
@@ -1260,6 +1470,14 @@ function openEdit(node) {
       maxId: node.id, // matches the server's cycle guard
     });
   }
+  // invert/level/clear only: showModal() makes the page inert, so re-picking a
+  // point is impossible from here — a new click point means a new node from the
+  // Apply panel. Coords are in the parent's space, which is what this previews.
+  appendSelectionControls($("edit-params"), {
+    selected: node.selection,
+    sourceNodeId: node.parent_id,
+    allowPick: false,
+  });
   const downstream = descendantsOf(node.id).length;
   $("edit-warning").textContent = downstream
     ? `${downstream} downstream effect${downstream === 1 ? "" : "s"} will be re-rendered.`
@@ -1279,7 +1497,7 @@ function closeEdit(restoreSrc) {
 async function saveEdit() {
   const node = edit.node;
   if (!node) return;
-  const { params, parent2_id } = readParams($("edit-params"), node.effect);
+  const { params, parent2_id, selection } = readParams($("edit-params"), node.effect);
   if (node.effect === "blend" && parent2_id === null) return;
   const btn = $("edit-save-btn");
   btn.disabled = true;
@@ -1289,7 +1507,7 @@ async function saveEdit() {
     await api(`/api/nodes/${node.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ params, parent2_id }),
+      body: JSON.stringify({ params, parent2_id, selection }), // null clears
     });
     // the node id did not change, so the cluster plot would otherwise keep
     // showing the clusters it cached for the old params

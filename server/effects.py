@@ -302,6 +302,35 @@ def _clean_points(value, p: dict) -> list[list[int]]:
     return pts
 
 
+# How decode_mask picks among SAM's candidate masks for a click: the model's
+# own confidence ranking, or one of the three granularities it proposes.
+SELECTION_LEVELS = ["auto", "whole", "part", "subpart"]
+
+
+def validate_selection(value) -> dict | None:
+    """Coerce a node's selection into `{"x", "y", "invert", "level"}` or None.
+
+    Total like `_clean_points` — anything malformed degrades to None (no
+    selection) instead of raising, because this runs unguarded in the node,
+    preview and preset endpoints. Only the lower bound of x/y is clamped here;
+    the upper bound depends on image dimensions, which presets don't know
+    (a recipe replays onto differently-sized images), so it clamps at mask time.
+    """
+    if not isinstance(value, dict):
+        return None
+    try:
+        x, y = int(value["x"]), int(value["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    level = value.get("level")
+    return {
+        "x": max(0, x),
+        "y": max(0, y),
+        "invert": bool(value.get("invert")),
+        "level": level if level in SELECTION_LEVELS else "auto",
+    }
+
+
 def validate_params(effect: str, params: dict) -> dict:
     """Clamp and coerce params against the effect's spec; raises on unknown effect."""
     spec = BLEND_SPEC if effect == "blend" else EFFECTS[effect]
