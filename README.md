@@ -20,6 +20,11 @@ restarts.
     so clusters spread across color rather than bunching along the luminance
     diagonal. Selecting a posterize node shows a rotatable **3D scatter plot**
     of sampled pixels in RGB space, colored by cluster average.
+  - *Tone curve* — a Photoshop-style curves editor. Drag control points on a
+    grid drawn over the input's luma **histogram**; they are interpolated with
+    a monotone cubic spline, so the curve never overshoots between points and
+    never inverts local contrast. Behind the same button, *Gamma* offers the
+    one-slider version of the same idea.
   - *Gaussian blur*, *Sobel edges*, *Floyd–Steinberg dither*, *Pixelate*
   - *Blend* — combine the selected node with any other node in the tree using
     average, additive, multiplicative, or subtractive blending.
@@ -90,6 +95,7 @@ effect is a single entry in `server/effects.py`.
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
+| GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | DELETE | `/api/nodes/{id}` | delete a node and everything derived from it |
 | DELETE | `/api/images/{id}` | delete an image, its tree, and its files |
 | GET    | `/api/presets` | list saved presets with their steps |

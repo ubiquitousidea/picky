@@ -157,6 +157,10 @@ function nodeParamsText(node) {
   if (node.effect === "blend") {
     return `${node.params.mode} · with #${node.parent2_id}`;
   }
+  // spelling out every control point would swamp the row and its tooltip
+  if (node.effect === "curves") {
+    return `${node.params.points.length} points`;
+  }
   return Object.entries(node.params)
     .map(([k, v]) => `${k}=${v}`)
     .join(", ");
@@ -419,6 +423,22 @@ function iconPixelate() {
   return svg;
 }
 
+// an S-curve in a box: the editor's own grid, in miniature. No gradient — the
+// one in iconBlur uses a hardcoded id, so a second would have to invent another
+function iconCurves() {
+  const svg = iconSvg();
+  svg.appendChild(svgEl("rect", {
+    x: 2.5, y: 2.5, width: 19, height: 19, rx: 2,
+    fill: "none", stroke: "currentColor", "stroke-width": 1.3, "stroke-opacity": 0.5,
+  }));
+  svg.appendChild(svgEl("path", {
+    d: "M 4 20 C 9 20, 8 8, 12 8 S 15 4, 20 4",
+    fill: "none", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round",
+  }));
+  svg.appendChild(svgEl("circle", { cx: 12, cy: 8, r: 1.9, fill: "currentColor" }));
+  return svg;
+}
+
 // two nodes merging into one, drawn with the same curve the DAG rail uses
 function iconBlend() {
   const svg = iconSvg();
@@ -434,10 +454,11 @@ function iconBlend() {
   return svg;
 }
 
-// The picker groups posterize + dither behind one button — same idea (reduce to
-// N colors), different palette algorithm — so choosing between them is a Method
-// dropdown rather than two icons. Presentation only: the registry, the stored
-// effect names, and the tree still treat them as two separate effects.
+// Some buttons stand for two effects that are one idea with two algorithms —
+// posterize/dither (reduce to N colors), curves/gamma (reshape tone) — so
+// choosing between them is a Method dropdown rather than two icons.
+// Presentation only: the registry, the stored effect names, and the tree still
+// treat each pair as two separate effects.
 const EFFECT_BUTTONS = [
   { key: "blur", label: "Gaussian blur", icon: iconBlur, effects: ["blur"] },
   { key: "edges", label: "Sobel edges", icon: iconEdges, effects: ["edges"] },
@@ -447,6 +468,13 @@ const EFFECT_BUTTONS = [
     icon: iconPosterize,
     effects: ["posterize", "dither"],
     methods: { posterize: "k-means clustering", dither: "Floyd–Steinberg dither" },
+  },
+  {
+    key: "curves",
+    label: "Tone curve",
+    icon: iconCurves,
+    effects: ["curves", "gamma"],
+    methods: { curves: "Multi-point curve", gamma: "Gamma correction" },
   },
   { key: "pixelate", label: "Pixelate", icon: iconPixelate, effects: ["pixelate"] },
   { key: "blend", label: "Blend with…", icon: iconBlend, effects: ["blend"] },
@@ -514,17 +542,278 @@ function buildMethodRow(group) {
   return row;
 }
 
+// ---------- Tone curve editor ----------
+
+// Line-for-line mirror of `_curve_lut` in server/effects.py: Fritsch–Carlson
+// monotone cubic Hermite interpolation, sampled at all 256 input levels. The
+// duplication is deliberate — the editor has to draw the exact transfer
+// function the server will apply, and asking the server per drag frame would
+// cost a round trip per pointermove. Change one, change the other.
+function curveLut(points) {
+  const pts = [...points].sort((a, b) => a[0] - b[0]);
+  const x = pts.map((p) => p[0]);
+  const y = pts.map((p) => p[1]);
+  const n = x.length;
+
+  const h = [], delta = [];
+  for (let i = 0; i < n - 1; i++) {
+    h.push(x[i + 1] - x[i]);
+    delta.push((y[i + 1] - y[i]) / h[i]);
+  }
+  // tangents: the average of the two adjacent secants, one-sided at the ends
+  const m = new Array(n);
+  m[0] = delta[0];
+  m[n - 1] = delta[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = (delta[i - 1] + delta[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (delta[i] === 0) {
+      // a flat segment must stay flat, or the cubic bulges out of it
+      m[i] = m[i + 1] = 0;
+    } else {
+      const a = m[i] / delta[i], b = m[i + 1] / delta[i];
+      const s = a * a + b * b;
+      if (s > 9) {
+        const t = 3 / Math.sqrt(s);
+        m[i] = t * a * delta[i];
+        m[i + 1] = t * b * delta[i];
+      }
+    }
+  }
+
+  const lut = new Uint8Array(256);
+  let seg = 0;
+  for (let level = 0; level < 256; level++) {
+    while (seg < n - 2 && level >= x[seg + 1]) seg++;
+    const t = (level - x[seg]) / h[seg];
+    const t2 = t * t, t3 = t2 * t;
+    const v =
+      (2 * t3 - 3 * t2 + 1) * y[seg] +
+      (t3 - 2 * t2 + t) * h[seg] * m[seg] +
+      (-2 * t3 + 3 * t2) * y[seg + 1] +
+      (t3 - t2) * h[seg] * m[seg + 1];
+    lut[level] = Math.min(255, Math.max(0, Math.round(v)));
+  }
+  return lut;
+}
+
+const CURVE = { size: 256, hit: 10, maxPoints: 16 };
+
+// Unlike the cluster plot, this is an *input*: buildParamControls() throws it
+// away and rebuilds it on every effect change, so it can't be an init()-time
+// singleton on a fixed id. All state lives in this closure and every listener
+// is per-instance — dragging uses pointer capture on the canvas rather than the
+// cluster plot's window-level mousemove/mouseup, which would leak one pair of
+// listeners per rebuild.
+function buildCurveEditor(p, current, sourceNodeId) {
+  let points = (Array.isArray(current) ? current : p.default).map((pt) => [pt[0], pt[1]]);
+  let hist = null;
+
+  const row = document.createElement("div");
+  row.className = "param-row";
+
+  const label = document.createElement("label");
+  const nameSpan = document.createElement("span");
+  nameSpan.textContent = p.label;
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "curve-reset";
+  reset.textContent = "reset";
+  label.append(nameSpan, reset);
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "curve-canvas";
+  canvas.width = canvas.height = CURVE.size;
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute("aria-label", "Tone curve editor");
+
+  // the points travel as JSON on a hidden input so readParams() finds them the
+  // same way it finds every other control: by [data-param]
+  const input = document.createElement("input");
+  input.type = "hidden";
+  input.dataset.param = p.name;
+
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "drag to move · click to add · double-click to remove";
+
+  row.append(label, canvas, input, hint);
+
+  // ---- drawing
+
+  const toCanvas = (v) => (v / 255) * CURVE.size;
+  const flip = (v) => CURVE.size - toCanvas(v); // y grows downward on a canvas
+
+  function draw() {
+    const ctx = canvas.getContext("2d");
+    const s = CURVE.size;
+    ctx.clearRect(0, 0, s, s);
+
+    if (hist) {
+      // sqrt so one spike (a clipped sky, a black border) doesn't flatten the rest
+      const peak = Math.sqrt(Math.max(...hist)) || 1;
+      ctx.fillStyle = "rgba(214, 218, 226, 0.16)";
+      for (let i = 0; i < 256; i++) {
+        const bh = (Math.sqrt(hist[i]) / peak) * s;
+        ctx.fillRect((i / 256) * s, s - bh, s / 256 + 0.5, bh);
+      }
+    }
+
+    ctx.strokeStyle = "rgba(139, 147, 163, 0.25)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const at = (i / 4) * s;
+      ctx.beginPath();
+      ctx.moveTo(at, 0); ctx.lineTo(at, s);
+      ctx.moveTo(0, at); ctx.lineTo(s, at);
+      ctx.stroke();
+    }
+
+    ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = "rgba(139, 147, 163, 0.45)";
+    ctx.beginPath();
+    ctx.moveTo(0, s); ctx.lineTo(s, 0);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const lut = curveLut(points);
+    // canvas has no currentColor, so read the .fx-* hue off the element itself
+    ctx.strokeStyle = getComputedStyle(canvas).color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 256; i++) {
+      const cx = toCanvas(i), cy = flip(lut[i]);
+      i === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = getComputedStyle(canvas).color;
+    for (const [px, py] of points) {
+      ctx.beginPath();
+      ctx.arc(toCanvas(px), flip(py), 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function commit() {
+    input.value = JSON.stringify(points);
+    draw();
+    // what drives live preview: the delegated `input` listeners on
+    // #effect-params and #edit-params, through the usual 250 ms debounce
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  // ---- interaction
+
+  // the canvas is CSS-scaled to the panel width, so pointer coordinates have to
+  // come off the rendered box, not the backing store
+  function atEvent(e) {
+    const r = canvas.getBoundingClientRect();
+    const scale = 255 / r.width;
+    return {
+      x: Math.round((e.clientX - r.left) * scale),
+      y: Math.round((r.bottom - e.clientY) * (255 / r.height)),
+      slop: CURVE.hit * scale,
+    };
+  }
+
+  const nearest = (pos) => {
+    let best = -1, bestD = Infinity;
+    points.forEach(([px, py], i) => {
+      const d = Math.hypot(px - pos.x, py - pos.y);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return bestD <= pos.slop ? best : -1;
+  };
+
+  const clamp = (v) => Math.max(0, Math.min(255, v));
+  let dragging = -1;
+
+  canvas.addEventListener("pointerdown", (e) => {
+    const pos = atEvent(e);
+    let i = nearest(pos);
+    if (i === -1) {
+      if (points.length >= CURVE.maxPoints) return;
+      // a new interior point; the endpoints keep the domain at 0..255
+      const x = Math.max(1, Math.min(254, pos.x));
+      if (points.some((pt) => pt[0] === x)) return;
+      i = points.findIndex((pt) => pt[0] > x);
+      points.splice(i, 0, [x, clamp(pos.y)]);
+    }
+    dragging = i;
+    canvas.setPointerCapture(e.pointerId);
+    commit();
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (dragging === -1) return;
+    const pos = atEvent(e);
+    const pt = points[dragging];
+    // endpoints are x-locked at 0 and 255 (that is what guarantees a
+    // full-domain curve); interior points stay strictly between their neighbours
+    if (dragging > 0 && dragging < points.length - 1) {
+      pt[0] = Math.max(points[dragging - 1][0] + 1,
+                       Math.min(points[dragging + 1][0] - 1, pos.x));
+    }
+    pt[1] = clamp(pos.y);
+    commit();
+  });
+
+  const endDrag = (e) => {
+    if (dragging === -1) return;
+    dragging = -1;
+    canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  canvas.addEventListener("dblclick", (e) => {
+    const i = nearest(atEvent(e));
+    if (i > 0 && i < points.length - 1) {
+      points.splice(i, 1);
+      commit();
+    }
+  });
+
+  reset.onclick = () => {
+    points = p.default.map((pt) => [pt[0], pt[1]]);
+    commit();
+  };
+
+  // ---- histogram backdrop
+
+  input.value = JSON.stringify(points);
+  draw();
+  if (sourceNodeId !== null) {
+    api(`/api/nodes/${sourceNodeId}/histogram`)
+      .then((data) => {
+        // a rebuild can land first, leaving this canvas detached
+        if (!canvas.isConnected) return;
+        hist = data.luma;
+        draw();
+      })
+      .catch((err) => console.warn("histogram failed:", err)); // the grid draws fine without it
+  }
+  return row;
+}
+
 // ---------- Effects ----------
 
 // The Apply panel and the edit modal both build their controls here and read
 // them back through readParams(), so the two can never disagree about ranges,
 // defaults, or how a value is coerced. `values` seeds the controls — empty for
 // Apply (fresh defaults), an existing node's params when editing.
-function buildParamControls(container, effectName, values = {}) {
+// `sourceNodeId` is the node whose pixels the effect will be applied to — the
+// same node the preview composes on — and is what the curve editor draws its
+// histogram from.
+function buildParamControls(container, effectName, values = {}, sourceNodeId = null) {
   const effect = state.effects.find((e) => e.name === effectName);
   container.innerHTML = "";
   for (const p of effect.params) {
     const current = values[p.name] ?? p.default;
+    if (p.type === "points") {
+      container.appendChild(buildCurveEditor(p, current, sourceNodeId));
+      continue;
+    }
     const row = document.createElement("div");
     row.className = "param-row";
     const label = document.createElement("label");
@@ -600,7 +889,7 @@ function appendBlendTarget(container, { text, excludeId, selected = null, maxId 
 
 function renderEffectControls() {
   const box = $("effect-params");
-  const effect = buildParamControls(box, state.effect);
+  const effect = buildParamControls(box, state.effect, {}, state.nodeId);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {
     const hasTarget = appendBlendTarget(box, {
@@ -618,7 +907,10 @@ function renderEffectControls() {
 function readParams(container, effectName) {
   const params = {};
   container.querySelectorAll("[data-param]").forEach((el) => {
-    params[el.dataset.param] = el.type === "range" ? Number(el.value) : el.value;
+    if (el.type === "range") params[el.dataset.param] = Number(el.value);
+    // the curve editor's control points, which only fit in a control as JSON
+    else if (el.type === "hidden") params[el.dataset.param] = JSON.parse(el.value);
+    else params[el.dataset.param] = el.value;
   });
   let parent2_id = null;
   if (effectName === "blend") {
@@ -954,7 +1246,9 @@ function openEdit(node) {
   }
   edit.node = node;
   $("edit-title").textContent = `#${node.id} ${nodeLabel(node)}`;
-  buildParamControls($("edit-params"), node.effect, node.params || {});
+  // the node's *parent* — editing re-applies the effect to the node's input,
+  // which is both what the preview shows and what the histogram describes
+  buildParamControls($("edit-params"), node.effect, node.params || {}, node.parent_id);
   if (node.effect === "blend") {
     appendBlendTarget($("edit-params"), {
       text: "Blend with",

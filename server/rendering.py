@@ -94,6 +94,26 @@ def cluster_data(node_id: int) -> Path:
     return out
 
 
+HIST_SAMPLE = 512
+
+
+def histogram(node_id: int) -> dict:
+    """Luma histogram of a node's rendered pixels, drawn behind the tone-curve
+    editor's grid.
+
+    Deliberately not cached to disk the way `cluster_data` is: k-means is
+    expensive, this is one pass over a reduced decode (`draft()` lets libjpeg
+    scale during the DCT), so it costs far less than the render it reads.
+    Staying uncached also keeps it out of `delete_render_files` and
+    `storage_stats` — no new file kind under `renders/`, no new invalidation edge.
+    """
+    im = Image.open(render_node(node_id))
+    im.draft("RGB", (HIST_SAMPLE, HIST_SAMPLE))
+    arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+    luma = (arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)).astype(np.uint8)
+    return {"luma": np.bincount(luma.ravel(), minlength=256).tolist()}
+
+
 def delete_render_files(node_ids: list[int]) -> None:
     for node_id in node_ids:
         render_path(node_id).unlink(missing_ok=True)

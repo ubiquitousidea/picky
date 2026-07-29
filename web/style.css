@@ -16,6 +16,10 @@
   --rb-teal: #7fb5ae;
   --rb-blue: #8aa7d6;
   --rb-violet: #ab93cc;
+  /* the seven above are the tree's lane palette and were all claimed by
+     .fx-* classes; these two exist only so curves and gamma get their own */
+  --rb-pink: #cf8fb5;
+  --rb-cyan: #7fb0c8;
 }
 
 body {
@@ -167,7 +171,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 /* icon buttons; each takes its color from the .fx-* class it also carries */
 #effect-buttons {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 0.35rem;
   margin-bottom: 0.6rem;
 }
@@ -201,6 +205,34 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
+}
+/* modelled on #cluster-canvas, but sized in % so the one canvas fits both the
+   300px side panel and the narrower edit modal. `color` is what the curve and
+   its handles are drawn in — canvas has no currentColor to inherit. */
+.curve-canvas {
+  width: 100%;
+  aspect-ratio: 1;
+  color: var(--rb-pink);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: crosshair;
+  touch-action: none; /* or a drag scrolls the panel on a touchscreen */
+}
+.curve-reset {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+}
+.curve-reset:hover { color: var(--text); }
+.param-row .hint {
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-align: center;
+  margin-top: 0.3rem;
 }
 #apply-btn,
 #preview-btn {
@@ -258,6 +290,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .fx-edges     { color: var(--rb-yellow); }
 .fx-dither    { color: var(--rb-orange); }
 .fx-pixelate  { color: var(--rb-green); }
+.fx-curves    { color: var(--rb-pink); }
+.fx-gamma     { color: var(--rb-cyan); }
 .node-edit,
 .node-del {
   border: none;

@@ -86,6 +86,66 @@ def fs_dither(img: np.ndarray, params: dict) -> np.ndarray:
     return np.asarray(out)
 
 
+def _curve_lut(points) -> np.ndarray:
+    """A 256-entry transfer function through `points`, interpolated with
+    Fritsch–Carlson monotone cubic Hermite splines.
+
+    Monotone rather than natural-cubic on purpose: an ordinary spline overshoots
+    between widely spaced control points, and a tone curve that dips below its
+    neighbours inverts local contrast — visible as banding in flat sky. The
+    clamp below is what rules that out.
+
+    `web/app.js` has a line-for-line mirror of this (`curveLut`) so the editor
+    can draw the exact function the server will apply without a round trip per
+    drag frame. Change one, change the other.
+    """
+    pts = sorted((int(x), int(y)) for x, y in points)
+    x = np.array([p[0] for p in pts], dtype=np.float64)
+    y = np.array([p[1] for p in pts], dtype=np.float64)
+
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    # tangents: the average of the two adjacent secants, one-sided at the ends
+    m = np.empty_like(x)
+    m[1:-1] = (delta[:-1] + delta[1:]) / 2
+    m[0], m[-1] = delta[0], delta[-1]
+    for i in range(len(delta)):
+        if delta[i] == 0:
+            # a flat segment must stay flat, or the cubic bulges out of it
+            m[i] = m[i + 1] = 0.0
+        else:
+            a, b = m[i] / delta[i], m[i + 1] / delta[i]
+            s = a * a + b * b
+            if s > 9:
+                t = 3.0 / np.sqrt(s)
+                m[i], m[i + 1] = t * a * delta[i], t * b * delta[i]
+
+    levels = np.arange(256, dtype=np.float64)
+    # searchsorted gives each level its segment; the ends are pinned to 0..255
+    # by validation, so no level falls outside [x[0], x[-1]]
+    seg = np.clip(np.searchsorted(x, levels, side="right") - 1, 0, len(x) - 2)
+    t = (levels - x[seg]) / h[seg]
+    t2, t3 = t * t, t * t * t
+    out = (
+        (2 * t3 - 3 * t2 + 1) * y[seg]
+        + (t3 - 2 * t2 + t) * h[seg] * m[seg]
+        + (-2 * t3 + 3 * t2) * y[seg + 1]
+        + (t3 - t2) * h[seg] * m[seg + 1]
+    )
+    return np.rint(out).clip(0, 255).astype(np.uint8)
+
+
+def apply_curves(img: np.ndarray, params: dict) -> np.ndarray:
+    return _curve_lut(params["points"])[img]
+
+
+def apply_gamma(img: np.ndarray, params: dict) -> np.ndarray:
+    # 1/gamma, not gamma: users read "gamma > 1" as brighter, and the label says so
+    gamma = float(params["gamma"])
+    lut = np.rint(255.0 * (np.arange(256) / 255.0) ** (1.0 / gamma))
+    return lut.clip(0, 255).astype(np.uint8)[img]
+
+
 def pixelate(img: np.ndarray, params: dict) -> np.ndarray:
     block = int(params["block"])
     im = Image.fromarray(img)
@@ -145,6 +205,28 @@ EFFECTS = {
             {"name": "colors", "label": "Colors", "type": "int", "min": 2, "max": 64, "default": 8},
         ],
     },
+    "curves": {
+        "label": "Tone curve",
+        "apply": apply_curves,
+        "params": [
+            {
+                "name": "points",
+                "label": "Curve",
+                "type": "points",
+                "min": 0,
+                "max": 255,
+                "max_points": 16,
+                "default": [[0, 0], [255, 255]],
+            },
+        ],
+    },
+    "gamma": {
+        "label": "Gamma",
+        "apply": apply_gamma,
+        "params": [
+            {"name": "gamma", "label": "Gamma (>1 brightens)", "type": "float", "min": 0.1, "max": 4.0, "step": 0.01, "default": 1.0},
+        ],
+    },
     "pixelate": {
         "label": "Pixelate",
         "apply": pixelate,
@@ -188,6 +270,38 @@ def effect_specs() -> list[dict]:
     return specs
 
 
+def _clean_points(value, p: dict) -> list[list[int]]:
+    """Coerce a control-point list into something `_curve_lut` can always eat.
+
+    Total by design — it clamps and falls back rather than raising, like the
+    `choice` branch, because `validate_params` is called unguarded from the node,
+    preview and preset endpoints and an exception there would be a 500.
+    """
+    pts = []
+    for item in value if isinstance(value, (list, tuple)) else []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            x, y = int(item[0]), int(item[1])
+        except (TypeError, ValueError):
+            continue
+        pts.append([max(p["min"], min(p["max"], x)), max(p["min"], min(p["max"], y))])
+    # one point per x: the editor cannot make a duplicate, a preset or a
+    # hand-written request can, and two ys at one x has no meaning
+    pts = [[x, y] for x, y in sorted({x: y for x, y in pts}.items())]
+    if len(pts) < 2:
+        return [list(pt) for pt in p["default"]]
+    # pin the domain so the LUT covers every input level and never extrapolates
+    if pts[0][0] != p["min"]:
+        pts.insert(0, [p["min"], pts[0][1]])
+    if pts[-1][0] != p["max"]:
+        pts.append([p["max"], pts[-1][1]])
+    # trim from the middle, after pinning, so the domain survives the cap
+    if len(pts) > p["max_points"]:
+        pts = pts[: p["max_points"] - 1] + pts[-1:]
+    return pts
+
+
 def validate_params(effect: str, params: dict) -> dict:
     """Clamp and coerce params against the effect's spec; raises on unknown effect."""
     spec = BLEND_SPEC if effect == "blend" else EFFECTS[effect]
@@ -196,6 +310,8 @@ def validate_params(effect: str, params: dict) -> dict:
         value = params.get(p["name"], p["default"])
         if p["type"] == "choice":
             clean[p["name"]] = value if value in p["options"] else p["default"]
+        elif p["type"] == "points":
+            clean[p["name"]] = _clean_points(value, p)
         elif p["type"] == "float":
             value = float(value)
             clean[p["name"]] = max(p["min"], min(p["max"], value))

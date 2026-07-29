@@ -103,15 +103,42 @@ Key invariants that cut across files:
   effects, `setEffect()` is the single write path (retoggle buttons → rebuild
   params → re-preview), and each icon is inline SVG painting with
   `currentColor` so it takes its hue from the `.fx-<name>` class already on the
-  button. Posterize and Floyd–Steinberg dither share one button with a **Method**
-  dropdown, because they are the same idea with different palette algorithms.
-  That grouping is presentation only: `EFFECTS` still holds two entries, nodes
-  still store `posterize` or `dither`, and the cluster plot is still
-  posterize-only. The Method row is built by `renderEffectControls()`, *not*
+  button. Two buttons stand for a pair of effects behind a **Method** dropdown,
+  because each pair is one idea with two algorithms: posterize/dither (reduce to
+  N colors) and curves/gamma (reshape tone). That grouping is presentation only:
+  `EFFECTS` still holds two entries per pair, nodes still store `posterize` or
+  `dither`, `curves` or `gamma`, each gets its own `.fx-*` hue in the tree, and
+  the cluster plot is still posterize-only (as the curve editor is
+  curves-only). The Method row is built by `renderEffectControls()`, *not*
   `buildParamControls()` — the edit modal shares the latter and must never grow
   the control, since `PATCH` edits params, not a node's effect. Its `<select>`
   deliberately carries no `data-param`, which is what keeps `readParams()` from
   posting it as one.
+- **The tone curve's LUT is implemented twice, on purpose.**
+  `effects._curve_lut` and `curveLut()` in `web/app.js` are the same
+  Fritsch–Carlson monotone cubic interpolation, line for line. The editor has to
+  draw the exact transfer function the server will apply, and asking the server
+  would cost a round trip per `pointermove` — so the duplication buys WYSIWYG.
+  Change one, change the other; the interpolation is *monotone* rather than
+  natural-cubic because a plain spline overshoots between distant control points
+  and a tone curve that dips below its neighbours inverts local contrast.
+  `points` is also the first param type that is not a scalar, so it needs an
+  explicit branch in **both** `effects.validate_params` (whose `else` is a
+  catch-all `int()`) and `buildParamControls()` (whose `else` is a catch-all
+  range slider), plus one in `readParams()` — the points ride on a hidden
+  `<input data-param>` as JSON precisely so `[data-param]` still finds them and
+  a dispatched `input` event still drives the shared preview debounce.
+  `_clean_points` is deliberately *total*: it clamps and falls back rather than
+  raising, because `validate_params` is called unguarded and an exception there
+  would be a 500 rather than a 400.
+- **The curve editor's histogram (`GET /api/nodes/{id}/histogram`) is not
+  cached**, unlike the posterize cluster JSON: it is one pass over a
+  `draft()`-reduced decode, far cheaper than the render it reads. That is what
+  keeps it out of `delete_render_files` and `storage_stats` — no new file kind
+  under `renders/`, no new invalidation edge. It describes the node the effect
+  will be applied *to*, which is why `buildParamControls()` takes a
+  `sourceNodeId`: `state.nodeId` from the Apply panel, `node.parent_id` from the
+  edit modal — the same node each one previews against.
 - **Deletes cascade through both parent links** (`db.delete_node`'s recursive
   CTE), and no deletion order is FK-safe for two-parent graphs, so deletes run
   with `PRAGMA defer_foreign_keys = ON`. File cleanup (render/thumb/clusters)

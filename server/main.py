@@ -214,6 +214,13 @@ def get_clusters(node_id: int):
     return FileResponse(rendering.cluster_data(node_id), media_type="application/json")
 
 
+@app.get("/api/nodes/{node_id}/histogram")
+def get_histogram(node_id: int):
+    if db.get_node(node_id) is None:
+        raise HTTPException(404, "node not found")
+    return rendering.histogram(node_id)
+
+
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: int):
     node = db.get_node(node_id)
