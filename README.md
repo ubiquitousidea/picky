@@ -6,15 +6,19 @@ currently selected node, so you can return to any earlier state and branch off
 in a new direction. Images, trees, and rendered results persist across
 restarts.
 
-![Picky screenshot: the effect picker as a row of icon buttons with Posterize selected, a posterized crocus photo, its RGB cluster plot, and a work tree drawn as a commit-graph DAG with a branch and blend merges](docs/screenshot.png)
+![Picky screenshot: a posterized orchid photo, with the side panel showing the Select step above the effect picker (Posterize chosen) and its RGB cluster plot, and the work tree drawn along the bottom as a left-to-right commit graph with branches and blend merges](docs/screenshot.png)
 
 ## Features
 
 - **Image catalog** — upload JPGs (file picker or drag-and-drop); everything
   you've loaded stays in the gallery until you delete it.
 - **Branching work tree** — effects stack as nodes in a tree, not a linear
-  undo history. Click any node to view it or branch from it; delete a node to
+  undo history, drawn as a commit graph running left to right in a strip under
+  the image. Click any node to view it or branch from it; delete a node to
   prune it and everything derived from it.
+- **Live preview** — the effect you are setting up renders over the image as
+  you tune it, with no button to press. Uncheck **live preview** to see the
+  selected node's own pixels again.
 - **Effects**
   - *Posterize* — k-means clustering on RGB values, run in PCA-whitened space
     so clusters spread across color rather than bunching along the luminance
@@ -30,9 +34,9 @@ restarts.
     average, additive, multiplicative, or subtractive blending.
 - **Click to segment** — *Limit to object* confines any effect to one thing
   instead of the whole frame. Hit **Select object** and click the subject; a
-  [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) model outlines it,
-  the outline shows as an overlay, and the effect then applies inside it and
-  leaves the rest of the image alone. A dropdown chooses how much of the
+  [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) model finds it and
+  traces its boundary as an outline over the image, and the effect then applies
+  inside it and leaves the rest alone. A dropdown chooses how much of the
   subject one click means — *auto (best match)*, or explicitly *whole*,
   *part*, or *subpart* — and **invert** flips the region, so the effect hits
   the background instead. The selection is saved with the node (masked nodes
@@ -41,12 +45,13 @@ restarts.
   first use.
 - **Saved masks** — **Save selection as mask** names the region you just
   picked and freezes its pixels to disk, so it becomes a durable mask rather
-  than a click that has to be re-segmented. Pick it from the *Masks* panel or
-  the dropdown to reuse it on any node of that image, which is what lets you
-  stack several effects on one object without re-selecting it each time; the
-  shape is identical every time, and it survives deleting the node it was
-  picked on. A mask belongs to its image, and one still in use cannot be
-  deleted out from under the nodes that reference it.
+  than a click that has to be re-segmented. Tick it in the mask list to reuse it
+  on any node of that image, which is what lets you stack several effects on one
+  object without re-selecting it each time; the shape is identical every time,
+  and it survives deleting the node it was picked on. **Tick several and they
+  combine** — the effect applies to their union, so one blur can cover two
+  objects. A mask belongs to its image, and one still in use cannot be deleted
+  out from under the nodes that reference it.
 - **Presets** — save the chain that produced a node as a named recipe and
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
@@ -117,6 +122,14 @@ to `data/masks/<id>.png` as a 1-bit image, so reuse skips the model entirely
 and the shape cannot drift. That file sits outside `data/renders/` because
 everything there is a cache that invalidation is free to delete.
 
+A selection is a *union* in either form — a list of click points, or a list of
+saved mask ids — OR'd together with one `invert` over the result. Selections
+written before unions existed are upgraded when they are read, so nothing on
+disk is rewritten. Presets can only carry the click form (a mask is pixels, and
+pixels belong to one image), so a multi-mask selection is captured as the union
+of the clicks those masks were frozen from and re-segmented on whatever image
+the preset is replayed against.
+
 ## API
 
 | Method | Path | Purpose |
@@ -129,7 +142,7 @@ everything there is a cache that invalidation is free to delete.
 | PATCH  | `/api/nodes/{id}` | edit a node's `params`, `parent2_id`, or `selection` in place, re-rendering it and dropping its descendants' caches |
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
-| POST   | `/api/nodes/{id}/mask` | overlay PNG for a selection — a click (`x`, `y`, optional `invert`, `level`) segmented on the fly, or a saved `mask` id read back; persists nothing but the node's cached embedding |
+| POST   | `/api/nodes/{id}/mask` | outline PNG for a selection — `points` segmented on the fly, or `masks` (saved ids) read back, plus an optional `invert`; persists nothing but the node's cached embedding |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | DELETE | `/api/nodes/{id}` | delete a node and everything derived from it |

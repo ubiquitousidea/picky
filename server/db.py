@@ -5,6 +5,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+# effects imports no DB, so this direction is the acyclic one. It is needed for
+# one thing only: normalizing selections on the way out of node_dict.
+from .effects import validate_selection
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ORIGINALS_DIR = DATA_DIR / "originals"
 RENDERS_DIR = DATA_DIR / "renders"
@@ -75,6 +79,16 @@ def _now() -> str:
 
 
 def node_dict(row: sqlite3.Row) -> dict:
+    """A node row as a dict, with its selection normalized to the union shapes.
+
+    Normalizing here rather than at each reader means exactly one selection
+    shape ever leaves the database, so neither the API's clients nor
+    `update_node`'s no-op check have to know that rows written before unions
+    existed spell it `{"mask": n}` or `{"x": .., "y": ..}`. Nothing is rewritten
+    on disk — this is a read-time upgrade, and it covers the render path too,
+    since `rendering.render_node` reads its node through `get_node`.
+    """
+    selection = json.loads(row["selection"]) if row["selection"] else None
     return {
         "id": row["id"],
         "image_id": row["image_id"],
@@ -82,7 +96,7 @@ def node_dict(row: sqlite3.Row) -> dict:
         "parent2_id": row["parent2_id"],
         "effect": row["effect"],
         "params": json.loads(row["params"]) if row["params"] else None,
-        "selection": json.loads(row["selection"]) if row["selection"] else None,
+        "selection": validate_selection(selection),
         "created_at": row["created_at"],
     }
 
@@ -343,13 +357,22 @@ def delete_mask(mask_id: int) -> None:
 
 def nodes_using_mask(mask_id: int) -> list[int]:
     """Nodes whose selection references this saved mask. Deleting the mask out
-    from under them would change their committed pixels, so the API refuses."""
+    from under them would change their committed pixels, so the API refuses.
+
+    Two arms because a selection holds a *union* of mask ids, and nothing
+    migrates the pre-union `$.mask` spelling out of rows written before it:
+    `json_extract` reads the scalar, `json_each` walks the array (it yields no
+    rows when `selection` is NULL or has no `masks` key, so it needs no guard).
+    """
     with connect() as conn:
         return [
             r["id"]
             for r in conn.execute(
-                "SELECT id FROM nodes WHERE json_extract(selection, '$.mask') = ?",
-                (mask_id,),
+                "SELECT id FROM nodes WHERE json_extract(selection, '$.mask') = ?"
+                " UNION"
+                " SELECT n.id FROM nodes n, json_each(n.selection, '$.masks') j"
+                " WHERE j.value = ?",
+                (mask_id, mask_id),
             )
         ]
 

@@ -12,6 +12,8 @@ const state = {
   // switch, which used to take the pick with them. nodeId/imageId record what
   // it was picked against, so pruneSelection() can tell when it goes stale.
   selection: { value: null, nodeId: null, imageId: null },
+  // Preview runs by default; the checkbox is how you get back to the original.
+  livePreview: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -47,7 +49,10 @@ async function refreshGallery() {
 }
 
 async function selectImage(imageId, nodeId = null) {
-  if (imageId !== state.imageId) resetZoom();
+  if (imageId !== state.imageId) {
+    resetZoom();
+    clearOverlayCache(); // overlays are image-scoped, and so are their mask ids
+  }
   state.imageId = imageId;
   localStorage.setItem("picky:lastImage", imageId ?? "");
   if (imageId === null) {
@@ -79,19 +84,23 @@ function renderSelection() {
   $("delete-btn").hidden = !hasImage;
   $("export-btn").hidden = !hasImage;
   $("apply-btn").disabled = !hasImage;
-  $("preview-btn").disabled = !hasImage;
   if (hasImage) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
   }
   // the Apply panel describes an operation on the *selected* node, so it is
   // rebuilt whenever the selection moves: blend's target list, and the curve
-  // editor's histogram, both read the node we are now pointing at
+  // editor's histogram, both read the node we are now pointing at. Selection
+  // first — the effect controls no longer own it, and it reads as step 1.
+  renderSelectControls();
   renderEffectControls();
   renderTree();
   updatePresetControls();
-  renderMasks();
   updateClusterPlot();
+  // and last, re-enter the preview this function's exitPreview() just left. The
+  // node's own render is already painted above, so the unedited pixels show
+  // immediately and the effect lands on top when the debounce fires.
+  if (state.livePreview) enterApplyPreview();
 }
 
 // ---------- Zoom / pan ----------
@@ -216,11 +225,17 @@ function nodeParamsText(node) {
 }
 
 // The work tree is a DAG (blend nodes have two parents), drawn like a git
-// commit graph: one row per node in id order (ids are topological — parents
-// always precede children), with colored lanes in a left gutter that fork at
-// branches and merge into blend rows.
+// commit graph laid on its side: one *column* per node in id order (ids are
+// topological — parents always precede children), flowing left to right, with
+// colored lanes in a gutter above the chips that fork at branches and merge
+// into blend columns.
+//
+// layoutGraph() below is unaffected by that orientation — it is a lane packer
+// whose output ("this step sits in lane k; these lanes pass it by; these
+// parents link in") names no axis. Only buildRailCell() and the DOM know which
+// way the graph runs.
 
-const RAIL = { rowH: 28, dotR: 4 };
+const RAIL = { colW: 108, dotR: 4 };
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 let lanePaletteCache = null;
@@ -293,32 +308,37 @@ function svgEl(tag, attrs) {
   return el;
 }
 
+// The flow axis is x (0 → mid → colW) and the cross axis is y (one lane per
+// track). This is the vertical rail's geometry with the two swapped.
 function buildRailCell(row, laneCount, laneWidth) {
-  const H = RAIL.rowH;
-  const mid = H / 2;
-  const laneX = (k) => laneWidth / 2 + k * laneWidth;
+  const W = RAIL.colW;
+  const mid = W / 2;
+  const laneY = (k) => laneWidth / 2 + k * laneWidth;
+  // a linear chain occupies one lane; floor the height so it is a rail and not
+  // a sliver, and so every column in the strip lines up
+  const H = Math.max(laneCount, 2) * laneWidth;
   const svg = svgEl("svg", {
-    width: laneCount * laneWidth,
+    width: W,
     height: H,
     class: `tree-rail fx-${row.node.effect || "original"}`,
   });
   for (const k of row.passThrough) {
     svg.appendChild(svgEl("line", {
-      x1: laneX(k), y1: 0, x2: laneX(k), y2: H,
+      x1: 0, y1: laneY(k), x2: W, y2: laneY(k),
       stroke: laneColor(k), "stroke-width": 2,
     }));
   }
   for (const { fromLane, colorLane } of row.parentLinks) {
     if (fromLane === row.lane) {
       svg.appendChild(svgEl("line", {
-        x1: laneX(fromLane), y1: 0, x2: laneX(fromLane), y2: mid,
+        x1: 0, y1: laneY(fromLane), x2: mid, y2: laneY(fromLane),
         stroke: laneColor(colorLane), "stroke-width": 2,
       }));
     } else {
-      const x1 = laneX(fromLane);
-      const x2 = laneX(row.lane);
+      const y1 = laneY(fromLane);
+      const y2 = laneY(row.lane);
       svg.appendChild(svgEl("path", {
-        d: `M ${x1} 0 C ${x1} ${mid}, ${x2} 0, ${x2} ${mid}`,
+        d: `M 0 ${y1} C ${mid} ${y1}, 0 ${y2}, ${mid} ${y2}`,
         stroke: laneColor(colorLane), "stroke-width": 2,
         fill: "none", "stroke-linecap": "round",
       }));
@@ -326,12 +346,12 @@ function buildRailCell(row, laneCount, laneWidth) {
   }
   if (row.continues) {
     svg.appendChild(svgEl("line", {
-      x1: laneX(row.lane), y1: mid, x2: laneX(row.lane), y2: H,
+      x1: mid, y1: laneY(row.lane), x2: W, y2: laneY(row.lane),
       stroke: laneColor(row.lane), "stroke-width": 2,
     }));
   }
   const dot = svgEl("circle", {
-    cx: laneX(row.lane), cy: mid, r: RAIL.dotR, fill: "currentColor",
+    cx: mid, cy: laneY(row.lane), r: RAIL.dotR, fill: "currentColor",
   });
   if (row.node.id === state.nodeId) {
     dot.setAttribute("stroke", "#e6e9ef");
@@ -341,11 +361,11 @@ function buildRailCell(row, laneCount, laneWidth) {
   return svg;
 }
 
-function buildTreeRow(row, laneCount, laneWidth) {
+function buildTreeCol(row, laneCount, laneWidth) {
   const node = row.node;
   const wrap = document.createElement("div");
-  wrap.className = "tree-row";
-  wrap.style.height = `${RAIL.rowH}px`;
+  wrap.className = "tree-col";
+  wrap.style.width = `${RAIL.colW}px`;
   wrap.appendChild(buildRailCell(row, laneCount, laneWidth));
 
   const div = document.createElement("div");
@@ -357,20 +377,17 @@ function buildTreeRow(row, laneCount, laneWidth) {
   const label = document.createElement("span");
   label.className = "fx-label";
   label.textContent = nodeLabel(node);
-  div.append(idSpan, label);
+  // the badge rides on the id line, not the label: the label ellipsises at this
+  // width, and an ellipsised badge is an invisible one
   if (node.selection) {
     const badge = document.createElement("span");
     badge.className = "sel-badge";
     badge.textContent = "◎";
-    div.appendChild(badge);
+    idSpan.append(" ", badge);
   }
+  div.append(idSpan, label);
+  // a column is too narrow for the params; the tooltip carries them instead
   div.title = `#${node.id} ${nodeLabel(node)}${node.params ? " · " + nodeParamsText(node) : ""}`;
-  if (node.params) {
-    const span = document.createElement("span");
-    span.className = "params";
-    span.textContent = nodeParamsText(node);
-    div.appendChild(span);
-  }
   if (node.parent_id !== null) {
     const edit = document.createElement("button");
     edit.className = "node-edit";
@@ -408,8 +425,16 @@ function renderTree() {
     return;
   }
   const { rows, laneCount } = layoutGraph(state.nodes);
-  const laneWidth = laneCount <= 8 ? 12 : Math.max(8, Math.floor(96 / laneCount));
-  for (const row of rows) container.appendChild(buildTreeRow(row, laneCount, laneWidth));
+  const laneWidth = laneCount <= 4 ? 14 : Math.max(8, Math.floor(56 / laneCount));
+  let selected = null;
+  for (const row of rows) {
+    const col = buildTreeCol(row, laneCount, laneWidth);
+    if (row.node.id === state.nodeId) selected = col;
+    container.appendChild(col);
+  }
+  // the strip grows to the right as work accumulates, so the newest node — and
+  // the one Apply just created — would otherwise land off-screen
+  selected?.scrollIntoView({ inline: "nearest", block: "nearest" });
 }
 
 // ---------- Effect picker ----------
@@ -943,13 +968,13 @@ function appendBlendTarget(container, { text, excludeId, selected = null, maxId 
 }
 
 // A selection outlives an effect switch — that is the whole point of keeping it
-// in state — but not a move to pixels it was never picked against. A click spec
-// is tied to the node it was clicked on (its coords are in that node's pixel
-// space); a saved mask's pixels are frozen and fit any node of its own image.
+// in state — but not a move to pixels it was never picked against. Click points
+// are tied to the node they were clicked on (their coords are in that node's
+// pixel space); saved masks' pixels are frozen and fit any node of their image.
 function pruneSelection() {
   const s = state.selection;
   if (!s.value) return;
-  const stale = s.value.mask ? s.imageId !== state.imageId : s.nodeId !== state.nodeId;
+  const stale = s.value.masks ? s.imageId !== state.imageId : s.nodeId !== state.nodeId;
   if (stale) Object.assign(s, { value: null, nodeId: null, imageId: null });
   // a surviving mask ref now belongs to the node we moved to: nodeId records
   // what the selection is aimed at, and everything downstream (the overlay's
@@ -957,8 +982,29 @@ function pruneSelection() {
   else s.nodeId = state.nodeId;
 }
 
-function renderEffectControls() {
+// Step 1 of the panel. Its own section rather than a row inside #effect-params,
+// because selecting comes *before* choosing an effect and outlives every switch
+// between them — living in the effect's box meant buildParamControls()'s
+// `innerHTML = ""` tore the control down underneath a live selection.
+// pruneSelection() runs here, and only here, so a selection has exactly one
+// place it can expire; renderSelection() calls this before renderEffectControls().
+function renderSelectControls() {
   pruneSelection();
+  const box = $("select-controls");
+  box.innerHTML = "";
+  if (state.nodeId === null) {
+    clearMaskOverlay();
+    box.textContent = "No image selected.";
+    return;
+  }
+  appendSelectionControls(box, {
+    store: state.selection,
+    sourceNodeId: state.nodeId,
+    allowManage: true,
+  });
+}
+
+function renderEffectControls() {
   const box = $("effect-params");
   const effect = buildParamControls(box, state.effect, {}, state.nodeId);
   let canApply = state.imageId !== null;
@@ -969,20 +1015,9 @@ function renderEffectControls() {
     });
     canApply = canApply && hasTarget;
   }
-  if (state.nodeId !== null) {
-    // seeds itself from the store and repaints the overlay to match, so a pick
-    // survives this rebuild instead of being silently dropped by innerHTML = ""
-    appendSelectionControls(box, {
-      store: state.selection,
-      sourceNodeId: state.nodeId,
-    });
-  } else {
-    clearMaskOverlay();
-  }
   const group = groupFor(state.effect);
   if (group.methods) box.prepend(buildMethodRow(group));
   $("apply-btn").disabled = !canApply;
-  $("preview-btn").disabled = !canApply;
 }
 
 // `store` is the selection store the container's controls were bound to — the
@@ -1042,17 +1077,27 @@ async function applyEffect() {
 // edit modal. It returns the request to render, or null when the form can't
 // produce one yet. Keeping it a single slot means one debounce, one stale-response
 // counter, and one owner of the blob URL no matter who is previewing.
-const preview = { active: false, url: null, seq: 0, timer: null, source: null };
+const preview = {
+  active: false, url: null, seq: 0, timer: null, source: null, abort: null,
+};
 
-function togglePreview() {
-  if (preview.active) {
-    exitPreview(true);
-  } else {
-    preview.active = true;
-    preview.source = applyPreviewRequest;
-    $("preview-btn").classList.add("active");
-    refreshPreview();
-  }
+// Hand the preview to the Apply panel. Debounced rather than immediate, so
+// clicking quickly through tree nodes coalesces into one render instead of
+// firing a full-resolution one per node.
+function enterApplyPreview() {
+  if (state.nodeId === null) return;
+  preview.active = true;
+  preview.source = applyPreviewRequest;
+  schedulePreview();
+}
+
+function toggleLivePreview() {
+  state.livePreview = $("live-preview").checked;
+  localStorage.setItem("picky:livePreview", state.livePreview ? "1" : "");
+  // unchecking restores the selected node's own render — that *is* "show me the
+  // original", so there is no separate control for it
+  if (state.livePreview) enterApplyPreview();
+  else exitPreview(true);
 }
 
 // Apply composes the effect on top of the selected node, which is exactly what
@@ -1064,21 +1109,23 @@ function applyPreviewRequest() {
   const body = { effect, params };
   if (parent2_id !== null) body.parent2_id = parent2_id;
   if (selection) body.selection = selection;
-  return { nodeId: state.nodeId, body, busyEl: $("preview-btn") };
+  return { nodeId: state.nodeId, body, busyEl: $("preview-status") };
 }
 
 function exitPreview(restoreSrc) {
   clearTimeout(preview.timer);
   preview.timer = null;
   preview.seq++; // invalidate in-flight fetches
+  preview.abort?.abort();
+  preview.abort = null;
   preview.active = false;
   preview.source = null;
   // The overlay is deliberately *not* torn down here: its lifetime tracks the
-  // selection store, not preview mode, so toggling Preview off leaves a live
+  // selection store, not preview mode, so unchecking live preview leaves a live
   // pick lit. A mask still cannot outlive the node it was picked on, because
-  // every path that changes the selection runs renderEffectControls(), which
+  // every path that changes the selection runs renderSelectControls(), which
   // prunes the store and repaints the overlay from whatever is left.
-  $("preview-btn").classList.remove("active");
+  $("preview-status").classList.remove("busy");
   if (restoreSrc && state.nodeId !== null) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
   }
@@ -1098,12 +1145,22 @@ async function refreshPreview() {
   const req = preview.source();
   if (!req) return;
   const seq = ++preview.seq;
+  // A preview is a full-resolution render — over a second on a 24-megapixel
+  // original. The debounce coalesces a slider drag, but discrete clicks through
+  // the work tree are seconds apart, so each one starts a fresh render; abort
+  // the one it supersedes rather than leaving it to finish into a dropped
+  // response. (The server cannot interrupt a render already running in the
+  // threadpool, but this stops the queue behind it from filling up.)
+  preview.abort?.abort();
+  const ctl = new AbortController();
+  preview.abort = ctl;
   req.busyEl?.classList.add("busy");
   try {
     const res = await fetch(`/api/nodes/${req.nodeId}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req.body),
+      signal: ctl.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
@@ -1113,6 +1170,7 @@ async function refreshPreview() {
     if (preview.url) URL.revokeObjectURL(preview.url);
     preview.url = url;
   } catch (err) {
+    if (err.name === "AbortError") return; // superseded on purpose, not a failure
     console.warn("preview failed:", err); // keep the last frame; no alert mid-drag
   } finally {
     req.busyEl?.classList.remove("busy");
@@ -1121,10 +1179,11 @@ async function refreshPreview() {
 
 // ---------- Click-to-segment selection ----------
 
-// One overlay, one armed picker, one blob URL — the same single-slot model as
-// `preview`: whichever controls instance (Apply panel or edit modal) last drove
-// it owns it, and every selection change tears it down through exitPreview().
-const selPicker = { armed: null, url: null, seq: 0 };
+// One overlay, one armed picker — the same single-slot model as `preview`:
+// whichever controls instance (Apply panel or edit modal) last drove it owns it.
+// `cache` maps an overlay's identity to its blob URL and owns every URL's
+// lifetime, so nothing here revokes on replacement — only on a cache clear.
+const selPicker = { armed: null, seq: 0, cache: new Map() };
 
 function disarmPick() {
   selPicker.armed = null;
@@ -1132,7 +1191,38 @@ function disarmPick() {
   document.querySelectorAll(".sel-pick").forEach((b) => b.classList.remove("armed"));
 }
 
+// What an overlay depends on. Saved masks are frozen pixels, so their PNG is a
+// pure function of the ids and invert — `compute_mask` ignores the node
+// entirely for that shape. Click points are in one node's pixel space, so they
+// key on it too. Without this, walking the tree with a mask selected refetched
+// a byte-identical half-megapixel PNG per node, at ~0.5 s each.
+function overlayKey(sourceNodeId, selection) {
+  return selection.masks
+    ? `m:${JSON.stringify(selection)}`
+    : `p:${sourceNodeId}:${JSON.stringify(selection)}`;
+}
+
+// Masks can be deleted or renamed and nodes re-rendered underneath a cached
+// point overlay, so the cache does not outlive the image it was filled for.
+function clearOverlayCache() {
+  for (const url of selPicker.cache.values()) URL.revokeObjectURL(url);
+  selPicker.cache.clear();
+}
+
+function paintOverlay(url) {
+  const overlay = $("mask-overlay");
+  overlay.src = url;
+  overlay.hidden = false;
+}
+
 async function updateMaskOverlay(sourceNodeId, selection, busyEl) {
+  const key = overlayKey(sourceNodeId, selection);
+  const hit = selPicker.cache.get(key);
+  if (hit) {
+    selPicker.seq++; // a cached paint still supersedes anything in flight
+    paintOverlay(hit);
+    return;
+  }
   const seq = ++selPicker.seq;
   busyEl?.classList.add("busy");
   try {
@@ -1143,13 +1233,12 @@ async function updateMaskOverlay(sourceNodeId, selection, busyEl) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
-    if (seq !== selPicker.seq) return; // stale response
-    const overlay = $("mask-overlay");
     const url = URL.createObjectURL(blob);
-    overlay.src = url;
-    overlay.hidden = false;
-    if (selPicker.url) URL.revokeObjectURL(selPicker.url);
-    selPicker.url = url;
+    // cache even a stale response: it cost a render, and the key says what it
+    // is, so a later selection that lands back here gets it for free
+    selPicker.cache.set(key, url);
+    if (seq !== selPicker.seq) return; // superseded; keep the pixels, drop the paint
+    paintOverlay(url);
   } catch (err) {
     console.warn("mask failed:", err); // the live preview still shows the result
   } finally {
@@ -1161,11 +1250,8 @@ function clearMaskOverlay() {
   selPicker.seq++; // invalidate in-flight fetches
   const overlay = $("mask-overlay");
   overlay.hidden = true;
-  overlay.removeAttribute("src");
-  if (selPicker.url) {
-    URL.revokeObjectURL(selPicker.url);
-    selPicker.url = null;
-  }
+  // the src stays pointing at a cached blob URL; the cache owns it, and
+  // re-selecting the same thing then repaints without a round trip
   disarmPick();
 }
 
@@ -1175,14 +1261,39 @@ function syncMaskOverlay(store, sourceNodeId, busyEl) {
   else clearMaskOverlay();
 }
 
+// A selection is a union in either of its two shapes: `{points: [...], invert}`
+// re-segmented by SAM, or `{masks: [...], invert}` loaded from frozen PNGs.
+// These helpers are the only things that know the shapes, so the control below
+// can treat "what is selected" as one list either way.
+const selPoints = (sel) => (sel && !sel.masks ? sel.points : []);
+const selMasks = (sel) => (sel && sel.masks ? sel.masks : []);
+
+function selSummary(sel) {
+  if (!sel) return "";
+  const names = selMasks(sel).map(
+    (id) => state.masks.find((m) => m.id === id)?.name ?? `mask #${id}`
+  );
+  if (names.length) return names.join(" + ");
+  const pts = selPoints(sel);
+  return pts.length === 1 ? `@ ${pts[0].x}, ${pts[0].y}` : `${pts.length} points`;
+}
+
 // The appendBlendTarget analogue for selections: any effect can be masked, so
 // like blend's target this is not a registry param. The state lives in `store`
 // — `state.selection` for the Apply panel, `edit.selection` for the modal — so
-// that rebuilding these controls (which happens on every effect switch) cannot
-// lose it, and so the two forms can be on screen at once. Every user change
-// dispatches a bubbling `input` event, so the existing delegated listeners on
-// the containers drive the shared preview debounce with no new wiring.
-function appendSelectionControls(container, { store, sourceNodeId, allowPick = true }) {
+// that the two forms can be on screen at once. Every user change dispatches a
+// bubbling `input` event, so the existing delegated listeners on the containers
+// drive the shared preview debounce with no new wiring.
+//
+// The saved-mask list is part of this control rather than a section of its own:
+// choosing masks *is* the selection, so keeping the picker, the level/invert
+// options, Save-as-mask, and the list of masks in one component is what stops
+// the panel's rendered state and the store from drifting apart. `allowManage`
+// is off in the edit modal — its page is inert, so a `prompt()` could not be
+// answered, and deleting a mask the node uses would 409 anyway.
+function appendSelectionControls(
+  container, { store, sourceNodeId, allowPick = true, allowManage = false }
+) {
   // rebuilding the control is exactly when a previously armed picker becomes
   // invalid: its commit closure now writes into a detached row
   disarmPick();
@@ -1228,51 +1339,115 @@ function appendSelectionControls(container, { store, sourceNodeId, allowPick = t
   optRow.className = "sel-row";
   optRow.append(level, invertLabel);
 
-  // Saved masks. Unlike "Select object" this stays live in the edit modal:
-  // re-picking needs a click on a page showModal() has made inert, but choosing
-  // frozen pixels needs no click, so an existing node can be retargeted in place.
-  const maskSel = document.createElement("select");
-  maskSel.className = "sel-mask";
-  const none = document.createElement("option");
-  none.value = "";
-  none.textContent = state.masks.length ? "— saved mask —" : "— no saved masks —";
-  maskSel.appendChild(none);
-  for (const m of state.masks) {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.textContent = m.name;
-    maskSel.appendChild(opt);
-  }
-  maskSel.disabled = !state.masks.length;
-  const maskRow = document.createElement("div");
-  maskRow.className = "sel-row";
-  maskRow.append(maskSel);
+  row.append(label, pickRow, optRow);
 
-  row.append(label, pickRow, maskRow, optRow);
+  // Save-as-mask, then the masks themselves — the order the workflow runs in:
+  // pick an object, freeze it, repeat, then tick the ones this effect applies to.
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "sel-save-mask";
+  save.textContent = "Save selection as mask";
+  if (allowManage) row.appendChild(save);
+
+  const list = document.createElement("ul");
+  list.className = "sel-mask-list";
+  row.appendChild(list);
   container.appendChild(row);
 
   const current = () => store.value;
-  const maskName = (id) => state.masks.find((m) => m.id === id)?.name ?? `mask #${id}`;
-  const render = (sel) => {
-    coords.textContent = sel ? (sel.mask ? maskName(sel.mask) : `@ ${sel.x}, ${sel.y}`) : "";
-    pick.textContent = sel && !sel.mask ? "Re-pick object" : "Select object";
-    pick.disabled = !allowPick;
-    maskSel.value = sel?.mask ? String(sel.mask) : "";
-    level.value = sel && !sel.mask ? sel.level : "auto";
-    invert.checked = sel ? !!sel.invert : false;
-    // a frozen mask has no candidate masks left to re-rank
-    level.disabled = !sel || !!sel.mask;
-    invert.disabled = clear.disabled = !sel;
-  };
   const commit = (sel) => {
     store.value = sel;
     store.nodeId = sel ? sourceNodeId : null;
     store.imageId = sel ? state.imageId : null;
     render(sel);
     syncMaskOverlay(store, sourceNodeId, pick);
-    updateMaskControls();
     row.dispatchEvent(new Event("input", { bubbles: true }));
   };
+
+  // Ticking a mask unions it in; unticking takes it out. Crossing over from a
+  // click selection replaces it — the two shapes cannot mix, since one is a
+  // recipe and the other is pixels.
+  const toggleMask = (id) => {
+    const ids = selMasks(current());
+    const next = ids.includes(id) ? ids.filter((m) => m !== id) : [...ids, id];
+    commit(next.length ? { masks: next, invert: !!current()?.invert } : null);
+  };
+
+  // The rows are built once, not on every toggle: `state.masks` is fixed for
+  // this control's lifetime (anything that changes it goes through
+  // refreshMasks(), which rebuilds the whole control), so ticking one only ever
+  // needs to restyle the existing rows. Rebuilding them would detach the very
+  // element the click came from mid-handler.
+  const rows = [];
+  if (!state.masks.length) {
+    const empty = document.createElement("li");
+    empty.className = "hint";
+    empty.textContent = state.imageId === null
+      ? "Pick an image to see its masks."
+      : "Select an object above, then save it to reuse it on any node.";
+    list.appendChild(empty);
+  }
+  for (const mask of state.masks) {
+    const li = document.createElement("li");
+    li.className = "mask-row";
+    li.title = mask.used_by
+      ? `Used by ${mask.used_by} node${mask.used_by === 1 ? "" : "s"} — delete those first to remove it`
+      : "Include this mask in the selection";
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.tabIndex = -1; // the row owns the click; the box is the indicator
+
+    const text = document.createElement("div");
+    text.className = "preset-text";
+    const name = document.createElement("div");
+    name.className = "preset-name";
+    name.textContent = mask.name;
+    const summary = document.createElement("div");
+    summary.className = "preset-summary";
+    summary.textContent =
+      `${mask.width}×${mask.height}${mask.used_by ? ` · used ${mask.used_by}×` : ""}`;
+    text.append(name, summary);
+
+    li.append(box, text);
+    if (allowManage) {
+      const del = document.createElement("button");
+      del.className = "mask-del";
+      del.textContent = "×";
+      del.title = "Delete mask";
+      del.onclick = (e) => {
+        e.stopPropagation();
+        deleteMask(mask);
+      };
+      li.appendChild(del);
+    }
+    li.onclick = () => toggleMask(mask.id);
+    list.appendChild(li);
+    rows.push({ mask, li, box });
+  }
+
+  function render(sel) {
+    const points = selPoints(sel);
+    coords.textContent = selSummary(sel);
+    pick.textContent = points.length ? "Re-pick object" : "Select object";
+    pick.disabled = !allowPick;
+    // a frozen mask has no candidate masks left to re-rank
+    level.value = points.length === 1 ? points[0].level : "auto";
+    level.disabled = points.length !== 1;
+    invert.checked = sel ? !!sel.invert : false;
+    invert.disabled = clear.disabled = !sel;
+    // a saved mask is already saved; only a fresh pick has anything to freeze
+    save.disabled = maskBusy || state.imageId === null || !points.length;
+    save.title = save.disabled
+      ? "Select an object first — a saved mask is already saved"
+      : "Freeze this selection's pixels so you can reuse it without re-picking";
+    const chosen = selMasks(sel);
+    for (const { mask, li, box } of rows) {
+      box.checked = chosen.includes(mask.id);
+      li.classList.toggle("selected", box.checked);
+      li.classList.toggle("disabled", maskBusy);
+    }
+  }
 
   if (allowPick) {
     pick.onclick = () => {
@@ -1280,28 +1455,30 @@ function appendSelectionControls(container, { store, sourceNodeId, allowPick = t
         disarmPick();
         return;
       }
-      // single-shot: the click handler in initZoom calls pick() then disarms
+      // single-shot: the click handler in initZoom does not disarm, so the
+      // closure does it before committing
       selPicker.armed = {
         pick: (x, y) => {
           disarmPick();
-          commit({ x, y, invert: invert.checked, level: level.value });
+          commit({ points: [{ x, y, level: level.value }], invert: invert.checked });
         },
       };
       pick.classList.add("armed");
       $("preview-wrap").classList.add("picking");
     };
   }
-  maskSel.onchange = () =>
-    commit(maskSel.value ? { mask: Number(maskSel.value), invert: invert.checked } : null);
   level.onchange = () => {
-    const sel = current();
-    if (sel) commit({ ...sel, level: level.value });
+    const pts = selPoints(current());
+    if (pts.length === 1) {
+      commit({ points: [{ ...pts[0], level: level.value }], invert: current().invert });
+    }
   };
   invert.onchange = () => {
     const sel = current();
     if (sel) commit({ ...sel, invert: invert.checked });
   };
   clear.onclick = () => commit(null);
+  save.onclick = () => saveMask();
 
   // seed without dispatching `input` — nothing user-driven happened yet — but do
   // repaint the overlay unconditionally, so it always agrees with the store:
@@ -1428,100 +1605,27 @@ async function deletePreset(preset) {
 //
 // Presets are global and fetched once; masks are image-scoped, so the analogous
 // rule is: fetched on image change (in selectImage), refreshed only after a
-// save/rename/delete. renderSelection() calls the synchronous renderMasks().
+// save/rename/delete. The list itself is drawn by appendSelectionControls(),
+// because ticking a mask *is* editing the selection — see the comment there.
 
 let maskBusy = false;
 
 async function refreshMasks() {
   state.masks = await api(`/api/images/${state.imageId}/masks`);
-  renderMasks();
-  // the selection control's picker was built from the old list
-  renderEffectControls();
-}
-
-function renderMasks() {
-  const list = $("mask-list");
-  list.innerHTML = "";
-  if (!state.masks.length) {
-    const empty = document.createElement("li");
-    empty.className = "hint";
-    empty.textContent = state.imageId === null
-      ? "Pick an image to see its masks."
-      : "Select an object above, then save it here to reuse it on any node.";
-    list.appendChild(empty);
-    updateMaskControls();
-    return;
-  }
-  for (const mask of state.masks) {
-    const li = document.createElement("li");
-    li.className = "mask-row";
-    li.title = mask.used_by
-      ? `Used by ${mask.used_by} node${mask.used_by === 1 ? "" : "s"} — delete those first to remove it`
-      : "Use this mask for the next effect";
-
-    const text = document.createElement("div");
-    text.className = "preset-text";
-    const name = document.createElement("div");
-    name.className = "preset-name";
-    name.textContent = mask.name;
-    const summary = document.createElement("div");
-    summary.className = "preset-summary";
-    summary.textContent = `${mask.width}×${mask.height}${mask.used_by ? ` · used ${mask.used_by}×` : ""}`;
-    text.append(name, summary);
-
-    const del = document.createElement("button");
-    del.className = "mask-del";
-    del.textContent = "×";
-    del.title = "Delete mask";
-    del.onclick = (e) => {
-      e.stopPropagation();
-      deleteMask(mask);
-    };
-
-    li.append(text, del);
-    li.onclick = () => useMask(mask);
-    list.appendChild(li);
-  }
-  updateMaskControls();
-}
-
-function updateMaskControls() {
-  const sel = state.selection.value;
-  const canSave = state.imageId !== null && !!sel && !sel.mask;
-  const btn = $("save-mask-btn");
-  btn.disabled = !canSave || maskBusy;
-  btn.title = canSave
-    ? "Freeze this selection's pixels so you can reuse it without re-picking"
-    : "Select an object first — a saved mask is already saved";
-  document.querySelectorAll("#mask-list .mask-row").forEach((li, i) => {
-    li.classList.toggle("selected", sel?.mask === state.masks[i]?.id);
-    li.classList.toggle("disabled", maskBusy);
-  });
-}
-
-// Clicking a row is the analogue of clicking a preset row: it acts on the
-// selected node. Here that means making the mask the Apply panel's selection.
-function useMask(mask) {
-  if (maskBusy || state.nodeId === null) return;
-  const sel = state.selection;
-  const already = sel.value?.mask === mask.id;
-  Object.assign(sel, {
-    value: already ? null : { mask: mask.id, invert: false },
-    nodeId: already ? null : state.nodeId,
-    imageId: already ? null : state.imageId,
-  });
-  renderEffectControls(); // reseeds the picker and repaints the overlay
-  updateMaskControls(); // moves the row highlight to (or off) this mask
-  if (preview.active) schedulePreview();
+  // a saved or deleted mask changes what the ids in a cached overlay key mean
+  clearOverlayCache();
+  // the mask list and the selection are one control, so redrawing it is how
+  // the list refreshes — and it reseeds the picker from the new list too
+  renderSelectControls();
 }
 
 async function saveMask() {
   const sel = state.selection.value;
-  if (!sel || sel.mask || state.imageId === null) return;
+  if (!sel || sel.masks || state.imageId === null) return;
   const name = prompt("Name this mask:", "");
   if (name === null || !name.trim()) return;
   maskBusy = true;
-  updateMaskControls();
+  renderSelectControls();
   try {
     const created = await api(`/api/images/${state.imageId}/masks`, {
       method: "POST",
@@ -1536,7 +1640,7 @@ async function saveMask() {
     // uses them rather than re-running SAM. `invert: false` because the PNG was
     // frozen post-invert — what was on screen is what got saved.
     Object.assign(state.selection, {
-      value: { mask: created.id, invert: false },
+      value: { masks: [created.id], invert: false },
       nodeId: state.nodeId,
       imageId: state.imageId,
     });
@@ -1546,7 +1650,7 @@ async function saveMask() {
     alert(`Could not save mask: ${err.message}`);
   } finally {
     maskBusy = false;
-    updateMaskControls();
+    renderSelectControls();
   }
 }
 
@@ -1555,8 +1659,12 @@ async function deleteMask(mask) {
   if (!confirm(`Delete the mask “${mask.name}”?`)) return;
   try {
     await api(`/api/masks/${mask.id}`, { method: "DELETE" });
-    if (state.selection.value?.mask === mask.id) {
-      Object.assign(state.selection, { value: null, nodeId: null, imageId: null });
+    const sel = state.selection.value;
+    if (sel?.masks?.includes(mask.id)) {
+      const rest = sel.masks.filter((id) => id !== mask.id);
+      // the rest of the union survives; only an emptied one clears the store
+      if (rest.length) sel.masks = rest;
+      else Object.assign(state.selection, { value: null, nodeId: null, imageId: null });
     }
     await refreshMasks();
   } catch (err) {
@@ -1673,14 +1781,16 @@ function editPreviewRequest() {
 }
 
 function openEdit(node) {
-  // select the node first: renderSelection() is the choke point that exits any
-  // running preview, so it has to happen before the modal starts its own
+  // Select the node first: renderSelection() is the choke point that exits any
+  // running preview, so it has to happen before the modal starts its own. Then
+  // exit unconditionally — with live preview, renderSelection() *re-enters* and
+  // leaves a debounce timer armed, and that timer would otherwise fire against
+  // whatever source it finds later. exitPreview() is what clears it.
   if (state.nodeId !== node.id) {
     state.nodeId = node.id;
     renderSelection();
-  } else {
-    exitPreview(false);
   }
+  exitPreview(false);
   edit.node = node;
   $("edit-title").textContent = `#${node.id} ${nodeLabel(node)}`;
   // the node's *parent* — editing re-applies the effect to the node's input,
@@ -1695,14 +1805,16 @@ function openEdit(node) {
     });
   }
   // No re-picking: showModal() makes the page inert, so clicking a new point is
-  // impossible from here — that means a new node from the Apply panel. Choosing
-  // a *saved* mask still works, since frozen pixels need no click. Coords are in
-  // the parent's space, which is what this previews.
+  // impossible from here — that means a new node from the Apply panel. Ticking
+  // *saved* masks still works, since frozen pixels need no click. Coords are in
+  // the parent's space, which is what this previews. allowManage is off for the
+  // same inertness reason: saveMask()'s prompt() could not be answered.
   edit.selection = { value: node.selection, nodeId: node.parent_id, imageId: state.imageId };
   appendSelectionControls($("edit-params"), {
     store: edit.selection,
     sourceNodeId: node.parent_id,
     allowPick: false,
+    allowManage: false,
   });
   const downstream = descendantsOf(node.id).length;
   $("edit-warning").textContent = downstream
@@ -1722,6 +1834,9 @@ function closeEdit(restoreSrc) {
   // selection, which openEdit() already left pointing at this same node
   syncMaskOverlay(state.selection, state.nodeId, null);
   $("edit-modal").close();
+  // and hand the preview back too. The Save path re-enters via selectImage(),
+  // but Cancel and Esc end here, and live preview should survive both.
+  if (state.livePreview && restoreSrc) enterApplyPreview();
 }
 
 async function saveEdit() {
@@ -1942,13 +2057,19 @@ async function init() {
   initZoom();
   initClusterPlot();
   $("apply-btn").onclick = applyEffect;
-  $("preview-btn").onclick = togglePreview;
-  $("effect-params").addEventListener("input", () => {
-    if (preview.active) schedulePreview();
-  });
+  // the preference outlives the session; only an explicit "" means opted out
+  state.livePreview = localStorage.getItem("picky:livePreview") !== "";
+  $("live-preview").checked = state.livePreview;
+  $("live-preview").onchange = toggleLivePreview;
+  // both control containers drive the one debounce; the selection lives in its
+  // own section now, so it needs its own listener
+  for (const id of ["effect-params", "select-controls"]) {
+    $(id).addEventListener("input", () => {
+      if (preview.active) schedulePreview();
+    });
+  }
   $("delete-btn").onclick = deleteImage;
   $("save-preset-btn").onclick = savePreset;
-  $("save-mask-btn").onclick = saveMask;
 
   $("stats-btn").onclick = openStats;
   $("stats-close-btn").onclick = () => $("stats-modal").close();
@@ -1982,7 +2103,7 @@ async function init() {
 
   await refreshGallery();
   await refreshPresets();
-  renderMasks(); // the empty-state hint, for a library with no images yet
+  renderSelectControls(); // the empty state, for a library with no images yet
   // deep links (?image=2&node=28) win over the last-viewed image
   const q = new URLSearchParams(location.search);
   const qImage = Number(q.get("image"));

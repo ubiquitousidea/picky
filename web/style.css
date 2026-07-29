@@ -22,14 +22,20 @@
   --rb-cyan: #7fb0c8;
 }
 
+/* The gallery and the side panel run the full height; the middle column splits
+   into the preview and, under it, the work tree's horizontal strip. */
 body {
   display: grid;
   grid-template-columns: 220px 1fr 300px;
+  grid-template-rows: 1fr auto;
   height: 100vh;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
+#gallery-panel, #side-panel { grid-row: 1 / 3; }
+#preview-panel { grid-row: 1; grid-column: 2; }
+#tree-section { grid-row: 2; grid-column: 2; }
 
 h1 {
   font-size: 1.25rem;
@@ -40,14 +46,22 @@ h1 {
   background-clip: text;
   color: transparent;
 }
-h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.6rem; }
+h2, summary {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.6rem;
+}
+#select-section h2 { color: var(--rb-teal); }
 #effects-section h2 { color: var(--rb-orange); }
-#tree-section h2 { color: var(--rb-green); }
-#presets-section h2 { color: var(--rb-teal); }
-#masks-section h2 { color: var(--rb-pink); }
-#cluster-section h2 { color: var(--rb-violet); }
+#presets-section summary { color: var(--rb-teal); }
+#cluster-section summary { color: var(--rb-violet); }
 #stats-modal h2 { color: var(--rb-blue); }
 #edit-modal h2 { color: var(--rb-orange); }
+/* Presets and the cluster plot are reference material, not part of the
+   pick → filter → apply loop, so they collapse out of the way by default. */
+summary { cursor: pointer; }
+details[open] > summary { margin-bottom: 0.6rem; }
 
 #cluster-canvas {
   width: 100%;
@@ -159,7 +173,9 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
 }
 #preview:active { cursor: grabbing; }
 /* Same intrinsic dimensions as the render + the same max constraints
-   + inset/margin centering = the exact box the flexed img resolves to. */
+   + inset/margin centering = the exact box the flexed img resolves to.
+   Opaque: the PNG traces the selection's outline and is transparent
+   everywhere else, so there is nothing to see through. */
 #mask-overlay {
   position: absolute;
   inset: 0;
@@ -167,7 +183,6 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
   max-width: 100%;
   max-height: 100%;
   border-radius: 4px;
-  opacity: 0.45;
   pointer-events: none;
 }
 #preview-wrap.picking #preview { cursor: crosshair; }
@@ -214,7 +229,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 .fx-btn svg { width: 100%; height: 100%; display: block; }
 .fx-btn:hover { opacity: 1; }
-/* selected fills the way .tree-node does, not the way #preview-btn.active does:
+/* selected fills the way .tree-node does, not the way a solid button would:
    inverting the background would flatten each icon's tonal ramp */
 .fx-btn.selected { opacity: 1; background: var(--panel-2); border-color: currentColor; }
 .param-row { margin-bottom: 0.6rem; }
@@ -291,7 +306,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 .sel-clear:hover:not(:disabled) { color: var(--text); }
 .sel-clear:disabled { opacity: 0.4; cursor: default; }
-.sel-level, .sel-mask { flex: 1; min-width: 0; }
+.sel-level { flex: 1; min-width: 0; }
 /* .param-row .sel-invert outranks the `.param-row label` header styling,
    which would otherwise paint this yellow and spread it apart */
 .param-row .sel-invert {
@@ -304,8 +319,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   color: var(--text);
 }
 .sel-invert input { accent-color: var(--rb-teal); }
-#apply-btn,
-#preview-btn {
+#apply-btn {
   width: 100%;
   padding: 0.5rem;
   border: 1px solid var(--rb-orange);
@@ -316,44 +330,70 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   cursor: pointer;
 }
 #apply-btn:hover:not(:disabled) { background: var(--rb-orange); color: var(--bg); }
-#apply-btn:disabled, #preview-btn:disabled { opacity: 0.4; cursor: default; }
-#apply-btn.busy, #preview-btn.busy { opacity: 0.7; }
-#preview-btn {
-  border-color: var(--rb-blue);
-  color: var(--rb-blue);
-  margin-bottom: 0.5rem;
-}
-#preview-btn:hover:not(:disabled) { background: var(--rb-blue); color: var(--bg); }
-#preview-btn.active { background: var(--rb-blue); color: var(--bg); }
-
-/* Work tree */
-#tree { font-size: 0.85rem; color: var(--muted); overflow-x: auto; }
-.sel-badge { flex: none; color: var(--rb-teal); }
-.tree-row { display: flex; align-items: stretch; }
-.tree-rail { flex: none; display: block; }
-.tree-node {
+#apply-btn:disabled { opacity: 0.4; cursor: default; }
+#apply-btn.busy { opacity: 0.7; }
+/* Preview is live by default; unchecking is how you look at the original. */
+#preview-row {
   display: flex;
   align-items: center;
-  flex: 1;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+  font-size: 0.8rem;
+}
+#live-preview-label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
+#live-preview { accent-color: var(--rb-blue); }
+/* same idiom as #edit-status: the text is always there, `.busy` reveals it, so
+   the row never reflows when a render starts */
+#preview-status { color: var(--muted); font-size: 0.7rem; visibility: hidden; }
+#preview-status.busy { visibility: visible; }
+
+/* Work tree — a horizontal strip under the preview, one column per node in id
+   order, with the commit-graph lanes running left to right above the chips. */
+#tree-section {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.5rem 0.75rem;
+}
+#tree {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  width: max-content;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.sel-badge { flex: none; color: var(--rb-teal); }
+.tree-col { display: flex; flex-direction: column; flex: none; }
+.tree-rail { flex: none; display: block; }
+.tree-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.1rem;
   min-width: 0;
-  gap: 0.35rem;
-  padding: 0 0.5rem;
+  padding: 0.25rem 0.4rem;
+  margin: 0 2px;
   border-radius: 6px;
   cursor: pointer;
   border: 1px solid transparent;
 }
 .tree-node:hover { background: var(--panel-2); }
 .tree-node.selected { background: var(--panel-2); border-color: currentColor; }
-.tree-node .fx-label { white-space: nowrap; flex-shrink: 0; }
-.tree-node .params {
-  color: var(--muted);
-  font-size: 0.75rem;
+.tree-node .fx-label {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
 }
 .tree-node .node-id { color: var(--muted); font-size: 0.7rem; }
+/* the buttons float over the chip's top-right rather than taking a column of
+   their own, which at this width would leave no room for the label */
+.tree-node .node-edit, .tree-node .node-del { position: absolute; top: 1px; }
+.tree-node .node-edit { right: 14px; }
+.tree-node .node-del { right: 0; }
 .fx-blend     { color: var(--rb-red); }
 .fx-original  { color: var(--rb-teal); }
 .fx-posterize { color: var(--rb-violet); }
@@ -375,15 +415,20 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border-radius: 4px;
   visibility: hidden;
 }
-/* the edit button always precedes the delete button, so it carries the push-right */
-.node-edit { margin-left: auto; font-size: 0.8rem; }
+.node-edit { font-size: 0.8rem; }
 .tree-node:hover .node-edit,
 .tree-node:hover .node-del { visibility: visible; }
 .node-edit:hover { color: var(--rb-yellow); background: var(--panel); }
 .node-del:hover { color: var(--rb-red); background: var(--panel); }
 
-/* Actions */
-#actions-section { display: flex; flex-direction: column; gap: 0.5rem; }
+/* Actions — per-image, not part of the editing loop, so they sit at the bottom */
+#actions-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: auto;
+  font-size: 0.8rem;
+}
 #export-btn {
   display: block;
   text-align: center;
@@ -406,7 +451,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #delete-btn:hover { background: var(--rb-red); color: var(--bg); }
 
 /* Presets and saved masks — same row/button shapes, different hue */
-#save-preset-btn, #save-mask-btn {
+#save-preset-btn, .sel-save-mask {
   width: 100%;
   padding: 0.45rem;
   border: 1px solid var(--rb-teal);
@@ -416,11 +461,11 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   cursor: pointer;
 }
 #save-preset-btn:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
-#save-preset-btn:disabled, #save-mask-btn:disabled { opacity: 0.4; cursor: default; }
-#save-mask-btn { border-color: var(--rb-pink); color: var(--rb-pink); }
-#save-mask-btn:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
-#preset-list, #mask-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
-#preset-list .hint, #mask-list .hint { padding: 0 0.1rem; }
+#save-preset-btn:disabled, .sel-save-mask:disabled { opacity: 0.4; cursor: default; }
+.sel-save-mask { margin-top: 0.5rem; border-color: var(--rb-pink); color: var(--rb-pink); }
+.sel-save-mask:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
+#preset-list, .sel-mask-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
+#preset-list .hint, .sel-mask-list .hint { padding: 0 0.1rem; }
 .preset-row, .mask-row {
   display: flex;
   align-items: center;
@@ -432,6 +477,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   color: var(--rb-teal);
 }
 .mask-row { color: var(--rb-pink); }
+.mask-row input { flex: none; accent-color: var(--rb-pink); }
 .preset-row:hover, .mask-row:hover { background: var(--panel-2); border-color: currentColor; }
 .mask-row.selected { background: var(--panel-2); border-color: currentColor; }
 .preset-row.disabled, .mask-row.disabled { opacity: 0.4; pointer-events: none; }

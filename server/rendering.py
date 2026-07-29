@@ -6,12 +6,12 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import json
 
 from . import db, sam
-from .effects import EFFECTS, apply_blend, kmeans_cluster_data
+from .effects import EFFECTS, apply_blend, kmeans_cluster_data, validate_selection
 
 THUMB_SIZE = 320
 JPEG_QUALITY = 92
@@ -165,22 +165,44 @@ def node_embedding(node_id: int) -> np.ndarray:
 
 
 def compute_mask(node_id: int | None, selection: dict) -> np.ndarray:
-    """Boolean mask for a selection: either a saved mask's frozen pixels, or a
-    click re-segmented against a node's rendered pixels.
+    """Boolean mask for a selection: the union of some saved masks' frozen
+    pixels, or the union of some clicks re-segmented against a node's rendered
+    pixels.
 
-    `invert` is applied at the end for both shapes, so toggling it on a saved
-    mask behaves exactly as it does on a click spec — and costs nothing, since
+    Normalizes through `validate_selection` on the way in, so this is total for
+    any shape a selection has ever had on disk and callers need not pre-clean.
+    In practice they all do — `db.node_dict` normalizes everything read from the
+    database (which is how `render_node`'s `node["selection"]` arrives here) and
+    `main.py` normalizes every request body — so this is the belt to their
+    braces, and the one place that stays correct if a future caller forgets.
+
+    `invert` is applied once at the end to the whole union, so toggling it on
+    saved masks behaves exactly as it does on clicks — and costs nothing, since
     a saved mask's PNG was already frozen with its own invert baked in."""
-    if "mask" in selection:
-        mask = load_mask(selection["mask"])  # node_id is irrelevant: frozen pixels
+    selection = validate_selection(selection)
+    if selection is None:
+        raise ValueError("selection is empty")
+    if "masks" in selection:
+        # node_id is irrelevant: frozen pixels
+        masks = [load_mask(mask_id) for mask_id in selection["masks"]]
     else:
         with Image.open(render_node(node_id)) as im:
             w, h = im.size  # header-only read; no full decode
-        mask = sam.decode_mask(
-            node_embedding(node_id), h, w,
-            selection["x"], selection["y"], selection["level"],
-        )
-    if selection.get("invert"):
+        # one encoder pass, cached; each extra point costs only a decoder run
+        embedding = node_embedding(node_id)
+        masks = [
+            sam.decode_mask(embedding, h, w, p["x"], p["y"], p["level"])
+            for p in selection["points"]
+        ]
+    mask = masks[0]
+    for other in masks[1:]:
+        if other.shape != mask.shape:
+            raise ValueError(
+                f"masks disagree: {mask.shape[1]}×{mask.shape[0]} "
+                f"vs {other.shape[1]}×{other.shape[0]}"
+            )
+        mask = mask | other
+    if selection["invert"]:
         mask = ~mask
     return mask
 
@@ -204,13 +226,68 @@ def load_mask(mask_id: int) -> np.ndarray:
         return np.asarray(im.convert("1")).astype(bool)
 
 
+def _shift(mask: np.ndarray, step: int, axis: int) -> np.ndarray:
+    """`mask` translated by `step` along `axis`, shifting False in at the edge."""
+    out = np.zeros_like(mask)
+    dst, src = [slice(None), slice(None)], [slice(None), slice(None)]
+    if step > 0:
+        dst[axis], src[axis] = slice(step, None), slice(None, -step)
+    else:
+        dst[axis], src[axis] = slice(None, step), slice(-step, None)
+    out[tuple(dst)] = mask[tuple(src)]
+    return out
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Grow a boolean mask by a (2*radius+1) square.
+
+    Separable and logarithmic: a square structuring element is a horizontal line
+    composed with a vertical one, and dilating by `a` then by `b` dilates by
+    `a + b` — so a line of length `radius` is reached in doubling steps
+    (1, 2, 4, …). That is O(log radius) whole-array passes per axis.
+
+    The obvious `ImageFilter.MaxFilter(2 * radius + 1)` is O(w·h·radius²) and
+    took **30 seconds** on a 7728×5152 mask, since the stroke width scales with
+    the image; this runs in well under a second on the same input.
+    """
+    if radius <= 0:
+        return mask
+    for axis in (0, 1):
+        step, remaining = 1, radius
+        while remaining > 0:
+            k = min(step, remaining)
+            mask = mask | _shift(mask, k, axis) | _shift(mask, -k, axis)
+            remaining -= k
+            step *= 2
+    return mask
+
+
 def _overlay_png(mask: np.ndarray) -> bytes:
-    """A boolean mask as a white-where-selected RGBA PNG for the frontend
-    overlay (translucency is the frontend's job — CSS opacity on the image).
-    Saved masks are *stored* 1-bit and colorized here on read, so there is one
-    file and one truth."""
-    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    rgba[mask] = 255
+    """A boolean mask as an RGBA PNG tracing its *outline* for the frontend
+    overlay. Saved masks are *stored* 1-bit and colorized here on read, so
+    there is one file and one truth.
+
+    An outline rather than a translucent fill because the fill hid the very
+    pixels you are picking. It is drawn fully opaque and composited with a dark
+    casing under a white core, so it stays legible over any photograph — the
+    frontend just lays the PNG over the render at opacity 1.
+
+    Stroke width scales with the image because the overlay is displayed fitted
+    to the preview panel: a 1px line on a 4000px photo would vanish.
+    """
+    h, w = mask.shape
+    # the stroke is 2*radius+1 wide; ~1/250 of the short side puts it at 3-4
+    # display pixels once the overlay is fitted to the panel, at any image size
+    radius = max(1, round(min(h, w) / 500))
+    # inner boundary: selected pixels missing at least one 4-neighbour
+    pad = np.pad(mask, 1)
+    edge = mask & ~(pad[:-2, 1:-1] & pad[2:, 1:-1] & pad[1:-1, :-2] & pad[1:-1, 2:])
+    core = _dilate(edge, radius)
+    casing = _dilate(edge, radius + 2)
+
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[casing] = (16, 18, 22, 255)
+    rgba[core] = (255, 255, 255, 255)
     buf = io.BytesIO()
     Image.fromarray(rgba).save(buf, format="PNG")
     return buf.getvalue()

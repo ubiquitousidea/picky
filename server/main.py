@@ -41,10 +41,13 @@ class PreviewRequest(BaseModel):
 
 
 class MaskRequest(BaseModel):
-    """Either shape of selection — a click spec (x/y) or a saved mask id.
-    The fields are all optional because the total `validate_selection` is what
-    actually decides which shape this is; the model is documentation."""
+    """Either shape of selection — a union of click specs or a union of saved
+    mask ids. The fields are all optional because the total `validate_selection`
+    is what actually decides which shape this is; the model is documentation.
+    `x`/`y`/`level`/`mask` are the pre-union spellings, still accepted."""
 
+    points: list[dict] | None = None
+    masks: list[int] | None = None
     x: int | None = None
     y: int | None = None
     mask: int | None = None
@@ -72,14 +75,17 @@ class PresetApply(BaseModel):
 
 
 def _check_selection(selection: dict | None, image_id: int) -> dict | None:
-    """Resolve a saved-mask reference. `validate_selection` cannot do this —
+    """Resolve saved-mask references. `validate_selection` cannot do this —
     effects.py imports no DB — so ownership becomes a 400 here, mirroring the
     blend target check. A mask is scoped to the image it was picked on, which is
-    what guarantees its frozen pixels match every node it can be used on."""
-    if selection is not None and "mask" in selection:
-        mask = db.get_mask(selection["mask"])
-        if mask is None or mask["image_id"] != image_id:
-            raise HTTPException(400, "mask does not belong to this image")
+    what guarantees its frozen pixels match every node it can be used on. Every
+    member of the union is checked: one foreign mask poisons the whole union,
+    since they are OR'd into a single mask of one image's dimensions."""
+    if selection is not None and "masks" in selection:
+        for mask_id in selection["masks"]:
+            mask = db.get_mask(mask_id)
+            if mask is None or mask["image_id"] != image_id:
+                raise HTTPException(400, "mask does not belong to this image")
     return selection
 
 
@@ -344,7 +350,7 @@ def create_mask(image_id: int, body: MaskCreate):
     if node is None or node["image_id"] != image_id:
         raise HTTPException(400, "node does not belong to this image")
     spec = validate_selection(body.selection)
-    if spec is None or "mask" in spec:
+    if spec is None or "masks" in spec:
         raise HTTPException(400, "a mask is saved from a click selection")
 
     try:
@@ -411,26 +417,41 @@ MAX_PRESET_STEPS = 100
 
 
 def _portable_selection(selection: dict | None) -> dict | None:
-    """A selection as a preset can carry it: a click spec, never a saved mask.
+    """A selection as a preset can carry it: click specs, never saved masks.
 
     A preset stores params, not pixels — replaying one runs today's effect code
     against another image. A saved mask *is* pixels, and image-scoped ones at
-    that, so it degrades back to the click spec it was frozen from and gets
+    that, so it degrades back to the click specs it was frozen from and gets
     re-segmented on the target. Dropping the selection instead would silently
-    turn a masked blur into a whole-image blur.
+    turn a masked blur into a whole-image blur. This is the reason the click
+    shape is a union too: a union of masks has nowhere else to land.
 
-    The inverts XOR: the PNG was frozen post-invert, so the spec's own invert
-    already produced the saved shape and the reference's invert toggles it
-    again. A mask deleted since (or one with no stored spec) leaves the step
-    unmasked rather than failing the save, matching validate_selection's totality.
+    Inverts are the lossy part. With a single mask they XOR exactly: the PNG was
+    frozen post-invert, so the spec's own invert already produced the saved shape
+    and the reference's invert toggles it again. With several, there is no single
+    invert that reproduces the union — an inverted region cannot join a union of
+    points — so a mask whose spec was inverted is dropped from the step. The
+    remaining masks still replay; the alternative is discarding the whole
+    selection, which is the failure mode this function exists to avoid.
+
+    A mask deleted since (or one with no stored spec) is skipped for the same
+    reason, and a step left with nothing replays unmasked rather than failing
+    the save, matching validate_selection's totality.
     """
-    if selection is None or "mask" not in selection:
+    if selection is None or "masks" not in selection:
         return selection
-    mask = db.get_mask(selection["mask"])
-    spec = validate_selection(mask["spec"]) if mask else None
-    if spec is None:
+    specs = []
+    for mask_id in selection["masks"]:
+        mask = db.get_mask(mask_id)
+        spec = validate_selection(mask["spec"]) if mask else None
+        if spec is not None and "points" in spec:
+            specs.append(spec)
+    if not specs:
         return None
-    return {**spec, "invert": spec["invert"] != selection["invert"]}
+    if len(specs) == 1:
+        return {**specs[0], "invert": specs[0]["invert"] != selection["invert"]}
+    points = [p for spec in specs if not spec["invert"] for p in spec["points"]]
+    return {"points": points, "invert": selection["invert"]} if points else None
 
 
 def capture_steps(node_id: int) -> list[dict]:
@@ -474,8 +495,8 @@ def capture_steps(node_id: int) -> list[dict]:
             "parent": index[node["parent_id"]],
             "parent2": index[node["parent2_id"]] if node["effect"] == "blend" else None,
             # click coords ride along; they are in the parent's pixel space and
-            # clamp to the target image's bounds at mask time. A saved mask
-            # degrades to the click spec behind it — see _portable_selection.
+            # clamp to the target image's bounds at mask time. Saved masks
+            # degrade to the click specs behind them — see _portable_selection.
             "selection": _portable_selection(validate_selection(node["selection"])),
         }
         steps.append(step)
@@ -483,7 +504,7 @@ def capture_steps(node_id: int) -> list[dict]:
 
 
 def _drop_mask_ref(selection: dict | None) -> dict | None:
-    if selection is not None and "mask" in selection:
+    if selection is not None and "masks" in selection:
         return None  # image-scoped; a preset is not
     return selection
 

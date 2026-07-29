@@ -307,33 +307,12 @@ def _clean_points(value, p: dict) -> list[list[int]]:
 SELECTION_LEVELS = ["auto", "whole", "part", "subpart"]
 
 
-def validate_selection(value) -> dict | None:
-    """Coerce a node's selection into one of two shapes, or None:
-
-    - `{"mask", "invert"}` — a saved mask, whose pixels were frozen to a PNG
-      when it was created and are simply loaded back.
-    - `{"x", "y", "invert", "level"}` — a click spec, re-segmented by SAM
-      against the pixels it is applied to.
-
-    Total like `_clean_points` — anything malformed degrades to None (no
-    selection) instead of raising, because this runs unguarded in the node,
-    preview and preset endpoints. Only the lower bound of x/y is clamped here;
-    the upper bound depends on image dimensions, which presets don't know
-    (a recipe replays onto differently-sized images), so it clamps at mask time.
-
-    Whether a mask id exists, and whether it belongs to the right image, is not
-    checked here — this module deliberately imports no DB. The callers in
-    `main.py` turn a bad reference into a 400 (`_check_selection`).
-    """
+def _clean_point(value) -> dict | None:
+    """One click spec, or None. Only the lower bound of x/y is clamped: the
+    upper bound depends on image dimensions, which presets don't know (a recipe
+    replays onto differently-sized images), so it clamps at mask time."""
     if not isinstance(value, dict):
         return None
-    # `is not None` rather than `in`: the request models carry `mask: int | None`,
-    # so the key is present-and-null on every click-spec request
-    if value.get("mask") is not None:
-        try:
-            return {"mask": int(value["mask"]), "invert": bool(value.get("invert"))}
-        except (TypeError, ValueError):
-            return None
     try:
         x, y = int(value["x"]), int(value["y"])
     except (KeyError, TypeError, ValueError):
@@ -342,9 +321,65 @@ def validate_selection(value) -> dict | None:
     return {
         "x": max(0, x),
         "y": max(0, y),
-        "invert": bool(value.get("invert")),
         "level": level if level in SELECTION_LEVELS else "auto",
     }
+
+
+def validate_selection(value) -> dict | None:
+    """Coerce a node's selection into one of two shapes, or None:
+
+    - `{"masks": [id, ...], "invert"}` — saved masks, whose pixels were frozen
+      to PNGs when they were created and are simply loaded back.
+    - `{"points": [{"x", "y", "level"}, ...], "invert"}` — click specs,
+      re-segmented by SAM against the pixels they are applied to.
+
+    Both shapes are *unions*: the members are OR'd together and `invert` applies
+    once, to the result. A union of clicks is what lets a multi-mask selection
+    degrade into a preset step (`main._portable_selection`), which is why the
+    click shape is a list even though the UI only ever produces one point.
+
+    The pre-union shapes (`{"mask", "invert"}` and `{"x", "y", "invert",
+    "level"}`) are still accepted and normalized, because node rows, mask specs
+    and stored presets on disk hold them and nothing migrates them in place.
+    `db.node_dict` is the choke point that upgrades everything read from the
+    database; request bodies come through the callers in `main.py`.
+
+    Total like `_clean_points` — anything malformed degrades to None (no
+    selection) instead of raising, because this runs unguarded in the node,
+    preview and preset endpoints.
+
+    Whether a mask id exists, and whether it belongs to the right image, is not
+    checked here — this module deliberately imports no DB. The callers in
+    `main.py` turn a bad reference into a 400 (`_check_selection`).
+    """
+    if not isinstance(value, dict):
+        return None
+    invert = bool(value.get("invert"))
+    # `is not None` rather than `in`: the request models carry every field as
+    # `| None`, so unused keys are present-and-null on every request
+    raw_masks = value.get("masks")
+    if raw_masks is None and value.get("mask") is not None:
+        raw_masks = [value["mask"]]
+    if raw_masks is not None:
+        if not isinstance(raw_masks, (list, tuple)):
+            return None
+        masks = []
+        for m in raw_masks:
+            try:
+                m = int(m)
+            except (TypeError, ValueError):
+                continue
+            if m not in masks:  # order-preserving dedupe; a union repeats for nothing
+                masks.append(m)
+        return {"masks": masks, "invert": invert} if masks else None
+
+    raw_points = value.get("points")
+    if raw_points is None:
+        raw_points = [value]  # the pre-union shape: x/y/level on the selection itself
+    if not isinstance(raw_points, (list, tuple)):
+        return None
+    points = [p for p in (_clean_point(p) for p in raw_points) if p is not None]
+    return {"points": points, "invert": invert} if points else None
 
 
 def validate_params(effect: str, params: dict) -> dict:

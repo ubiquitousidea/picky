@@ -79,50 +79,99 @@ Key invariants that cut across files:
   image) only affects the `average` mode; `rendering.py` reads it with
   `.get("weight", 0.5)` because nodes created before the param existed lack
   the key — keep that default when touching the call site.
-- **Previews never persist.** `POST /api/nodes/{id}/preview` renders an effect
-  against a node's cached pixels entirely in memory (`rendering.render_preview`)
-  — no DB row, no file in `data/renders/`. It shares the effect-application
-  core (`rendering._apply`) with `render_node` so preview and Apply can never
-  disagree. Frontend preview mode lives in the `preview` state object in
-  `web/app.js`; every path that changes the selection exits preview through the
-  `exitPreview()` call at the top of `renderSelection()` — keep that single
-  choke point. `preview.source` names whoever is currently driving it (the Apply
-  panel or the edit modal) and is the *only* thing that varies: one debounce, one
-  `seq` stale-response counter, one owner of the blob URL. Note the edit modal
-  previews against the edited node's **parent** — re-applying its effect to its
-  own input — because the endpoint composes on *top* of the node you name.
-- **A selection lives in a store, not in the DOM.** `state.selection` (Apply
-  panel) and `edit.selection` (modal) each hold `{value, nodeId, imageId}`;
-  `appendSelectionControls()` takes the store as a parameter and `readParams()`
-  reads it back. It used to ride on a hidden `<input data-selection>` inside
-  `#effect-params`, which `buildParamControls()`'s `container.innerHTML = ""`
-  destroyed on every effect switch — the pick vanished while the overlay stayed
-  painted, so the next preview silently covered the whole image.
-  `pruneSelection()` at the top of `renderEffectControls()` is now the one place
-  a selection expires, and the two shapes expire differently: a **click spec**
-  dies when `nodeId` changes (its coords are in that node's pixel space), a
-  **saved mask** only when `imageId` does (its pixels are frozen and every node
-  of an image shares dimensions) — which is what lets you stack several masked
-  effects on one object. Corollaries: `exitPreview()` deliberately does *not*
-  clear the overlay any more (its lifetime tracks the store, so toggling Preview
-  off leaves a live pick lit); `appendSelectionControls()` opens with
-  `disarmPick()`, because a rebuild is exactly when an armed picker's commit
-  closure becomes detached; and `closeEdit()` repaints the Apply panel's
-  selection, since the modal borrows the single overlay.
-- **A saved mask freezes pixels; a click spec is a recipe.** `selection` is a
-  union — `{x, y, invert, level}` re-segmented by SAM, or `{mask, invert}` loaded
-  from `data/masks/<id>.png`. `effects.validate_selection` accepts both and stays
-  total; `rendering.compute_mask` branches, applying `invert` to either at the
-  end. Masks live *outside* `renders/` on purpose: that directory is a
-  regenerable cache swept by node id (`delete_render_files`), and a saved mask is
-  user data keyed by mask id whose whole point is that it is *not* regenerable.
-  Stored 1-bit, colorized to RGBA on read (`rendering._overlay_png`), so
+- **Previews never persist, and run by default.** `POST /api/nodes/{id}/preview`
+  renders an effect against a node's cached pixels entirely in memory
+  (`rendering.render_preview`) — no DB row, no file in `data/renders/`. It shares
+  the effect-application core (`rendering._apply`) with `render_node` so preview
+  and Apply can never disagree. Frontend preview mode lives in the `preview`
+  state object in `web/app.js`; every path that changes the selection exits
+  preview through the `exitPreview()` call at the top of `renderSelection()` —
+  keep that single choke point — and `renderSelection()` re-enters at the *end*
+  via `enterApplyPreview()`, which is debounced so clicking through tree nodes
+  coalesces into one full-resolution render. There is no Preview button: the
+  `#live-preview` checkbox (default on, persisted in `localStorage`) is the only
+  control, and unchecking it restores the node's own render — that is the
+  "show me the original" gesture. `preview.source` names whoever is currently
+  driving it (the Apply panel or the edit modal) and is the *only* thing that
+  varies: one debounce, one `seq` stale-response counter, one owner of the blob
+  URL. Note the edit modal previews against the edited node's **parent** —
+  re-applying its effect to its own input — because the endpoint composes on
+  *top* of the node you name. `openEdit()` must call `exitPreview(false)`
+  **unconditionally** before installing its own source: live preview leaves a
+  debounce timer armed, and only `exitPreview()` clears it, so skipping that lets
+  a stale timer re-fire against whatever source it finds. Symmetrically
+  `closeEdit(true)` (Cancel and Esc) hands the preview back to the Apply panel;
+  the Save path gets there through `selectImage()`.
+- **A selection lives in a store, not in the DOM, and in its own panel
+  section.** `state.selection` (Apply panel) and `edit.selection` (modal) each
+  hold `{value, nodeId, imageId}`; `appendSelectionControls()` takes the store
+  as a parameter and `readParams()` reads it back. It used to ride on a hidden
+  `<input data-selection>` inside `#effect-params`, which `buildParamControls()`'s
+  `container.innerHTML = ""` destroyed on every effect switch — the pick vanished
+  while the overlay stayed painted, so the next preview silently covered the
+  whole image. The Apply panel's copy now renders into its own
+  `#select-controls` section (step 1, *above* the effect picker), which removes
+  that hazard at the source and matches the workflow: you pick and save objects
+  before you choose what to do to them. `pruneSelection()` at the top of
+  `renderSelectControls()` is the one place a selection expires, and the two
+  shapes expire differently: **click points** die when `nodeId` changes (their
+  coords are in that node's pixel space), **saved masks** only when `imageId`
+  does (their pixels are frozen and every node of an image shares dimensions) —
+  which is what lets you stack several masked effects on one object.
+  Corollaries: `exitPreview()` deliberately does *not* clear the overlay (its
+  lifetime tracks the store, so unchecking live preview leaves a pick lit);
+  `appendSelectionControls()` opens with `disarmPick()`, because a rebuild is
+  exactly when an armed picker's commit closure becomes detached; and
+  `closeEdit()` repaints the Apply panel's selection, since the modal borrows
+  the single overlay.
+- **The saved-mask list is part of the selection control, not a section of its
+  own.** Ticking a mask *is* editing the selection, so the picker, the
+  level/invert options, "Save selection as mask", and the list of masks are one
+  component with one render path — the panel and the store cannot drift. Its
+  `allowManage` flag is off in the edit modal (a `prompt()` can't be answered on
+  a page `showModal()` made inert, and deleting a mask the node uses would 409
+  anyway); `allowPick` is off there too, since re-picking needs a click. The
+  rows are built **once** per control and only restyled on a toggle: rebuilding
+  them would detach the very `<li>` whose click handler is mid-flight.
+- **Saved masks freeze pixels; click points are a recipe — and both are
+  unions.** `selection` has two shapes: `{points: [{x, y, level}, ...], invert}`
+  re-segmented by SAM, or `{masks: [id, ...], invert}` loaded from
+  `data/masks/<id>.png`. The members are OR'd and `invert` applies once, to the
+  result. The *click* shape is a list even though the UI only ever produces one
+  point, because that is the only place a multi-mask selection can degrade to
+  when a preset captures it (`_portable_selection`) — see the preset bullet.
+  `effects.validate_selection` accepts both, stays total, and also normalizes
+  the pre-union spellings (`{mask, invert}`, `{x, y, invert, level}`) that node
+  rows, mask specs and stored presets on disk still hold. **Nothing migrates
+  those on disk; they upgrade on read**, in `db.node_dict` — so exactly one
+  shape ever leaves the database, which is also what keeps `update_node`'s
+  no-op check from needlessly nuking a subtree when the stored row was written
+  in an older spelling. `db` imports `effects` for this; that is the acyclic
+  direction, since `effects` imports no DB. `rendering.compute_mask` normalizes
+  again on entry, deliberately: every caller already hands it a clean selection
+  (via `node_dict` or `main.py`'s request validation), so that call is the belt
+  to their braces — it is what keeps the mask-building function total on its
+  own rather than by convention.
+  Masks live *outside* `renders/` on purpose: that directory is a regenerable
+  cache swept by node id (`delete_render_files`), and a saved mask is user data
+  keyed by mask id whose whole point is that it is *not* regenerable. Stored
+  1-bit and colorized on read (`rendering._overlay_png`), so
   `POST /api/nodes/{id}/mask` serves both shapes and the frontend overlay needs
   no branch. The PNG is frozen **post-invert** — what you saw is what you saved —
   so a reference's own `invert` toggles on top, which is why `saveMask()` follows
-  up with `invert: false` and why `_portable_selection` XORs. A mask belongs to
-  the image it was picked on (`_check_selection` 400s otherwise); deleting one
-  that nodes reference is a 409 rather than a silent repaint of committed pixels.
+  up with `invert: false` and why `_portable_selection` XORs. Masks belong to the
+  image they were picked on (`_check_selection` 400s if *any* member is foreign,
+  since they are OR'd into one image's dimensions); deleting one that nodes
+  reference is a 409 rather than a silent repaint of committed pixels, and
+  `db.nodes_using_mask` needs **two arms** to find those referrers — a
+  `json_extract` for the legacy scalar and a `json_each` for the array.
+- **The overlay is an outline, not a fill.** `_overlay_png` emits the mask's
+  4-neighbour inner boundary, dilated to a width scaled by image size (the
+  overlay is displayed fitted to the panel, so a 1px line on a 4000px photo
+  would vanish), as an opaque white core over a dark casing so it reads on any
+  photograph. It is transparent everywhere else, which is why `#mask-overlay`
+  carries no `opacity` — a translucent white fill used to hide the very pixels
+  you were picking.
 - **Param controls are built and read in one place.** `buildParamControls()` /
   `appendBlendTarget()` / `appendSelectionControls()` / `readParams()` in
   `web/app.js` are shared by the Apply panel and the edit modal, which is what
@@ -188,11 +237,15 @@ Key invariants that cut across files:
   stored as `{"version": n, "steps": [...]}` and params are re-normalized through
   `validate_params` at both save and apply, which also backfills params added
   since the node was made (e.g. blend's `weight`). A **saved-mask selection
-  degrades back to the click spec it was frozen from** (`_portable_selection`,
-  with the inverts XORed): a preset stores params, not pixels, and a mask is
-  both pixels and image-scoped, so it must replay as the recipe that produced
-  it. Dropping the selection instead would quietly turn a masked blur into a
-  whole-image blur. `_validate_steps` strips any mask ref that reached a stored
+  degrades back to the click points it was frozen from** (`_portable_selection`):
+  a preset stores params, not pixels, and a mask is both pixels and image-scoped,
+  so it must replay as the recipe that produced it. Dropping the selection
+  instead would quietly turn a masked blur into a whole-image blur. This is the
+  reason the click shape is a union too — a union of masks has nowhere else to
+  land. Inverts are where it goes lossy: one mask XORs exactly, but several have
+  no single invert that reproduces the union, so a mask whose spec was inverted
+  is dropped from the step (the rest still replay — better than discarding the
+  whole selection). `_validate_steps` strips any mask ref that reached a stored
   preset anyway, as older or hand-edited data.
 - **Applying a preset is all-or-nothing, and cannot be one transaction.**
   `rendering.render_node` reads through its own connection, so a step's row must
@@ -220,24 +273,41 @@ Key invariants that cut across files:
   ordered by id, and both parents of a node always have smaller ids (SQLite
   autoincrement + parents must exist at creation). The work-tree DAG renderer
   (`layoutGraph()` in `web/app.js`) depends on this to assign commit-graph
-  lanes in a single forward pass — one row per node, per-row SVG gutter,
-  curves forking at branches and merging into blend rows.
+  lanes in a single forward pass — one step per node, curves forking at branches
+  and merging into blend steps. `layoutGraph()` names no axis: it emits
+  `{node, lane, continues, passThrough, parentLinks}` per step, and only
+  `buildRailCell()` and the DOM know the graph runs **left to right**, as a
+  horizontal strip under the preview (`#tree-section`, its own body-grid row)
+  rather than down the side panel. Flow is x, lanes are y. Chips are narrow, so
+  the effect's params live in the `title` and the `◎` selection badge rides on
+  the id line — the label ellipsises, and an ellipsised badge is an invisible
+  one. `renderTree()` scrolls the selected column into view, since the strip
+  grows rightward as work accumulates.
 - **Frontend files are served `Cache-Control: no-cache`** (`NoCacheStaticFiles`
   in `main.py`). Before this, browsers heuristically cached `app.js` and stale
   scripts produced phantom UI bugs (dead buttons, broken sliders) against a
   new backend. Keep the header; there is deliberately no cache-busting in
   filenames.
 
+The side panel is ordered by the workflow it serves — pick an object, save it as
+a mask, repeat, then choose an effect, tick the masks it applies to, tune, and
+Apply. So: **1 · Select** (`#select-controls`), **2 · Effect**
+(`#effects-section`), then Presets and the RGB cluster plot as collapsed
+`<details>` (reference material, not part of the loop) and Export/Delete pinned
+to the bottom with `margin-top: auto`. The work tree left the panel entirely for
+its horizontal strip under the preview.
+
 Frontend state lives in one `state` object in `web/app.js`; selection flows
 through `selectImage()` → `renderSelection()`, which updates preview, export
-link, tree, effect controls, and the cluster plot. The effect controls are
-rebuilt from scratch on *every* selection change, not just when the effect is
-blend: the Apply panel describes an operation on the selected node, and two of
-its controls read that node (blend's target picker, the curve editor's
-histogram). The rebuild seeds `{}`, so params return to their registry defaults
-— that is what resets a dragged tone curve back to y=x when you switch images (a hand-rolled canvas 3D scatter, shown only for posterize
-nodes, placed last in the side panel so its appearance doesn't shift the tree).
-Deep links `?image=N&node=M` override the localStorage last-image.
+link, selection controls, effect controls, tree, and the cluster plot, then
+re-enters live preview. The effect controls are rebuilt from scratch on *every*
+selection change, not just when the effect is blend: the Apply panel describes
+an operation on the selected node, and two of its controls read that node
+(blend's target picker, the curve editor's histogram). The rebuild seeds `{}`,
+so params return to their registry defaults — that is what resets a dragged tone
+curve back to y=x when you switch images. The cluster plot is a hand-rolled
+canvas 3D scatter, shown only for posterize nodes. Deep links `?image=N&node=M`
+override the localStorage last-image.
 
 `state.presets` is fetched once in `init()` and refreshed only after a save or
 delete — `renderSelection()` calls the synchronous `updatePresetControls()`, not
@@ -247,9 +317,11 @@ new nodes appear.
 
 `state.masks` follows the adapted rule: masks are image-scoped, so they are
 fetched in `selectImage()` alongside the tree and refreshed only after a
-save/rename/delete — `renderSelection()` calls the synchronous `renderMasks()`.
-Clicking a mask row makes it the Apply panel's selection (the analogue of a
-preset row acting on the selected node) rather than creating anything.
+save/rename/delete. The list has no render function of its own —
+`renderSelectControls()` draws it as part of the selection control — so
+`refreshMasks()` calls that. Ticking a mask row unions it into the Apply panel's
+selection (the analogue of a preset row acting on the selected node) rather than
+creating anything.
 
 The two modals are native `<dialog>` elements (Esc and focus trapping for free);
 `prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two gotchas:
@@ -257,8 +329,10 @@ the global `* { margin: 0 }` reset defeats a dialog's centering, so `dialog`
 re-sets `margin: auto`; and Esc closes a dialog without going through the
 buttons, so `#edit-modal` listens for `close` to run the same teardown Cancel
 does. `openEdit()` is the one selection change that must *not* be followed by
-`renderSelection()` — it selects the node first and only then starts its own
-preview, because that choke point would otherwise cancel it immediately. After a
+`renderSelection()` — it selects the node first, then calls `exitPreview(false)`
+unconditionally, and only then starts its own preview, because that choke point
+would otherwise cancel it immediately (and, with live preview, leave a debounce
+timer armed behind it). After a
 successful PATCH the node id is unchanged, so `saveEdit()` clears
 `cluster.nodeId` by hand; `updateClusterPlot()` refetches only on an id change
 and would otherwise keep drawing the old centroids.
