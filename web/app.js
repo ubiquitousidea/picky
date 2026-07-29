@@ -72,7 +72,10 @@ function renderSelection() {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
   }
-  if (state.effect === "blend") renderEffectControls();
+  // the Apply panel describes an operation on the *selected* node, so it is
+  // rebuilt whenever the selection moves: blend's target list, and the curve
+  // editor's histogram, both read the node we are now pointing at
+  renderEffectControls();
   renderTree();
   updatePresetControls();
   updateClusterPlot();

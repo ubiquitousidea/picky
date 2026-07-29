@@ -190,8 +190,12 @@ Key invariants that cut across files:
 
 Frontend state lives in one `state` object in `web/app.js`; selection flows
 through `selectImage()` → `renderSelection()`, which updates preview, export
-link, tree, effect controls (blend's target picker depends on the tree), and
-the cluster plot (a hand-rolled canvas 3D scatter, shown only for posterize
+link, tree, effect controls, and the cluster plot. The effect controls are
+rebuilt from scratch on *every* selection change, not just when the effect is
+blend: the Apply panel describes an operation on the selected node, and two of
+its controls read that node (blend's target picker, the curve editor's
+histogram). The rebuild seeds `{}`, so params return to their registry defaults
+— that is what resets a dragged tone curve back to y=x when you switch images (a hand-rolled canvas 3D scatter, shown only for posterize
 nodes, placed last in the side panel so its appearance doesn't shift the tree).
 Deep links `?image=N&node=M` override the localStorage last-image.
 
