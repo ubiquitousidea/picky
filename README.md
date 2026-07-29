@@ -28,6 +28,17 @@ restarts.
   - *Gaussian blur*, *Sobel edges*, *Floyd–Steinberg dither*, *Pixelate*
   - *Blend* — combine the selected node with any other node in the tree using
     average, additive, multiplicative, or subtractive blending.
+- **Click to segment** — *Limit to object* confines any effect to one thing
+  instead of the whole frame. Hit **Select object** and click the subject; a
+  [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) model outlines it,
+  the outline shows as an overlay, and the effect then applies inside it and
+  leaves the rest of the image alone. A dropdown chooses how much of the
+  subject one click means — *auto (best match)*, or explicitly *whole*,
+  *part*, or *subpart* — and **invert** flips the region, so the effect hits
+  the background instead. The selection is saved with the node (masked nodes
+  are marked in the work tree), so editing the effect's params later
+  re-composites against the same region. Model weights (~45 MB) download on
+  first use.
 - **Presets** — save the chain that produced a node as a named recipe and
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
@@ -61,6 +72,11 @@ python3 -m venv .venv
 Then open <http://localhost:8000>. Uploaded originals, the SQLite database,
 and cached renders live in `data/` (gitignored).
 
+The segmentation models are fetched to `data/models/` the first time you use
+click-to-segment, from a revision-pinned Hugging Face URL. To supply your own
+ONNX exports instead, point `PICKY_SAM_ENCODER` and `PICKY_SAM_DECODER` at
+them; nothing else in the app requires the download.
+
 ## Architecture
 
 ```
@@ -69,6 +85,7 @@ server/
   db.py         SQLite schema and queries (images, nodes)
   effects.py    effect registry: each effect maps an RGB numpy array -> array
   rendering.py  node render pipeline with per-node JPEG cache
+  sam.py        MobileSAM via onnxruntime: click a point, get a mask
 web/
   index.html, app.js, style.css   vanilla JS single-page frontend
 ```
@@ -82,6 +99,12 @@ Effects declare their parameter specs (range, default) in the registry, and
 the frontend generates its controls from `GET /api/effects` — adding a new
 effect is a single entry in `server/effects.py`.
 
+Segmentation splits into a heavy image encoder and a light prompt decoder.
+The encoder's output is cached per node alongside its render, so the cost is
+paid once per node no matter how many points you click; each click is then
+only the decoder. A stored selection is re-decoded rather than saved as
+pixels, which keeps it exact when a node's params are edited.
+
 ## API
 
 | Method | Path | Purpose |
@@ -90,10 +113,11 @@ effect is a single entry in `server/effects.py`.
 | POST   | `/api/images` | upload a JPG (multipart) |
 | GET    | `/api/images` | list images |
 | GET    | `/api/images/{id}/tree` | all work-tree nodes for an image |
-| POST   | `/api/images/{id}/nodes` | apply an effect (`parent_id`, `effect`, `params`, optional `parent2_id` for blend) |
-| PATCH  | `/api/nodes/{id}` | edit a node's params in place, re-rendering it and dropping its descendants' caches |
+| POST   | `/api/images/{id}/nodes` | apply an effect (`parent_id`, `effect`, `params`, optional `parent2_id` for blend, optional `selection` to mask it) |
+| PATCH  | `/api/nodes/{id}` | edit a node's `params`, `parent2_id`, or `selection` in place, re-rendering it and dropping its descendants' caches |
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
+| POST   | `/api/nodes/{id}/mask` | segment a click (`x`, `y`, optional `invert`, `level`) into a mask PNG; persists nothing but the node's cached embedding |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | DELETE | `/api/nodes/{id}` | delete a node and everything derived from it |
