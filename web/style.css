@@ -44,6 +44,7 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; marg
 #effects-section h2 { color: var(--rb-orange); }
 #tree-section h2 { color: var(--rb-green); }
 #presets-section h2 { color: var(--rb-teal); }
+#masks-section h2 { color: var(--rb-pink); }
 #cluster-section h2 { color: var(--rb-violet); }
 #stats-modal h2 { color: var(--rb-blue); }
 #edit-modal h2 { color: var(--rb-orange); }
@@ -290,7 +291,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 .sel-clear:hover:not(:disabled) { color: var(--text); }
 .sel-clear:disabled { opacity: 0.4; cursor: default; }
-.sel-level { flex: 1; min-width: 0; }
+.sel-level, .sel-mask { flex: 1; min-width: 0; }
 /* .param-row .sel-invert outranks the `.param-row label` header styling,
    which would otherwise paint this yellow and spread it apart */
 .param-row .sel-invert {
@@ -404,8 +405,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 #delete-btn:hover { background: var(--rb-red); color: var(--bg); }
 
-/* Presets */
-#save-preset-btn {
+/* Presets and saved masks — same row/button shapes, different hue */
+#save-preset-btn, #save-mask-btn {
   width: 100%;
   padding: 0.45rem;
   border: 1px solid var(--rb-teal);
@@ -415,10 +416,12 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   cursor: pointer;
 }
 #save-preset-btn:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
-#save-preset-btn:disabled { opacity: 0.4; cursor: default; }
-#preset-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
-#preset-list .hint { padding: 0 0.1rem; }
-.preset-row {
+#save-preset-btn:disabled, #save-mask-btn:disabled { opacity: 0.4; cursor: default; }
+#save-mask-btn { border-color: var(--rb-pink); color: var(--rb-pink); }
+#save-mask-btn:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
+#preset-list, #mask-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
+#preset-list .hint, #mask-list .hint { padding: 0 0.1rem; }
+.preset-row, .mask-row {
   display: flex;
   align-items: center;
   gap: 0.35rem;
@@ -428,8 +431,10 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border: 1px solid transparent;
   color: var(--rb-teal);
 }
-.preset-row:hover { background: var(--panel-2); border-color: currentColor; }
-.preset-row.disabled { opacity: 0.4; pointer-events: none; }
+.mask-row { color: var(--rb-pink); }
+.preset-row:hover, .mask-row:hover { background: var(--panel-2); border-color: currentColor; }
+.mask-row.selected { background: var(--panel-2); border-color: currentColor; }
+.preset-row.disabled, .mask-row.disabled { opacity: 0.4; pointer-events: none; }
 .preset-row.busy { opacity: 0.7; pointer-events: none; }
 .preset-text { min-width: 0; }
 .preset-summary {
@@ -439,7 +444,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.preset-del {
+.preset-del, .mask-del {
   margin-left: auto;
   border: none;
   background: transparent;
@@ -451,8 +456,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border-radius: 4px;
   visibility: hidden;
 }
-.preset-row:hover .preset-del { visibility: visible; }
-.preset-del:hover { color: var(--rb-red); background: var(--panel); }
+.preset-row:hover .preset-del, .mask-row:hover .mask-del { visibility: visible; }
+.preset-del:hover, .mask-del:hover { color: var(--rb-red); background: var(--panel); }
 
 /* Modals — native <dialog>, so Esc and focus trapping come for free */
 dialog {

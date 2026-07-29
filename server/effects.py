@@ -308,16 +308,32 @@ SELECTION_LEVELS = ["auto", "whole", "part", "subpart"]
 
 
 def validate_selection(value) -> dict | None:
-    """Coerce a node's selection into `{"x", "y", "invert", "level"}` or None.
+    """Coerce a node's selection into one of two shapes, or None:
+
+    - `{"mask", "invert"}` — a saved mask, whose pixels were frozen to a PNG
+      when it was created and are simply loaded back.
+    - `{"x", "y", "invert", "level"}` — a click spec, re-segmented by SAM
+      against the pixels it is applied to.
 
     Total like `_clean_points` — anything malformed degrades to None (no
     selection) instead of raising, because this runs unguarded in the node,
     preview and preset endpoints. Only the lower bound of x/y is clamped here;
     the upper bound depends on image dimensions, which presets don't know
     (a recipe replays onto differently-sized images), so it clamps at mask time.
+
+    Whether a mask id exists, and whether it belongs to the right image, is not
+    checked here — this module deliberately imports no DB. The callers in
+    `main.py` turn a bad reference into a 400 (`_check_selection`).
     """
     if not isinstance(value, dict):
         return None
+    # `is not None` rather than `in`: the request models carry `mask: int | None`,
+    # so the key is present-and-null on every click-spec request
+    if value.get("mask") is not None:
+        try:
+            return {"mask": int(value["mask"]), "invert": bool(value.get("invert"))}
+        except (TypeError, ValueError):
+            return None
     try:
         x, y = int(value["x"]), int(value["y"])
     except (KeyError, TypeError, ValueError):

@@ -91,12 +91,46 @@ Key invariants that cut across files:
   `seq` stale-response counter, one owner of the blob URL. Note the edit modal
   previews against the edited node's **parent** — re-applying its effect to its
   own input — because the endpoint composes on *top* of the node you name.
+- **A selection lives in a store, not in the DOM.** `state.selection` (Apply
+  panel) and `edit.selection` (modal) each hold `{value, nodeId, imageId}`;
+  `appendSelectionControls()` takes the store as a parameter and `readParams()`
+  reads it back. It used to ride on a hidden `<input data-selection>` inside
+  `#effect-params`, which `buildParamControls()`'s `container.innerHTML = ""`
+  destroyed on every effect switch — the pick vanished while the overlay stayed
+  painted, so the next preview silently covered the whole image.
+  `pruneSelection()` at the top of `renderEffectControls()` is now the one place
+  a selection expires, and the two shapes expire differently: a **click spec**
+  dies when `nodeId` changes (its coords are in that node's pixel space), a
+  **saved mask** only when `imageId` does (its pixels are frozen and every node
+  of an image shares dimensions) — which is what lets you stack several masked
+  effects on one object. Corollaries: `exitPreview()` deliberately does *not*
+  clear the overlay any more (its lifetime tracks the store, so toggling Preview
+  off leaves a live pick lit); `appendSelectionControls()` opens with
+  `disarmPick()`, because a rebuild is exactly when an armed picker's commit
+  closure becomes detached; and `closeEdit()` repaints the Apply panel's
+  selection, since the modal borrows the single overlay.
+- **A saved mask freezes pixels; a click spec is a recipe.** `selection` is a
+  union — `{x, y, invert, level}` re-segmented by SAM, or `{mask, invert}` loaded
+  from `data/masks/<id>.png`. `effects.validate_selection` accepts both and stays
+  total; `rendering.compute_mask` branches, applying `invert` to either at the
+  end. Masks live *outside* `renders/` on purpose: that directory is a
+  regenerable cache swept by node id (`delete_render_files`), and a saved mask is
+  user data keyed by mask id whose whole point is that it is *not* regenerable.
+  Stored 1-bit, colorized to RGBA on read (`rendering._overlay_png`), so
+  `POST /api/nodes/{id}/mask` serves both shapes and the frontend overlay needs
+  no branch. The PNG is frozen **post-invert** — what you saw is what you saved —
+  so a reference's own `invert` toggles on top, which is why `saveMask()` follows
+  up with `invert: false` and why `_portable_selection` XORs. A mask belongs to
+  the image it was picked on (`_check_selection` 400s otherwise); deleting one
+  that nodes reference is a 409 rather than a silent repaint of committed pixels.
 - **Param controls are built and read in one place.** `buildParamControls()` /
-  `appendBlendTarget()` / `readParams()` in `web/app.js` are shared by the Apply
-  panel and the edit modal, which is what keeps ranges, defaults, and value
-  coercion from drifting between "create a node" and "edit a node". The blend
-  target picker is found by the `.blend-with` class *scoped to its container*,
-  not a global id, so two of them can coexist while the modal is open.
+  `appendBlendTarget()` / `appendSelectionControls()` / `readParams()` in
+  `web/app.js` are shared by the Apply panel and the edit modal, which is what
+  keeps ranges, defaults, and value coercion from drifting between "create a
+  node" and "edit a node". The blend target picker is found by the `.blend-with`
+  class *scoped to its container*, not a global id, so two of them can coexist
+  while the modal is open. The modal cannot re-*pick* a point (`showModal()`
+  makes the page inert) but can still choose a saved mask, which needs no click.
 - **The effect picker is a row of icon buttons, and its selection lives in
   `state.effect`** — not in the DOM, as it did when it was a `<select>`.
   `EFFECT_BUTTONS` in `web/app.js` maps one button to one or more registry
@@ -153,7 +187,13 @@ Key invariants that cut across files:
   since SQLite reuses rowids — hence no FK from `presets` to `nodes`. Steps are
   stored as `{"version": n, "steps": [...]}` and params are re-normalized through
   `validate_params` at both save and apply, which also backfills params added
-  since the node was made (e.g. blend's `weight`).
+  since the node was made (e.g. blend's `weight`). A **saved-mask selection
+  degrades back to the click spec it was frozen from** (`_portable_selection`,
+  with the inverts XORed): a preset stores params, not pixels, and a mask is
+  both pixels and image-scoped, so it must replay as the recipe that produced
+  it. Dropping the selection instead would quietly turn a masked blur into a
+  whole-image blur. `_validate_steps` strips any mask ref that reached a stored
+  preset anyway, as older or hand-edited data.
 - **Applying a preset is all-or-nothing, and cannot be one transaction.**
   `rendering.render_node` reads through its own connection, so a step's row must
   be committed before the next step can reference it — the loop is
@@ -205,6 +245,12 @@ a fetch. Clicking a preset row applies it to the *selected* node and then routes
 through `selectImage()`, which is what refetches the tree so all of the preset's
 new nodes appear.
 
+`state.masks` follows the adapted rule: masks are image-scoped, so they are
+fetched in `selectImage()` alongside the tree and refreshed only after a
+save/rename/delete — `renderSelection()` calls the synchronous `renderMasks()`.
+Clicking a mask row makes it the Apply panel's selection (the analogue of a
+preset row acting on the selected node) rather than creating anything.
+
 The two modals are native `<dialog>` elements (Esc and focus trapping for free);
 `prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two gotchas:
 the global `* { margin: 0 }` reset defeats a dialog's centering, so `dialog`
@@ -218,6 +264,6 @@ successful PATCH the node id is unchanged, so `saveEdit()` clears
 and would otherwise keep drawing the old centroids.
 
 `GET /api/stats` (`db.stats()` + `rendering.storage_stats()`) backs the Library
-stats modal. It reports the render cache apart from the database and originals
-because the cache is ~85% of the bytes and is fully regenerable — one lumped
-"on disk" number would badly misrepresent what a user would lose.
+stats modal. It reports the render cache apart from the database, originals, and
+saved masks because the cache is ~85% of the bytes and is fully regenerable —
+one lumped "on disk" number would badly misrepresent what a user would lose.

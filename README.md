@@ -39,6 +39,14 @@ restarts.
   are marked in the work tree), so editing the effect's params later
   re-composites against the same region. Model weights (~45 MB) download on
   first use.
+- **Saved masks** — **Save selection as mask** names the region you just
+  picked and freezes its pixels to disk, so it becomes a durable mask rather
+  than a click that has to be re-segmented. Pick it from the *Masks* panel or
+  the dropdown to reuse it on any node of that image, which is what lets you
+  stack several effects on one object without re-selecting it each time; the
+  shape is identical every time, and it survives deleting the node it was
+  picked on. A mask belongs to its image, and one still in use cannot be
+  deleted out from under the nodes that reference it.
 - **Presets** — save the chain that produced a node as a named recipe and
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
@@ -49,10 +57,10 @@ restarts.
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
   chain (e.g. `photo-posterize-blur.jpg`).
-- **Library stats** — image, node, and preset counts plus disk usage. The
-  render cache is reported apart from the database and originals: it is ~85%
-  of the bytes and regenerates on demand, so a single "on disk" figure would
-  badly misstate what you would actually lose.
+- **Library stats** — image, node, preset, and mask counts plus disk usage. The
+  render cache is reported apart from the database, originals, and saved masks:
+  it is ~85% of the bytes and regenerates on demand, so a single "on disk"
+  figure would badly misstate what you would actually lose.
 
 ## Setup
 
@@ -82,7 +90,7 @@ them; nothing else in the app requires the download.
 ```
 server/
   main.py       FastAPI routes + static file serving
-  db.py         SQLite schema and queries (images, nodes)
+  db.py         SQLite schema and queries (images, nodes, presets, masks)
   effects.py    effect registry: each effect maps an RGB numpy array -> array
   rendering.py  node render pipeline with per-node JPEG cache
   sam.py        MobileSAM via onnxruntime: click a point, get a mask
@@ -102,8 +110,12 @@ effect is a single entry in `server/effects.py`.
 Segmentation splits into a heavy image encoder and a light prompt decoder.
 The encoder's output is cached per node alongside its render, so the cost is
 paid once per node no matter how many points you click; each click is then
-only the decoder. A stored selection is re-decoded rather than saved as
-pixels, which keeps it exact when a node's params are edited.
+only the decoder. A node's own selection is stored as the click, not the
+pixels, and re-decoded — which keeps it exact when the node's params are
+edited. Saving a mask is the deliberate opposite: it writes the decoded region
+to `data/masks/<id>.png` as a 1-bit image, so reuse skips the model entirely
+and the shape cannot drift. That file sits outside `data/renders/` because
+everything there is a cache that invalidation is free to delete.
 
 ## API
 
@@ -117,7 +129,7 @@ pixels, which keeps it exact when a node's params are edited.
 | PATCH  | `/api/nodes/{id}` | edit a node's `params`, `parent2_id`, or `selection` in place, re-rendering it and dropping its descendants' caches |
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
-| POST   | `/api/nodes/{id}/mask` | segment a click (`x`, `y`, optional `invert`, `level`) into a mask PNG; persists nothing but the node's cached embedding |
+| POST   | `/api/nodes/{id}/mask` | overlay PNG for a selection — a click (`x`, `y`, optional `invert`, `level`) segmented on the fly, or a saved `mask` id read back; persists nothing but the node's cached embedding |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | DELETE | `/api/nodes/{id}` | delete a node and everything derived from it |
@@ -126,4 +138,8 @@ pixels, which keeps it exact when a node's params are edited.
 | POST   | `/api/presets` | save a node's ancestor chain as a preset (`name`, `node_id`) |
 | POST   | `/api/nodes/{id}/apply-preset` | replay a preset onto a node (`preset_id`) |
 | DELETE | `/api/presets/{id}` | delete a preset |
+| GET    | `/api/images/{id}/masks` | list an image's saved masks, each with a `used_by` count |
+| POST   | `/api/images/{id}/masks` | freeze a click selection into a named mask (`name`, `node_id`, `selection`) |
+| PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
+| DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
 | GET    | `/api/stats` | library counts and disk usage |

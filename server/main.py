@@ -41,10 +41,25 @@ class PreviewRequest(BaseModel):
 
 
 class MaskRequest(BaseModel):
-    x: int
-    y: int
+    """Either shape of selection — a click spec (x/y) or a saved mask id.
+    The fields are all optional because the total `validate_selection` is what
+    actually decides which shape this is; the model is documentation."""
+
+    x: int | None = None
+    y: int | None = None
+    mask: int | None = None
     invert: bool = False
     level: str = "auto"
+
+
+class MaskCreate(BaseModel):
+    name: str
+    node_id: int
+    selection: dict
+
+
+class MaskUpdate(BaseModel):
+    name: str
 
 
 class PresetCreate(BaseModel):
@@ -54,6 +69,18 @@ class PresetCreate(BaseModel):
 
 class PresetApply(BaseModel):
     preset_id: int
+
+
+def _check_selection(selection: dict | None, image_id: int) -> dict | None:
+    """Resolve a saved-mask reference. `validate_selection` cannot do this —
+    effects.py imports no DB — so ownership becomes a 400 here, mirroring the
+    blend target check. A mask is scoped to the image it was picked on, which is
+    what guarantees its frozen pixels match every node it can be used on."""
+    if selection is not None and "mask" in selection:
+        mask = db.get_mask(selection["mask"])
+        if mask is None or mask["image_id"] != image_id:
+            raise HTTPException(400, "mask does not belong to this image")
+    return selection
 
 
 @app.get("/api/effects")
@@ -99,7 +126,7 @@ def create_node(image_id: int, body: NodeCreate):
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
     params = validate_params(body.effect, body.params)
-    selection = validate_selection(body.selection)
+    selection = _check_selection(validate_selection(body.selection), image_id)
 
     parent2_id = None
     if body.effect == "blend":
@@ -134,7 +161,7 @@ def update_node(node_id: int, body: NodeUpdate):
     if effect not in EFFECTS and effect != "blend":
         raise HTTPException(400, f"effect '{effect}' no longer exists")
     params = validate_params(effect, body.params)
-    selection = validate_selection(body.selection)
+    selection = _check_selection(validate_selection(body.selection), node["image_id"])
 
     parent2_id = None
     if effect == "blend":
@@ -205,7 +232,7 @@ def preview_node(node_id: int, body: PreviewRequest):
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
     params = validate_params(body.effect, body.params)
-    selection = validate_selection(body.selection)
+    selection = _check_selection(validate_selection(body.selection), node["image_id"])
 
     parent2_id = None
     if body.effect == "blend":
@@ -225,12 +252,16 @@ def preview_node(node_id: int, body: PreviewRequest):
 
 @app.post("/api/nodes/{node_id}/mask")
 def get_mask(node_id: int, body: MaskRequest):
-    """The segmentation mask for a click on a node's pixels, as a PNG for the
-    frontend's overlay. Persists nothing but the node's cached embedding —
-    like preview, the selection itself only exists in the request."""
-    if db.get_node(node_id) is None:
+    """The overlay PNG for a selection on a node's pixels — a fresh click, which
+    persists nothing but the node's cached embedding, or a saved mask, which is
+    just read back. One endpoint for both is what keeps the frontend's overlay
+    code free of branches."""
+    node = db.get_node(node_id)
+    if node is None:
         raise HTTPException(404, "node not found")
-    selection = validate_selection(body.model_dump())
+    selection = _check_selection(validate_selection(body.model_dump()), node["image_id"])
+    if selection is None:
+        raise HTTPException(400, "a selection needs either a click point or a mask id")
     try:
         data = rendering.mask_png(node_id, selection)
     except Exception as exc:
@@ -271,13 +302,135 @@ def delete_node(node_id: int):
 def delete_image(image_id: int):
     if db.get_image(image_id) is None:
         raise HTTPException(404, "image not found")
+    # collect the mask ids before the cascade removes their rows; only the files
+    # need a hand, the rows go with ON DELETE CASCADE
+    mask_ids = [m["id"] for m in db.list_masks(image_id)]
     node_ids = db.delete_image(image_id)
     rendering.delete_render_files(node_ids)
     rendering.original_path(image_id).unlink(missing_ok=True)
+    for mask_id in mask_ids:
+        rendering.mask_path(mask_id).unlink(missing_ok=True)
     return {"deleted": image_id}
 
 
+# ---------- Saved masks ----------
+#
+# A mask freezes a segmentation to a PNG so reuse never re-runs SAM: the shape is
+# byte-identical everywhere it is used, and it outlives the node it was picked
+# on. It belongs to the image it was picked on and is offered on every node of
+# that image's tree — every node of an image shares its dimensions, so the frozen
+# pixels always line up.
+
+
+@app.get("/api/images/{image_id}/masks")
+def list_masks(image_id: int):
+    if db.get_image(image_id) is None:
+        raise HTTPException(404, "image not found")
+    # used_by rides along so the UI can warn before a delete is refused
+    return [
+        {**mask, "used_by": len(db.nodes_using_mask(mask["id"]))}
+        for mask in db.list_masks(image_id)
+    ]
+
+
+@app.post("/api/images/{image_id}/masks")
+def create_mask(image_id: int, body: MaskCreate):
+    if db.get_image(image_id) is None:
+        raise HTTPException(404, "image not found")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "mask name cannot be empty")
+    node = db.get_node(body.node_id)
+    if node is None or node["image_id"] != image_id:
+        raise HTTPException(400, "node does not belong to this image")
+    spec = validate_selection(body.selection)
+    if spec is None or "mask" in spec:
+        raise HTTPException(400, "a mask is saved from a click selection")
+
+    try:
+        # compute_mask already applies spec's invert, so what gets frozen is
+        # exactly what the user was looking at. A reference's own invert then
+        # toggles on top of that — see the XOR in capture_steps.
+        mask = rendering.compute_mask(body.node_id, spec)
+    except Exception as exc:
+        raise HTTPException(500, f"segmentation failed: {exc}")
+
+    height, width = mask.shape
+    try:
+        saved = db.create_mask(image_id, name, body.node_id, spec, width, height)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"a mask named '{name}' already exists for this image")
+    # row first so the file is named by the id; unwind it if the write fails,
+    # so a row can never point at a missing PNG
+    try:
+        rendering.save_mask(saved["id"], mask)
+    except Exception as exc:
+        db.delete_mask(saved["id"])
+        raise HTTPException(500, f"saving the mask failed: {exc}")
+    return {**saved, "used_by": 0}
+
+
+@app.patch("/api/masks/{mask_id}")
+def update_mask(mask_id: int, body: MaskUpdate):
+    """Rename. Presets have no equivalent because re-saving one is free; redoing
+    a mask means re-picking the object, which is the cost this feature exists to
+    remove."""
+    mask = db.get_mask(mask_id)
+    if mask is None:
+        raise HTTPException(404, "mask not found")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "mask name cannot be empty")
+    try:
+        return db.rename_mask(mask_id, name)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"a mask named '{name}' already exists for this image")
+
+
+@app.delete("/api/masks/{mask_id}")
+def delete_mask(mask_id: int):
+    """Refuse while nodes still reference it. Clearing their selections instead
+    would silently change committed pixels and force a re-render of every one of
+    their descendants — a large invisible side effect behind an '×'."""
+    if db.get_mask(mask_id) is None:
+        raise HTTPException(404, "mask not found")
+    users = db.nodes_using_mask(mask_id)
+    if users:
+        raise HTTPException(
+            409,
+            f"{len(users)} node{'s' if len(users) > 1 else ''}"
+            f" still use{'s' if len(users) == 1 else ''} this mask"
+            f" (#{', #'.join(str(i) for i in users)}) — delete them first",
+        )
+    db.delete_mask(mask_id)
+    rendering.mask_path(mask_id).unlink(missing_ok=True)
+    return {"deleted": mask_id}
+
+
 MAX_PRESET_STEPS = 100
+
+
+def _portable_selection(selection: dict | None) -> dict | None:
+    """A selection as a preset can carry it: a click spec, never a saved mask.
+
+    A preset stores params, not pixels — replaying one runs today's effect code
+    against another image. A saved mask *is* pixels, and image-scoped ones at
+    that, so it degrades back to the click spec it was frozen from and gets
+    re-segmented on the target. Dropping the selection instead would silently
+    turn a masked blur into a whole-image blur.
+
+    The inverts XOR: the PNG was frozen post-invert, so the spec's own invert
+    already produced the saved shape and the reference's invert toggles it
+    again. A mask deleted since (or one with no stored spec) leaves the step
+    unmasked rather than failing the save, matching validate_selection's totality.
+    """
+    if selection is None or "mask" not in selection:
+        return selection
+    mask = db.get_mask(selection["mask"])
+    spec = validate_selection(mask["spec"]) if mask else None
+    if spec is None:
+        return None
+    return {**spec, "invert": spec["invert"] != selection["invert"]}
 
 
 def capture_steps(node_id: int) -> list[dict]:
@@ -320,12 +473,19 @@ def capture_steps(node_id: int) -> list[dict]:
             "params": params,
             "parent": index[node["parent_id"]],
             "parent2": index[node["parent2_id"]] if node["effect"] == "blend" else None,
-            # click coords ride along verbatim; they are in the parent's pixel
-            # space and clamp to the target image's bounds at mask time
-            "selection": validate_selection(node["selection"]),
+            # click coords ride along; they are in the parent's pixel space and
+            # clamp to the target image's bounds at mask time. A saved mask
+            # degrades to the click spec behind it — see _portable_selection.
+            "selection": _portable_selection(validate_selection(node["selection"])),
         }
         steps.append(step)
     return steps
+
+
+def _drop_mask_ref(selection: dict | None) -> dict | None:
+    if selection is not None and "mask" in selection:
+        return None  # image-scoped; a preset is not
+    return selection
 
 
 def _step_summary(steps: list[dict]) -> str:
@@ -409,8 +569,11 @@ def _validate_steps(steps: list[dict]) -> list[dict]:
                 "parent": parent,
                 "parent2": parent2,
                 # total: presets saved before selections existed, or with
-                # malformed data, replay unmasked rather than failing
-                "selection": validate_selection(step.get("selection")),
+                # malformed data, replay unmasked rather than failing. A mask
+                # reference should never reach a stored preset (capture_steps
+                # degrades it), so one that did is hand-edited or older data —
+                # strip it rather than resolve it against the wrong image.
+                "selection": _drop_mask_ref(validate_selection(step.get("selection"))),
             }
         )
     return checked

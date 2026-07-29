@@ -49,9 +49,17 @@ def _apply(
         out = EFFECTS[effect]["apply"](img, params)
     if selection is not None:
         # masked apply: effect pixels inside the selection, source outside.
-        # The mask comes from the same node whose pixels `img` holds, so the
-        # shapes always agree.
+        # For a click spec the mask is segmented from the same node whose pixels
+        # `img` holds, so the shapes always agree. A saved mask ignores
+        # source_node_id and still agrees, one step weaker: every EFFECTS entry
+        # is a pixel-for-pixel transform and blend resizes its second input to
+        # the first, so every node of an image shares its dimensions.
         mask = compute_mask(source_node_id, selection)
+        if mask.shape != img.shape[:2]:
+            raise ValueError(
+                f"mask is {mask.shape[1]}×{mask.shape[0]}, "
+                f"image is {img.shape[1]}×{img.shape[0]}"
+            )
         out = np.where(mask[:, :, None], out, img)
     return out
 
@@ -156,27 +164,61 @@ def node_embedding(node_id: int) -> np.ndarray:
     return embedding
 
 
-def compute_mask(node_id: int, selection: dict) -> np.ndarray:
-    """Boolean mask for a click on a node's rendered pixels."""
-    with Image.open(render_node(node_id)) as im:
-        w, h = im.size  # header-only read; no full decode
-    mask = sam.decode_mask(
-        node_embedding(node_id), h, w, selection["x"], selection["y"], selection["level"]
-    )
+def compute_mask(node_id: int | None, selection: dict) -> np.ndarray:
+    """Boolean mask for a selection: either a saved mask's frozen pixels, or a
+    click re-segmented against a node's rendered pixels.
+
+    `invert` is applied at the end for both shapes, so toggling it on a saved
+    mask behaves exactly as it does on a click spec — and costs nothing, since
+    a saved mask's PNG was already frozen with its own invert baked in."""
+    if "mask" in selection:
+        mask = load_mask(selection["mask"])  # node_id is irrelevant: frozen pixels
+    else:
+        with Image.open(render_node(node_id)) as im:
+            w, h = im.size  # header-only read; no full decode
+        mask = sam.decode_mask(
+            node_embedding(node_id), h, w,
+            selection["x"], selection["y"], selection["level"],
+        )
     if selection.get("invert"):
         mask = ~mask
     return mask
 
 
-def mask_png(node_id: int, selection: dict) -> bytes:
-    """The mask as a white-where-selected RGBA PNG for the frontend overlay
-    (translucency is the frontend's job — CSS opacity on the whole image)."""
-    mask = compute_mask(node_id, selection)
+# ---------- Saved masks (frozen pixels) ----------
+
+
+def mask_path(mask_id: int) -> Path:
+    return db.MASKS_DIR / f"{mask_id}.png"
+
+
+def save_mask(mask_id: int, mask: np.ndarray) -> None:
+    """Freeze a boolean mask to disk as a 1-bit PNG — a few tens of KB even for
+    a pathological mask, and the point of the whole feature: reuse loads these
+    pixels back rather than re-running SAM, so the shape never drifts."""
+    Image.fromarray(mask).save(mask_path(mask_id), format="PNG", optimize=True)
+
+
+def load_mask(mask_id: int) -> np.ndarray:
+    with Image.open(mask_path(mask_id)) as im:
+        return np.asarray(im.convert("1")).astype(bool)
+
+
+def _overlay_png(mask: np.ndarray) -> bytes:
+    """A boolean mask as a white-where-selected RGBA PNG for the frontend
+    overlay (translucency is the frontend's job — CSS opacity on the image).
+    Saved masks are *stored* 1-bit and colorized here on read, so there is one
+    file and one truth."""
     rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
     rgba[mask] = 255
     buf = io.BytesIO()
     Image.fromarray(rgba).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def mask_png(node_id: int, selection: dict) -> bytes:
+    """The overlay PNG for a selection on a node — either shape."""
+    return _overlay_png(compute_mask(node_id, selection))
 
 
 HIST_SAMPLE = 512
@@ -215,7 +257,8 @@ def _totals(paths) -> dict:
 def storage_stats() -> dict:
     """Bytes on disk, split by kind. Everything under `renders` is a cache that
     rebuilds from the originals plus the node rows, so it is reported apart from
-    the data that cannot be regenerated."""
+    the data that cannot be regenerated — which now includes saved masks, whose
+    frozen pixels are exactly what re-running SAM would not reproduce."""
     renders = list(db.RENDERS_DIR.iterdir())
     thumbs = [p for p in renders if p.name.endswith(".thumb.jpg")]
     clusters = [p for p in renders if p.name.endswith(".clusters.json")]
@@ -224,6 +267,7 @@ def storage_stats() -> dict:
         # glob, not DB_PATH.stat(), so a future WAL journal mode still adds up
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
         "originals": _totals(db.ORIGINALS_DIR.iterdir()),
+        "masks": _totals(db.MASKS_DIR.iterdir()),
         # a thumb is also a .jpg, so exclude it rather than matching on suffix
         "renders": _totals(
             p for p in renders if p.suffix == ".jpg" and not p.name.endswith(".thumb.jpg")

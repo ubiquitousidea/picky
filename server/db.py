@@ -8,6 +8,10 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ORIGINALS_DIR = DATA_DIR / "originals"
 RENDERS_DIR = DATA_DIR / "renders"
+# Saved masks live outside RENDERS_DIR on purpose: everything under renders/ is
+# a regenerable cache that delete_render_files sweeps by node id, and a saved
+# mask is user data keyed by mask id that must never be swept.
+MASKS_DIR = DATA_DIR / "masks"
 DB_PATH = DATA_DIR / "picky.db"
 
 SCHEMA = """
@@ -31,11 +35,22 @@ CREATE TABLE IF NOT EXISTS presets (
   steps TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS masks (
+  id INTEGER PRIMARY KEY,
+  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  node_id INTEGER,        -- provenance only: no FK, so the mask outlives the node
+  spec TEXT,              -- the click spec it was frozen from, for preset replay
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS masks_image_name ON masks(image_id, name);
 """
 
 
 def init() -> None:
-    for d in (DATA_DIR, ORIGINALS_DIR, RENDERS_DIR):
+    for d in (DATA_DIR, ORIGINALS_DIR, RENDERS_DIR, MASKS_DIR):
         d.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -270,6 +285,75 @@ def delete_preset(preset_id: int) -> None:
         conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
 
 
+def mask_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "image_id": row["image_id"],
+        "name": row["name"],
+        # provenance only — node_id carries no FK so the mask survives its
+        # node's deletion, which means it may dangle or, since SQLite reuses
+        # rowids, later name an unrelated node. Never present it as a link.
+        "node_id": row["node_id"],
+        "spec": json.loads(row["spec"]) if row["spec"] else None,
+        "width": row["width"],
+        "height": row["height"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_masks(image_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM masks WHERE image_id = ? ORDER BY name", (image_id,)
+        ).fetchall()
+    return [mask_dict(r) for r in rows]
+
+
+def get_mask(mask_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM masks WHERE id = ?", (mask_id,)).fetchone()
+    return mask_dict(row) if row else None
+
+
+def create_mask(
+    image_id: int, name: str, node_id: int, spec: dict, width: int, height: int
+) -> dict:
+    """Raises sqlite3.IntegrityError if the image already has a mask by this name."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO masks (image_id, name, node_id, spec, width, height, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (image_id, name, node_id, json.dumps(spec), width, height, _now()),
+        )
+        mask_id = cur.lastrowid
+    return get_mask(mask_id)
+
+
+def rename_mask(mask_id: int, name: str) -> dict:
+    """Raises sqlite3.IntegrityError if the new name collides within the image."""
+    with connect() as conn:
+        conn.execute("UPDATE masks SET name = ? WHERE id = ?", (name, mask_id))
+    return get_mask(mask_id)
+
+
+def delete_mask(mask_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM masks WHERE id = ?", (mask_id,))
+
+
+def nodes_using_mask(mask_id: int) -> list[int]:
+    """Nodes whose selection references this saved mask. Deleting the mask out
+    from under them would change their committed pixels, so the API refuses."""
+    with connect() as conn:
+        return [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM nodes WHERE json_extract(selection, '$.mask') = ?",
+                (mask_id,),
+            )
+        ]
+
+
 def stats() -> dict:
     """Row counts for the library stats screen."""
     with connect() as conn:
@@ -281,6 +365,7 @@ def stats() -> dict:
             "nodes": one("SELECT COUNT(*) FROM nodes"),
             "edits": one("SELECT COUNT(*) FROM nodes WHERE effect IS NOT NULL"),
             "presets": one("SELECT COUNT(*) FROM presets"),
+            "masks": one("SELECT COUNT(*) FROM masks"),
             "by_effect": [
                 dict(r)
                 for r in conn.execute(
