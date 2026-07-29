@@ -21,11 +21,21 @@ in order of precedence:
 
 Exports vary (I/O names, whether preprocessing is baked into the graph,
 low-res vs full-size mask output), so both entry points introspect the
-session instead of hardcoding one export's contract. To produce the files
-yourself: the MobileSAM repo's `scripts/export_onnx_model.py` exports the
-decoder (do NOT pass `--return-single-mask`; the level picker needs the
-multi-mask output), and the encoder is a plain `torch.onnx.export` of
-`model.image_encoder` traced on a (1, 3, 1024, 1024) float input.
+session instead of hardcoding one export's contract. For the encoder the
+tell is the input *rank*, and `compute_embedding` handles both families:
+
+- **Rank 3** — `(image_height, image_width, 3)`, dynamic HW, fixed 64x64
+  output. Preprocessing is baked into the graph: it wants raw 0-255 pixels
+  and normalizes and pads to 1024 itself. This is what `_HF_BASE` serves.
+- **Rank 4** — `(1, 3, 1024, 1024)`, a plain `torch.onnx.export` of
+  `model.image_encoder`. Caller must normalize and pad.
+
+Do *not* distinguish them by dtype: the rank-3 export declares float, so a
+`uint8`-vs-float test silently picks the rank-4 path and double-normalizes.
+
+To produce the files yourself, the MobileSAM repo's
+`scripts/export_onnx_model.py` exports the decoder — do NOT pass
+`--return-single-mask`; the level picker needs the multi-mask output.
 """
 
 import functools
@@ -119,26 +129,39 @@ def _resize_dims(h: int, w: int) -> tuple[int, int]:
 
 
 def compute_embedding(img: np.ndarray) -> np.ndarray:
-    """Run the SAM image encoder on an RGB uint8 array -> float32 embedding."""
+    """Run the SAM image encoder on an RGB uint8 array -> float32 embedding.
+
+    The resize to longest-side 1024 is ours in either case — no export resizes
+    internally, and feeding a full-size image instead yields a completely
+    unrelated embedding (cosine 0.31 against the correct one).
+    """
     h, w = img.shape[:2]
     new_h, new_w = _resize_dims(h, w)
     resized = np.asarray(
         Image.fromarray(img).resize((new_w, new_h), Image.Resampling.BILINEAR)
     )
-    canvas = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
-    canvas[:new_h, :new_w] = resized  # zero-pad bottom/right, like SAM
 
     session = _session("encoder")
     info = session.get_inputs()[0]
-    if "uint8" in info.type:
-        x = canvas  # export with preprocessing baked into the graph
+    # symbolic dims come through as strings, so read the rank, not the values:
+    # rank 3 is the HWC preprocessing-included family, rank 4 the bare encoder.
+    if len(info.shape) == 3:
+        # The graph does the mean/std normalize and the pad-to-1024 itself and
+        # wants raw 0-255 pixels. Doing either here as well hands the encoder
+        # values in ~[-2, 2], which degrades the embedding into one that returns
+        # most of the frame for every click — the bug this branch exists to fix.
+        # Dtype alone cannot tell the families apart: this export declares
+        # float, not uint8.
+        x = resized if "uint8" in info.type else resized.astype(np.float32)
     else:
-        x = (canvas.astype(np.float32) - _PIXEL_MEAN) / _PIXEL_STD
-    shape = info.shape  # symbolic dims come through as strings; only look at rank
-    if len(shape) == 4 and shape[1] == 3:
-        x = x.transpose(2, 0, 1)[None]  # NCHW
-    elif len(shape) == 4:
-        x = x[None]  # NHWC
+        canvas = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+        canvas[:new_h, :new_w] = resized  # zero-pad bottom/right, like SAM
+        x = (
+            canvas
+            if "uint8" in info.type
+            else (canvas.astype(np.float32) - _PIXEL_MEAN) / _PIXEL_STD
+        )
+        x = x.transpose(2, 0, 1)[None] if info.shape[1] == 3 else x[None]
     (embedding,) = session.run(None, {info.name: np.ascontiguousarray(x)})
     return embedding.astype(np.float32)
 
@@ -187,12 +210,15 @@ def decode_mask(
     scores = next((o for o in outputs if o.ndim == 2), None)
     binary = [_upscale(m, orig_h, orig_w, new_h, new_w) > 0.0 for m in masks]
 
+    # the multi-mask granularities are candidates 1.. when the single-mask
+    # token is also present (official multi export returns 4 masks)
+    first = 1 if len(binary) > 3 else 0
     if level == "auto" and scores is not None:
-        pick = int(np.argmax(scores[0]))
+        # skip the single-mask token for the same reason the level picker does,
+        # and as official SAM does whenever the multi-mask outputs are in play
+        pick = first + int(np.argmax(scores[0][first:]))
     else:
-        # the multi-mask granularities are candidates 1.. when the single-mask
-        # token is also present (official multi export returns 4 masks)
-        candidates = list(range(1, len(binary))) if len(binary) > 3 else list(range(len(binary)))
+        candidates = list(range(first, len(binary)))
         by_area = sorted(candidates, key=lambda i: (int(binary[i].sum()), -i))
         if level == "subpart":
             pick = by_area[0]
