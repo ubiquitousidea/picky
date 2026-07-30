@@ -386,6 +386,37 @@ def nodes_using_mask(mask_id: int) -> list[int]:
         ]
 
 
+def mask_use_counts(image_id: int) -> dict[int, int]:
+    """`{mask_id: number of nodes referencing it}` for one image's masks, in a
+    single query — the list endpoint's twin of `nodes_using_mask`, which it used
+    to call once per mask. Auto-banking mints a mask per picked object, so that
+    N+1 grew with the user's work on a path that runs on every image switch.
+
+    The subquery is `nodes_using_mask`'s two arms verbatim except that it selects
+    (mask, node) *pairs*, so `UNION` still dedupes a node that somehow holds both
+    spellings for the same mask — counting it twice is exactly what a plain
+    `UNION ALL` here would do. Masks with no referrers must still appear with 0,
+    hence the LEFT JOIN and `COUNT(u.node_id)` rather than `COUNT(*)`.
+
+    Deliberately not scoped to this image's nodes: a reference from elsewhere
+    should never exist, but if one did, it is precisely what must keep the delete
+    from going through — so it counts here too, as it does in `nodes_using_mask`.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT m.id AS mask_id, COUNT(u.node_id) AS used_by FROM masks m"
+            " LEFT JOIN ("
+            "   SELECT json_extract(selection, '$.mask') AS mask_id, id AS node_id"
+            "     FROM nodes WHERE json_extract(selection, '$.mask') IS NOT NULL"
+            "   UNION"
+            "   SELECT j.value, n.id FROM nodes n, json_each(n.selection, '$.masks') j"
+            " ) u ON u.mask_id = m.id"
+            " WHERE m.image_id = ? GROUP BY m.id",
+            (image_id,),
+        ).fetchall()
+    return {r["mask_id"]: r["used_by"] for r in rows}
+
+
 def stats() -> dict:
     """Row counts for the library stats screen."""
     with connect() as conn:
