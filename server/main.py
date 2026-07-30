@@ -335,13 +335,9 @@ def list_masks(image_id: int):
     if db.get_image(image_id) is None:
         raise HTTPException(404, "image not found")
     # used_by rides along so the UI can warn before a delete is refused. One
-    # grouped query, not one per mask: banking a selection on every Apply means
+    # joined query, not one per mask: banking a selection on every Apply means
     # this list grows with use, and it is refetched on every image switch.
-    used = db.mask_use_counts(image_id)
-    return [
-        {**mask, "used_by": used.get(mask["id"], 0)}
-        for mask in db.list_masks(image_id)
-    ]
+    return db.list_masks(image_id, with_use_counts=True)
 
 
 def _auto_mask_name(image_id: int) -> str:

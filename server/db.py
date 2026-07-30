@@ -299,8 +299,44 @@ def delete_preset(preset_id: int) -> None:
         conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
 
 
+# Every (mask, referring node) pair in the library. `nodes_using_mask` filters it
+# to guard a delete; `list_masks(with_use_counts=True)` groups it to render the
+# warning that *predicts* that delete. They share the text for the same reason
+# `descendant_ids` and `delete_node` share `DESCENDANT_CTE`: a check and the thing
+# it checks must not be able to drift. They did while this SQL was duplicated —
+# the count's join compared a typeless subquery column against `masks.id`, whose
+# INTEGER affinity silently coerced a TEXT id that the guard's `= ?` against a
+# bound int did not match, so a `{"masks": ["7"]}` row was counted but not refused.
+#
+# Hence the CAST, which puts both on the one interpretation the rest of the app
+# already uses: `effects.validate_selection` runs every id through Python's
+# `int()` on read. Casting the two spellings rather than the bound parameter is
+# what makes that normalization happen once, here, for every caller.
+#
+# Two arms because a selection holds a *union* of mask ids, and nothing migrates
+# the pre-union `$.mask` spelling out of rows written before it: `json_extract`
+# reads the scalar, `json_each` walks the array (it yields no rows when
+# `selection` is NULL or has no `masks` key, so it needs no guard).
+#
+# UNION ALL, not UNION: deduping here would sort every pair in the database on
+# every call to collapse only the node that holds one mask in *both* spellings.
+# Each caller spells that dedupe itself, over the far smaller set it selects.
+#
+# Deliberately library-wide rather than scoped to one image's nodes. A reference
+# from another image should never exist, but if one did it is precisely what must
+# keep a delete from going through — so it has to be visible to both callers.
+# Scoping the arms by image_id measures ~16x faster and is the obvious
+# optimization; it is wrong for exactly that reason.
+MASK_REFS = """SELECT CAST(json_extract(selection, '$.mask') AS INTEGER) AS mask_id,
+                        id AS node_id
+                   FROM nodes WHERE json_extract(selection, '$.mask') IS NOT NULL
+                 UNION ALL
+                 SELECT CAST(j.value AS INTEGER), n.id
+                   FROM nodes n, json_each(n.selection, '$.masks') j"""
+
+
 def mask_dict(row: sqlite3.Row) -> dict:
-    return {
+    d = {
         "id": row["id"],
         "image_id": row["image_id"],
         "name": row["name"],
@@ -313,9 +349,16 @@ def mask_dict(row: sqlite3.Row) -> dict:
         "height": row["height"],
         "created_at": row["created_at"],
     }
+    # present only when the caller asked list_masks to join the counts in, so
+    # the key is absent rather than 0 when nobody counted — a mask that reports
+    # `used_by: 0` has been checked, and the UI may trust it enough to skip a
+    # delete warning
+    if "used_by" in row.keys():
+        d["used_by"] = row["used_by"]
+    return d
 
 
-def list_masks(image_id: int) -> list[dict]:
+def list_masks(image_id: int, *, with_use_counts: bool = False) -> list[dict]:
     """Oldest first, so a newly banked mask appends to the grid instead of
     shifting the tiles under the user's cursor.
 
@@ -323,10 +366,33 @@ def list_masks(image_id: int) -> list[dict]:
     puts `Object 10` ahead of `Object 2`. Not `ORDER BY id` either — rowids are
     reused, so a brand-new mask can take a low id and sort into the middle.
     `created_at` is an ISO string with a fixed-width `+00:00` offset, so
-    lexicographic order *is* chronological; `id` only breaks ties."""
+    lexicographic order *is* chronological; `id` only breaks ties.
+
+    `with_use_counts` adds each mask's referring-node count (see `MASK_REFS`) as
+    `used_by`. It is opt-in because that join scans every node in the library,
+    and two of the three callers — the mask-id set `_check_selection` validates
+    against, and the taken-names set `_auto_mask_name` scans — want neither the
+    number nor the scan. Only the list endpoint renders it.
+
+    Joining it here rather than merging a second query's dict in the endpoint is
+    what makes the list and its counts one snapshot. As two queries on two
+    connections they were not: the counts were read first, so a node created in
+    between made an in-use mask report `used_by: 0` — the grid would then omit
+    the warning and let the user click into a 409, which is the exact surprise
+    `used_by` exists to prevent."""
+    join = count = ""
+    if with_use_counts:
+        count = ", COALESCE(u.used_by, 0) AS used_by"
+        join = (
+            " LEFT JOIN ("
+            f"   SELECT mask_id, COUNT(DISTINCT node_id) AS used_by FROM ({MASK_REFS})"
+            "    GROUP BY mask_id"
+            " ) u ON u.mask_id = m.id"
+        )
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM masks WHERE image_id = ? ORDER BY created_at, id",
+            f"SELECT m.*{count} FROM masks m{join}"
+            " WHERE m.image_id = ? ORDER BY m.created_at, m.id",
             (image_id,),
         ).fetchall()
     return [mask_dict(r) for r in rows]
@@ -368,53 +434,24 @@ def nodes_using_mask(mask_id: int) -> list[int]:
     """Nodes whose selection references this saved mask. Deleting the mask out
     from under them would change their committed pixels, so the API refuses.
 
-    Two arms because a selection holds a *union* of mask ids, and nothing
-    migrates the pre-union `$.mask` spelling out of rows written before it:
-    `json_extract` reads the scalar, `json_each` walks the array (it yields no
-    rows when `selection` is NULL or has no `masks` key, so it needs no guard).
+    Reads `MASK_REFS`, whose comment carries the shared reasoning — including why
+    this query and the `used_by` count it must agree with are one piece of SQL.
+
+    `DISTINCT` is this caller's half of the dedupe `MASK_REFS` leaves undone: it
+    collapses the node holding the same mask in both spellings, which would
+    otherwise be named twice in the 409. `ORDER BY` restores the ascending ids the
+    old `UNION` used to produce as a side effect of sorting — the 409 message
+    lists them, so the order is user-visible.
     """
     with connect() as conn:
         return [
-            r["id"]
+            r["node_id"]
             for r in conn.execute(
-                "SELECT id FROM nodes WHERE json_extract(selection, '$.mask') = ?"
-                " UNION"
-                " SELECT n.id FROM nodes n, json_each(n.selection, '$.masks') j"
-                " WHERE j.value = ?",
-                (mask_id, mask_id),
+                f"SELECT DISTINCT node_id FROM ({MASK_REFS})"
+                " WHERE mask_id = ? ORDER BY node_id",
+                (mask_id,),
             )
         ]
-
-
-def mask_use_counts(image_id: int) -> dict[int, int]:
-    """`{mask_id: number of nodes referencing it}` for one image's masks, in a
-    single query — the list endpoint's twin of `nodes_using_mask`, which it used
-    to call once per mask. Auto-banking mints a mask per picked object, so that
-    N+1 grew with the user's work on a path that runs on every image switch.
-
-    The subquery is `nodes_using_mask`'s two arms verbatim except that it selects
-    (mask, node) *pairs*, so `UNION` still dedupes a node that somehow holds both
-    spellings for the same mask — counting it twice is exactly what a plain
-    `UNION ALL` here would do. Masks with no referrers must still appear with 0,
-    hence the LEFT JOIN and `COUNT(u.node_id)` rather than `COUNT(*)`.
-
-    Deliberately not scoped to this image's nodes: a reference from elsewhere
-    should never exist, but if one did, it is precisely what must keep the delete
-    from going through — so it counts here too, as it does in `nodes_using_mask`.
-    """
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT m.id AS mask_id, COUNT(u.node_id) AS used_by FROM masks m"
-            " LEFT JOIN ("
-            "   SELECT json_extract(selection, '$.mask') AS mask_id, id AS node_id"
-            "     FROM nodes WHERE json_extract(selection, '$.mask') IS NOT NULL"
-            "   UNION"
-            "   SELECT j.value, n.id FROM nodes n, json_each(n.selection, '$.masks') j"
-            " ) u ON u.mask_id = m.id"
-            " WHERE m.image_id = ? GROUP BY m.id",
-            (image_id,),
-        ).fetchall()
-    return {r["mask_id"]: r["used_by"] for r in rows}
 
 
 def stats() -> dict:

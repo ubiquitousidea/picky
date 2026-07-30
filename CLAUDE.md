@@ -205,8 +205,34 @@ Key invariants that cut across files:
   image they were picked on (`_check_selection` 400s if *any* member is foreign,
   since they are OR'd into one image's dimensions); deleting one that nodes
   reference is a 409 rather than a silent repaint of committed pixels, and
-  `db.nodes_using_mask` needs **two arms** to find those referrers — a
-  `json_extract` for the legacy scalar and a `json_each` for the array.
+  finding those referrers needs **two arms** — a `json_extract` for the legacy
+  scalar and a `json_each` for the array. Both live in one shared `MASK_REFS`
+  constant, which `db.nodes_using_mask` filters (it guards the delete) and
+  `db.list_masks(with_use_counts=True)` groups (it renders the `used_by` warning
+  that *predicts* the delete), for the same reason `descendant_ids` and
+  `delete_node` share `DESCENDANT_CTE`: a check and the thing it checks must not
+  be able to drift. They did while the SQL was duplicated — the count's join
+  compared a typeless subquery column against `masks.id`, whose INTEGER affinity
+  coerced a TEXT id that the guard's `= ?` against a bound int did not match, so
+  a `{"masks": ["7"]}` row was counted but not refused. Hence the `CAST` inside
+  `MASK_REFS`: it puts both on the one interpretation
+  `effects.validate_selection` already applies on read (Python's `int()`).
+  `MASK_REFS` is `UNION ALL`, so each caller spells its own dedupe — `DISTINCT`
+  for the id list, `COUNT(DISTINCT node_id)` for the counts — which is what
+  collapses a node holding both spellings. It deliberately cannot be filtered by
+  `image_id` (~16x cheaper, and the obvious optimization), since a cross-image
+  reference is exactly what must still block a delete.
+- **`used_by` is joined into the mask list, not merged in afterwards.** The
+  counting is a `with_use_counts` flag on `db.list_masks` rather than a second
+  function, so the list and its counts are one query, one connection, one
+  snapshot — as two queries the counts were read *first*, so a node created in
+  between made an in-use mask report `used_by: 0`, dropping the warning and
+  letting the user click into the 409 it exists to prevent. The flag is opt-in
+  because the join scans every node in the library and two of the three callers
+  (`_check_selection`'s id set, `_auto_mask_name`'s taken-names set) want
+  neither the number nor the scan. `mask_dict` omits the key entirely when
+  nobody counted, so `used_by: 0` always means *checked and unused* rather than
+  *not looked at*.
 - **The overlay is an outline, not a fill.** `_overlay_png` emits the mask's
   4-neighbour inner boundary, dilated to a width scaled by image size (the
   overlay is displayed fitted to the panel, so a 1px line on a 4000px photo
