@@ -43,15 +43,17 @@ restarts.
   are marked in the work tree), so editing the effect's params later
   re-composites against the same region. Model weights (~45 MB) download on
   first use.
-- **Saved masks** — **Save selection as mask** names the region you just
-  picked and freezes its pixels to disk, so it becomes a durable mask rather
-  than a click that has to be re-segmented. Tick it in the mask list to reuse it
-  on any node of that image, which is what lets you stack several effects on one
-  object without re-selecting it each time; the shape is identical every time,
-  and it survives deleting the node it was picked on. **Tick several and they
-  combine** — the effect applies to their union, so one blur can cover two
-  objects. A mask belongs to its image, and one still in use cannot be deleted
-  out from under the nodes that reference it.
+- **Saved masks** — **picking an object and applying an effect saves that
+  object automatically**, freezing its pixels to disk as a durable mask rather
+  than a click that has to be re-segmented. It appears as a silhouette icon
+  under the picker, named for you (*Object 1*, *Object 2*, …) and already
+  ticked, so the next effect lands on exactly the same region — that is what
+  lets you stack several effects on one object without re-selecting it each
+  time. The shape is identical every time, and it survives deleting the node it
+  was picked on. **Tick several and they combine** — the effect applies to
+  their union, so one blur can cover two objects. **Save selection** banks an
+  object you are not ready to use yet. A mask belongs to its image, and one
+  still in use cannot be deleted out from under the nodes that reference it.
 - **Presets** — save the chain that produced a node as a named recipe and
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
@@ -120,7 +122,10 @@ pixels, and re-decoded — which keeps it exact when the node's params are
 edited. Saving a mask is the deliberate opposite: it writes the decoded region
 to `data/masks/<id>.png` as a 1-bit image, so reuse skips the model entirely
 and the shape cannot drift. That file sits outside `data/renders/` because
-everything there is a cache that invalidation is free to delete.
+everything there is a cache that invalidation is free to delete. Applying an
+effect to a fresh pick saves it that way first, so the object outlives the
+click — a click is only meaningful on the node it was made on, and applying an
+effect moves you off that node.
 
 A selection is a *union* in either form — a list of click points, or a list of
 saved mask ids — OR'd together with one `invert` over the result. Selections
@@ -152,7 +157,8 @@ the preset is replayed against.
 | POST   | `/api/nodes/{id}/apply-preset` | replay a preset onto a node (`preset_id`) |
 | DELETE | `/api/presets/{id}` | delete a preset |
 | GET    | `/api/images/{id}/masks` | list an image's saved masks, each with a `used_by` count |
-| POST   | `/api/images/{id}/masks` | freeze a click selection into a named mask (`name`, `node_id`, `selection`) |
+| POST   | `/api/images/{id}/masks` | freeze a click selection into a mask (`node_id`, `selection`, optional `name` — omit it and the server picks the next unused *Object N*) |
+| GET    | `/api/masks/{id}/thumb` | the mask's silhouette as a small grayscale PNG — the icon in the mask grid; computed per request and served `immutable`, so cache-bust on the mask's `created_at` |
 | PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
 | DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
 | GET    | `/api/stats` | library counts and disk usage |

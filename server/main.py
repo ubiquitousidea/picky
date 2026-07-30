@@ -56,7 +56,9 @@ class MaskRequest(BaseModel):
 
 
 class MaskCreate(BaseModel):
-    name: str
+    # omit `name` to have the server pick one — masks are identified by their
+    # thumbnail now, so the name is only a tooltip and a uniqueness key
+    name: str | None = None
     node_id: int
     selection: dict
 
@@ -339,12 +341,35 @@ def list_masks(image_id: int):
     ]
 
 
+def _auto_mask_name(image_id: int) -> str:
+    """`Object 1`, `Object 2`, … — the lowest ordinal this image is not using.
+
+    Masks name themselves because the user never has to think about the name:
+    the grid identifies them by thumbnail, so a name only has to satisfy the
+    masks(image_id, name) index and read sensibly in a tooltip. Reusing a freed
+    ordinal (delete `Object 2`, next save takes it back) is deliberate — the
+    numbers stay small and they are not identifiers, the ids are.
+    """
+    taken = {m["name"] for m in db.list_masks(image_id)}
+    n = 1
+    while f"Object {n}" in taken:
+        n += 1
+    return f"Object {n}"
+
+
+# an auto-named save races another one only if two Applies land in the same
+# instant; these endpoints are sync `def`, so FastAPI runs them concurrently in
+# a threadpool and that is a real, if rare, window
+AUTO_NAME_TRIES = 5
+
+
 @app.post("/api/images/{image_id}/masks")
 def create_mask(image_id: int, body: MaskCreate):
     if db.get_image(image_id) is None:
         raise HTTPException(404, "image not found")
-    name = body.name.strip()
-    if not name:
+    name = None if body.name is None else body.name.strip()
+    if name == "":
+        # an explicitly empty name is a client bug, not a request to auto-name
         raise HTTPException(400, "mask name cannot be empty")
     node = db.get_node(body.node_id)
     if node is None or node["image_id"] != image_id:
@@ -362,10 +387,18 @@ def create_mask(image_id: int, body: MaskCreate):
         raise HTTPException(500, f"segmentation failed: {exc}")
 
     height, width = mask.shape
-    try:
-        saved = db.create_mask(image_id, name, body.node_id, spec, width, height)
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, f"a mask named '{name}' already exists for this image")
+    # a caller-supplied name is taken literally and collides once; an auto-name
+    # re-derives and retries, since losing the race just means picking again
+    for attempt in range(AUTO_NAME_TRIES if name is None else 1):
+        chosen = name if name is not None else _auto_mask_name(image_id)
+        try:
+            saved = db.create_mask(image_id, chosen, body.node_id, spec, width, height)
+            break
+        except sqlite3.IntegrityError:
+            if name is not None or attempt == AUTO_NAME_TRIES - 1:
+                raise HTTPException(
+                    409, f"a mask named '{chosen}' already exists for this image"
+                )
     # row first so the file is named by the id; unwind it if the write fails,
     # so a row can never point at a missing PNG
     try:
@@ -411,6 +444,31 @@ def delete_mask(mask_id: int):
     db.delete_mask(mask_id)
     rendering.mask_path(mask_id).unlink(missing_ok=True)
     return {"deleted": mask_id}
+
+
+@app.get("/api/masks/{mask_id}/thumb")
+def get_mask_thumb(mask_id: int):
+    """A mask's silhouette as a small PNG — the icon in the selection grid.
+
+    Computed per request rather than cached (see `mask_thumb_png`). The one
+    cache that *is* worth having is the browser's, and that is also where the
+    rowid-reuse hazard is unfixable — nothing can unlink a cache entry — so the
+    frontend versions the URL with the mask's `created_at` and this is
+    `immutable`. That combination is what keeps the grid rebuild that
+    `renderSelectControls` does on every selection change from refetching
+    every icon.
+    """
+    if db.get_mask(mask_id) is None:
+        raise HTTPException(404, "mask not found")
+    try:
+        data = rendering.mask_thumb_png(mask_id)
+    except Exception as exc:
+        raise HTTPException(500, f"thumbnail failed: {exc}")
+    return Response(
+        content=data,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 MAX_PRESET_STEPS = 100

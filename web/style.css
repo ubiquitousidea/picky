@@ -466,7 +466,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .sel-save-mask:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
 #preset-list, .sel-mask-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
 #preset-list .hint, .sel-mask-list .hint { padding: 0 0.1rem; }
-.preset-row, .mask-row {
+.preset-row {
   display: flex;
   align-items: center;
   gap: 0.35rem;
@@ -476,12 +476,38 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border: 1px solid transparent;
   color: var(--rb-teal);
 }
-.mask-row { color: var(--rb-pink); }
-.mask-row input { flex: none; accent-color: var(--rb-pink); }
-.preset-row:hover, .mask-row:hover { background: var(--panel-2); border-color: currentColor; }
-.mask-row.selected { background: var(--panel-2); border-color: currentColor; }
-.preset-row.disabled, .mask-row.disabled { opacity: 0.4; pointer-events: none; }
+.preset-row:hover { background: var(--panel-2); border-color: currentColor; }
+.preset-row.disabled { opacity: 0.4; pointer-events: none; }
 .preset-row.busy { opacity: 0.7; pointer-events: none; }
+
+/* A preset is a recipe and reads as a line of text; a mask is a shape, so it
+   reads as a picture. Hence a grid of silhouette icons rather than named rows —
+   the name is only in the tooltip. */
+.sel-mask-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+  gap: 0.35rem;
+}
+.sel-mask-list .hint { grid-column: 1 / -1; }
+.mask-chip {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+.mask-chip img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.mask-chip input {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  margin: 0;
+  accent-color: var(--rb-pink);
+}
+.mask-chip:hover, .mask-chip.selected { border-color: var(--rb-pink); }
+.mask-chip.disabled { opacity: 0.4; pointer-events: none; }
 .preset-text { min-width: 0; }
 .preset-summary {
   color: var(--muted);
@@ -502,7 +528,16 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   border-radius: 4px;
   visibility: hidden;
 }
-.preset-row:hover .preset-del, .mask-row:hover .mask-del { visibility: visible; }
+/* the chip's × floats over the icon rather than following it in flow */
+.mask-chip .mask-del {
+  position: absolute;
+  top: 0;
+  right: 0;
+  margin-left: 0;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 0 6px 0 4px;
+}
+.preset-row:hover .preset-del, .mask-chip:hover .mask-del { visibility: visible; }
 .preset-del:hover, .mask-del:hover { color: var(--rb-red); background: var(--panel); }
 
 /* Modals — native <dialog>, so Esc and focus trapping come for free */

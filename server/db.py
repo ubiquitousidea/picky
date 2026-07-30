@@ -316,9 +316,18 @@ def mask_dict(row: sqlite3.Row) -> dict:
 
 
 def list_masks(image_id: int) -> list[dict]:
+    """Oldest first, so a newly banked mask appends to the grid instead of
+    shifting the tiles under the user's cursor.
+
+    Not `ORDER BY name`: names are auto-generated ordinals now, and text order
+    puts `Object 10` ahead of `Object 2`. Not `ORDER BY id` either — rowids are
+    reused, so a brand-new mask can take a low id and sort into the middle.
+    `created_at` is an ISO string with a fixed-width `+00:00` offset, so
+    lexicographic order *is* chronological; `id` only breaks ties."""
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM masks WHERE image_id = ? ORDER BY name", (image_id,)
+            "SELECT * FROM masks WHERE image_id = ? ORDER BY created_at, id",
+            (image_id,),
         ).fetchall()
     return [mask_dict(r) for r in rows]
 

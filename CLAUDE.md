@@ -124,15 +124,22 @@ Key invariants that cut across files:
   exactly when an armed picker's commit closure becomes detached; and
   `closeEdit()` repaints the Apply panel's selection, since the modal borrows
   the single overlay.
-- **The saved-mask list is part of the selection control, not a section of its
+- **The saved-mask grid is part of the selection control, not a section of its
   own.** Ticking a mask *is* editing the selection, so the picker, the
-  level/invert options, "Save selection as mask", and the list of masks are one
+  level/invert options, "Save selection", and the saved objects are one
   component with one render path — the panel and the store cannot drift. Its
-  `allowManage` flag is off in the edit modal (a `prompt()` can't be answered on
-  a page `showModal()` made inert, and deleting a mask the node uses would 409
-  anyway); `allowPick` is off there too, since re-picking needs a click. The
-  rows are built **once** per control and only restyled on a toggle: rebuilding
-  them would detach the very `<li>` whose click handler is mid-flight.
+  `allowManage` flag is off in the edit modal (deleting a mask the node uses
+  would 409 anyway); `allowPick` is off there too, since re-picking needs a
+  click on a page `showModal()` made inert. The chips are built **once** per
+  control and only restyled on a toggle: rebuilding them would detach the very
+  `<li>` whose click handler is mid-flight.
+  A mask is a shape, so it is drawn as a **picture, not a row of text** — a grid
+  of square chips, each an `<img>` of `GET /api/masks/{id}/thumb`, with the
+  name, dimensions and used-by count in the `title`. A preset stays a text row
+  because a recipe has no picture. The `src` carries `?v=<created_at>` because
+  the icon is served with a year-long `max-age` (the grid is rebuilt on every
+  selection change, so uncached it would refetch every icon) and mask ids are
+  rowids that SQLite hands back out after a delete.
 - **Saved masks freeze pixels; click points are a recipe — and both are
   unions.** `selection` has two shapes: `{points: [{x, y, level}, ...], invert}`
   re-segmented by SAM, or `{masks: [id, ...], invert}` loaded from
@@ -152,14 +159,49 @@ Key invariants that cut across files:
   (via `node_dict` or `main.py`'s request validation), so that call is the belt
   to their braces — it is what keeps the mask-building function total on its
   own rather than by convention.
+  **A click selection is frozen automatically the moment it is used.**
+  `bankSelection()` runs in `applyEffect()` *before* the node POST, so the store
+  crosses over to the mask shape and survives `pruneSelection()` into the node
+  it just made — without it, using a pick destroys it, since Apply selects the
+  new node and a point's coords only mean anything in the node they were picked
+  on. That is also what stops the *next* Apply freezing a second copy: it finds
+  `{masks}` and no-ops. This lives in the frontend rather than the `create_node`
+  endpoint on purpose — from the server the store would still hold the points,
+  so every Apply would duplicate, and preset replay (which builds nodes through
+  `db.create_node`) would mint a mask per masked step. A failed bank still
+  applies the effect, with the click selection, and says so in one alert
+  afterwards: a bookkeeping failure is no reason to refuse the edit, but it must
+  not be silent either. The explicit "Save selection" button survives for
+  banking an object you are not ready to use, and shares the same function.
+  Names are **server-generated** (`_auto_mask_name`: the lowest unused
+  `Object N` for that image, retried on `IntegrityError` because these are sync
+  `def` endpoints running concurrently in a threadpool) — the grid identifies a
+  mask by its picture, so a name only has to satisfy the `masks(image_id, name)`
+  index and read sensibly in a tooltip. `MaskCreate.name` is therefore optional;
+  an explicitly *empty* one is still a 400, and a caller-supplied one still 409s
+  without retrying. `db.list_masks` orders by `created_at, id` — not by name
+  (text order puts `Object 10` before `Object 2`) and not by id alone (rowids
+  are reused, so a brand-new mask could sort into the middle of the grid).
   Masks live *outside* `renders/` on purpose: that directory is a regenerable
   cache swept by node id (`delete_render_files`), and a saved mask is user data
   keyed by mask id whose whole point is that it is *not* regenerable. Stored
   1-bit and colorized on read (`rendering._overlay_png`), so
   `POST /api/nodes/{id}/mask` serves both shapes and the frontend overlay needs
-  no branch. The PNG is frozen **post-invert** — what you saw is what you saved —
-  so a reference's own `invert` toggles on top, which is why `saveMask()` follows
-  up with `invert: false` and why `_portable_selection` XORs. Masks belong to the
+  no branch. A mask's **icon is not a file** (`rendering.mask_thumb_png`), for
+  the same reason the histogram is not: ~15 ms even on a 7728×5152 mask and
+  under a kilobyte on the wire, cheaper than the `load_mask` these endpoints
+  already run. A `<id>.thumb.png` would be a second file keyed by a rowid
+  SQLite reuses, so one missed unlink would serve a deleted mask's silhouette
+  as its successor's, and it would need excluding from `storage_stats`, whose
+  masks line means "the bytes you cannot regenerate". Derived from the one file
+  whose deletion is already correct, it cannot go stale. Two Pillow details are
+  load-bearing: a stored mask opens as mode `"1"`, which resizes NEAREST
+  whatever filter you pass, so it is converted to `"L"` first; and the resample
+  is `BOX`, because on a binary mask that is exactly "what fraction of this
+  source cell was selected" while cubic filters ring — bright halos outside the
+  object, dark ones inside. The PNG is frozen **post-invert** — what you saw is what you saved —
+  so a reference's own `invert` toggles on top, which is why `bankSelection()`
+  follows up with `invert: false` and why `_portable_selection` XORs. Masks belong to the
   image they were picked on (`_check_selection` 400s if *any* member is foreign,
   since they are OR'd into one image's dimensions); deleting one that nodes
   reference is a 409 rather than a silent repaint of committed pixels, and
@@ -317,11 +359,16 @@ new nodes appear.
 
 `state.masks` follows the adapted rule: masks are image-scoped, so they are
 fetched in `selectImage()` alongside the tree and refreshed only after a
-save/rename/delete. The list has no render function of its own —
-`renderSelectControls()` draws it as part of the selection control — so
-`refreshMasks()` calls that. Ticking a mask row unions it into the Apply panel's
-selection (the analogue of a preset row acting on the selected node) rather than
-creating anything.
+save/rename/delete — and Apply is now one of those, since it banks the
+selection. That path needs no extra refresh call: `applyEffect()` ends in
+`selectImage()`, which refetches the list anyway. `bankSelection()` still
+appends the new row locally first, so the window between banking and that
+refetch — which a failed Apply can leave open indefinitely — never shows a
+store pointing at a mask the grid does not have. The grid has no render
+function of its own — `renderSelectControls()` draws it as part of the selection
+control — so `refreshMasks()` calls that. Ticking a mask chip unions it into the
+Apply panel's selection (the analogue of a preset row acting on the selected
+node) rather than creating anything.
 
 The two modals are native `<dialog>` elements (Esc and focus trapping for free);
 `prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two gotchas:

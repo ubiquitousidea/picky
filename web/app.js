@@ -1049,12 +1049,22 @@ async function applyEffect() {
   const { effect, params, parent2_id, selection } = readEffectForm();
   if (effect === "blend" && parent2_id === null) return;
   exitPreview(false);
-  const body = { parent_id: state.nodeId, effect, params };
-  if (effect === "blend") body.parent2_id = parent2_id;
-  if (selection) body.selection = selection;
   btn.disabled = true;
   btn.classList.add("busy");
   btn.textContent = "Applying…";
+  // Using a picked object banks it first, so it outlives the click that made
+  // it — see bankSelection. Failing to bank is not a reason to refuse the
+  // effect, so fall back to the click and say so once the node is in.
+  let banked = selection;
+  let bankErr = null;
+  try {
+    banked = await bankSelection(state.selection);
+  } catch (err) {
+    bankErr = err;
+  }
+  const body = { parent_id: state.nodeId, effect, params };
+  if (effect === "blend") body.parent2_id = parent2_id;
+  if (banked) body.selection = banked;
   try {
     const node = await api(`/api/images/${state.imageId}/nodes`, {
       method: "POST",
@@ -1062,7 +1072,16 @@ async function applyEffect() {
       body: JSON.stringify(body),
     });
     await selectImage(state.imageId, node.id);
+    if (bankErr) {
+      alert(
+        "The effect was applied, but the selection could not be saved for reuse: " +
+          bankErr.message
+      );
+    }
   } catch (err) {
+    // a bank that succeeded is never unwound — the mask is durable user data and
+    // the retry reuses it — but the grid has not drawn its tile yet
+    renderSelectControls();
     alert(`Failed to apply effect: ${err.message}`);
   } finally {
     btn.disabled = state.imageId === null;
@@ -1285,12 +1304,11 @@ function selSummary(sel) {
 // bubbling `input` event, so the existing delegated listeners on the containers
 // drive the shared preview debounce with no new wiring.
 //
-// The saved-mask list is part of this control rather than a section of its own:
+// The saved-mask grid is part of this control rather than a section of its own:
 // choosing masks *is* the selection, so keeping the picker, the level/invert
-// options, Save-as-mask, and the list of masks in one component is what stops
-// the panel's rendered state and the store from drifting apart. `allowManage`
-// is off in the edit modal — its page is inert, so a `prompt()` could not be
-// answered, and deleting a mask the node uses would 409 anyway.
+// options, Save, and the saved objects in one component is what stops the
+// panel's rendered state and the store from drifting apart. `allowManage` is off
+// in the edit modal — deleting a mask the node uses would 409 anyway.
 function appendSelectionControls(
   container, { store, sourceNodeId, allowPick = true, allowManage = false }
 ) {
@@ -1341,12 +1359,13 @@ function appendSelectionControls(
 
   row.append(label, pickRow, optRow);
 
-  // Save-as-mask, then the masks themselves — the order the workflow runs in:
-  // pick an object, freeze it, repeat, then tick the ones this effect applies to.
+  // Save, then the saved objects themselves — the order the workflow runs in:
+  // pick an object, use it (which banks it), repeat, then tick the ones this
+  // effect applies to.
   const save = document.createElement("button");
   save.type = "button";
   save.className = "sel-save-mask";
-  save.textContent = "Save selection as mask";
+  save.textContent = "Save selection";
   if (allowManage) row.appendChild(save);
 
   const list = document.createElement("ul");
@@ -1384,32 +1403,34 @@ function appendSelectionControls(
     empty.className = "hint";
     empty.textContent = state.imageId === null
       ? "Pick an image to see its masks."
-      : "Select an object above, then save it to reuse it on any node.";
+      : "Select an object and apply an effect — it gets saved here for reuse.";
     list.appendChild(empty);
   }
   for (const mask of state.masks) {
     const li = document.createElement("li");
-    li.className = "mask-row";
-    li.title = mask.used_by
-      ? `Used by ${mask.used_by} node${mask.used_by === 1 ? "" : "s"} — delete those first to remove it`
-      : "Include this mask in the selection";
+    li.className = "mask-chip";
+    // the silhouette carries the identity, so the words live in the tooltip
+    li.title = [
+      mask.name,
+      `${mask.width}×${mask.height}`,
+      mask.used_by
+        ? `used by ${mask.used_by} node${mask.used_by === 1 ? "" : "s"} — delete those first to remove it`
+        : "click to include it in the selection",
+    ].join(" · ");
+
+    const img = document.createElement("img");
+    // created_at busts the cache: the icon is served with a year-long max-age,
+    // but mask ids are rowids and SQLite reuses them
+    img.src = `/api/masks/${mask.id}/thumb?v=${encodeURIComponent(mask.created_at)}`;
+    img.alt = mask.name;
+    img.loading = "lazy";
+    img.draggable = false;
 
     const box = document.createElement("input");
     box.type = "checkbox";
-    box.tabIndex = -1; // the row owns the click; the box is the indicator
+    box.tabIndex = -1; // the chip owns the click; the box is the indicator
 
-    const text = document.createElement("div");
-    text.className = "preset-text";
-    const name = document.createElement("div");
-    name.className = "preset-name";
-    name.textContent = mask.name;
-    const summary = document.createElement("div");
-    summary.className = "preset-summary";
-    summary.textContent =
-      `${mask.width}×${mask.height}${mask.used_by ? ` · used ${mask.used_by}×` : ""}`;
-    text.append(name, summary);
-
-    li.append(box, text);
+    li.append(img, box);
     if (allowManage) {
       const del = document.createElement("button");
       del.className = "mask-del";
@@ -1440,7 +1461,7 @@ function appendSelectionControls(
     save.disabled = maskBusy || state.imageId === null || !points.length;
     save.title = save.disabled
       ? "Select an object first — a saved mask is already saved"
-      : "Freeze this selection's pixels so you can reuse it without re-picking";
+      : "Save this object now — applying an effect to it saves it too";
     const chosen = selMasks(sel);
     for (const { mask, li, box } of rows) {
       box.checked = chosen.includes(mask.id);
@@ -1619,35 +1640,54 @@ async function refreshMasks() {
   renderSelectControls();
 }
 
+// Freeze a store's click selection and swap the store over to the frozen
+// pixels. This is what makes a picked object durable: a {points} selection dies
+// with its node in pruneSelection(), because its coordinates only mean anything
+// in that node's pixel space, while a {masks} one lives as long as the image.
+//
+// So every path that *uses* a pick banks it first — which is also what stops the
+// next Apply saving a second copy of the same object, since it now finds the
+// mask shape and no-ops. Doing this here rather than in the create_node endpoint
+// is deliberate: from the server the store would still be holding the points, so
+// every Apply would freeze another duplicate, and preset replay (which builds
+// nodes through db.create_node) would mint a mask per masked step.
+//
+// The server names it. `invert: false` because the PNG is frozen post-invert —
+// what was on screen is what got saved, and a reference's own invert toggles on
+// top of that.
+async function bankSelection(store) {
+  const sel = store.value;
+  if (!sel || sel.masks || state.imageId === null) return sel;
+  const created = await api(`/api/images/${state.imageId}/masks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: store.nodeId, selection: sel }),
+  });
+  const value = { masks: [created.id], invert: false };
+  Object.assign(store, { value, nodeId: state.nodeId, imageId: state.imageId });
+  // Adopt the row locally rather than waiting for the refetch: a caller whose
+  // *next* step fails (Apply erroring after a successful bank) would otherwise
+  // leave the store naming a mask the grid has no tile for, and selSummary()
+  // falling back to `mask #12`. A new id also changes what a cached overlay key
+  // means, since rowids come back around.
+  state.masks = [...state.masks, created];
+  clearOverlayCache();
+  return value;
+}
+
+// The explicit button: bank an object you are not ready to use yet. Applying an
+// effect banks the selection too, so this is a shortcut, not the only way in.
 async function saveMask() {
   const sel = state.selection.value;
   if (!sel || sel.masks || state.imageId === null) return;
-  const name = prompt("Name this mask:", "");
-  if (name === null || !name.trim()) return;
   maskBusy = true;
   renderSelectControls();
   try {
-    const created = await api(`/api/images/${state.imageId}/masks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: name.trim(),
-        node_id: state.selection.nodeId,
-        selection: sel,
-      }),
-    });
-    // Switch the live selection over to the frozen pixels, so the next Apply
-    // uses them rather than re-running SAM. `invert: false` because the PNG was
-    // frozen post-invert — what was on screen is what got saved.
-    Object.assign(state.selection, {
-      value: { masks: [created.id], invert: false },
-      nodeId: state.nodeId,
-      imageId: state.imageId,
-    });
+    await bankSelection(state.selection);
     maskBusy = false;
     await refreshMasks();
   } catch (err) {
-    alert(`Could not save mask: ${err.message}`);
+    alert(`Could not save the selection: ${err.message}`);
   } finally {
     maskBusy = false;
     renderSelectControls();

@@ -226,6 +226,39 @@ def load_mask(mask_id: int) -> np.ndarray:
         return np.asarray(im.convert("1")).astype(bool)
 
 
+MASK_THUMB_PX = 160
+
+
+def mask_thumb_png(mask_id: int) -> bytes:
+    """A saved mask shrunk to an icon: white where selected, black where not.
+
+    A silhouette rather than the photo behind it, because this is a picture of
+    the *mask* — a shape against a flat field is legible at 50-odd display
+    pixels in a way a downsampled photograph is not, and an inverted pick reads
+    at a glance for free.
+
+    Deliberately **not** cached to a file, for the same reason `histogram` is
+    not: ~15 ms even on a 7728×5152 mask and well under a kilobyte on the wire,
+    which is cheaper than the `load_mask` these endpoints already run. A
+    `<id>.thumb.png` would be a second file keyed by a rowid SQLite reuses, so
+    one missed unlink would serve a deleted mask's silhouette as its
+    successor's — and it would need excluding from `storage_stats`, whose masks
+    line means "the bytes you cannot regenerate". Derived instead from the one
+    file whose deletion is already correct, it cannot go stale.
+    """
+    with Image.open(mask_path(mask_id)) as im:
+        # a stored mask opens as mode "1", which resizes NEAREST whatever filter
+        # is asked for — convert first or the silhouette comes back jagged
+        thumb = im.convert("L")
+    # BOX, not thumbnail()'s default: on a binary mask a box filter is exactly
+    # "what fraction of this source cell was selected". Cubic filters ring, and
+    # ringing puts bright halos outside the object and dark ones inside it.
+    thumb.thumbnail((MASK_THUMB_PX, MASK_THUMB_PX), Image.BOX)
+    buf = io.BytesIO()
+    thumb.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def _shift(mask: np.ndarray, step: int, axis: int) -> np.ndarray:
     """`mask` translated by `step` along `axis`, shifting False in at the edge."""
     out = np.zeros_like(mask)
