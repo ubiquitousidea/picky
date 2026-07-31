@@ -329,6 +329,21 @@ Key invariants that cut across files:
   A preset stores params, not pixels: replaying one runs *today's* effect code,
   so it need not reproduce the original node's pixels if an effect implementation
   changed since the preset was saved.
+- **An apply-time selection masks every step, and beats the recipe's own.**
+  `PresetApply.selection` limits a whole chain to a ticked object the same way
+  the Apply panel's selection limits one effect — what is ticked is what gets
+  edited — so `apply_preset` passes it to every `db.create_node` in place of
+  `step["selection"]`. Honouring both instead would mean intersecting a union of
+  masks with the union of *points* a step carries (`_portable_selection`'s
+  degradation, captured against some other image), and there is no intersection
+  shape in the model. It is resolved through `validate_selection` +
+  `_check_selection` up beside `_validate_steps`, **before** the loop, so a
+  foreign mask is a 400 rather than a half-written chain — same pre-flight
+  discipline as the steps themselves. The frontend banks the pick first
+  (`applyPreset` calls `bankSelection`, as `applyEffect` does) for the reason in
+  the banking bullet, and because one banked mask id then masks every step
+  rather than minting one mask per masked step. With nothing ticked the recipe's
+  own selections replay exactly as before.
 - **Posterize clusters in PCA-whitened RGB space** (`_fit_kmeans`), not raw
   RGB — raw k-means bunches centroids along the luminance diagonal. Whitening
   is manual (`sqrt(explained_variance_ + 1e-4)`) rather than sklearn's
@@ -379,15 +394,20 @@ override the localStorage last-image.
 
 `state.presets` is fetched once in `init()` and refreshed only after a save or
 delete — `renderSelection()` calls the synchronous `updatePresetControls()`, not
-a fetch. Clicking a preset row applies it to the *selected* node and then routes
-through `selectImage()`, which is what refetches the tree so all of the preset's
-new nodes appear.
+a fetch. Clicking a preset row applies it to the *selected* node, limited to the
+*selected* object, and then routes through `selectImage()`, which is what
+refetches the tree so all of the preset's new nodes appear. That synchronous
+call is also what keeps each row's `title` naming the currently ticked object:
+the rows are built by `renderPresets()` (only when the list itself changes) but
+titled by `updatePresetControls()`, which is why a row carries
+`dataset.presetId` — it is how the title is recomposed without a rebuild.
 
 `state.masks` follows the adapted rule: masks are image-scoped, so they are
 fetched in `selectImage()` alongside the tree and refreshed only after a
 save/rename/delete — and Apply is now one of those, since it banks the
-selection. That path needs no extra refresh call: `applyEffect()` ends in
-`selectImage()`, which refetches the list anyway. `bankSelection()` still
+selection, as is applying a preset, which banks it for the same reason. Neither
+path needs an extra refresh call: `applyEffect()` and `applyPreset()` both end
+in `selectImage()`, which refetches the list anyway. `bankSelection()` still
 appends the new row locally first, so the window between banking and that
 refetch — which a failed Apply can leave open indefinitely — never shows a
 store pointing at a mask the grid does not have. The grid has no render

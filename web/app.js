@@ -1380,6 +1380,10 @@ function appendSelectionControls(
     store.imageId = sel ? state.imageId : null;
     render(sel);
     syncMaskOverlay(store, sourceNodeId, pick);
+    // a preset run is limited to this selection too, and its rows say which
+    // object — this is the write path renderSelection() does not cover, since
+    // the store changes without the node or image changing
+    updatePresetControls();
     row.dispatchEvent(new Event("input", { bubbles: true }));
   };
 
@@ -1531,7 +1535,9 @@ function renderPresets() {
   for (const preset of state.presets) {
     const li = document.createElement("li");
     li.className = "preset-row";
-    li.title = `Apply to the selected node: ${preset.summary}`;
+    // the title names the ticked object, which changes without a rebuild —
+    // updatePresetControls owns it, and finds the preset back through this id
+    li.dataset.presetId = preset.id;
 
     const text = document.createElement("div");
     text.className = "preset-text";
@@ -1567,8 +1573,17 @@ function updatePresetControls() {
   saveBtn.title = canSave
     ? "Save the edits leading to the selected node"
     : "Select an edited node — the original has no chain to save";
+  // A ticked object limits the whole chain, so the row has to say so — and this
+  // runs on every selection change (renderSelection calls it), unlike the row
+  // build, which only runs when the preset list itself changes.
+  const limit = selSummary(state.selection.value);
   document.querySelectorAll("#preset-list .preset-row").forEach((li) => {
     li.classList.toggle("disabled", state.imageId === null || presetBusy);
+    const preset = state.presets.find((p) => p.id === +li.dataset.presetId);
+    if (!preset) return;
+    li.title = limit
+      ? `Apply to the selected node, limited to ${limit}: ${preset.summary}`
+      : `Apply to the selected node: ${preset.summary}`;
   });
 }
 
@@ -1595,15 +1610,38 @@ async function applyPreset(preset, row) {
   presetBusy = true;
   row.classList.add("busy");
   updatePresetControls();
+  // A ticked object limits every step of the chain, exactly as it limits a
+  // single effect — so this banks the pick first, for the same reasons
+  // applyEffect does (and here it also means one mask for the whole replay
+  // rather than one per masked step). A failed bank still runs the preset,
+  // with the click selection, and says so once afterwards.
+  let banked = state.selection.value;
+  let bankErr = null;
+  try {
+    banked = await bankSelection(state.selection);
+  } catch (err) {
+    bankErr = err;
+  }
+  const body = { preset_id: preset.id };
+  if (banked) body.selection = banked;
   try {
     const res = await api(`/api/nodes/${state.nodeId}/apply-preset`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ preset_id: preset.id }),
+      body: JSON.stringify(body),
     });
     // selectImage refetches the tree, so all of the preset's new nodes show up
     await selectImage(state.imageId, res.terminal_node_id);
+    if (bankErr) {
+      alert(
+        "The preset was applied, but the selection could not be saved for reuse: " +
+          bankErr.message
+      );
+    }
   } catch (err) {
+    // as in applyEffect: a bank that succeeded stays, but the grid has not
+    // drawn its tile yet
+    renderSelectControls();
     alert(`Could not apply preset: ${err.message}`);
   } finally {
     presetBusy = false;

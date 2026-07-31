@@ -73,7 +73,9 @@ class PresetCreate(BaseModel):
 
 
 class PresetApply(BaseModel):
+    # the selection to run the whole recipe through, if any — see apply_preset
     preset_id: int
+    selection: dict | None = None
 
 
 def _check_selection(selection: dict | None, image_id: int) -> dict | None:
@@ -667,10 +669,20 @@ def apply_preset(node_id: int, body: PresetApply):
         raise HTTPException(404, "preset not found")
     steps = _validate_steps(preset["steps"])
 
+    image_id = base["image_id"]
+    # An apply-time selection masks *every* step, and beats whatever the recipe
+    # stored for that step: a preset is a chain of edits, and limiting it to an
+    # object is the same gesture as limiting one effect to it — what is ticked is
+    # what gets edited. The step's own selection is a click spec captured from
+    # some other image, so honouring both would mean intersecting a union of
+    # points with a union of masks, a shape the model does not have. Resolved
+    # here, next to _validate_steps, so a foreign mask 400s before the first row
+    # is written rather than half way through the chain.
+    override = _check_selection(validate_selection(body.selection), image_id)
+
     # Each step must be committed and rendered before the next one references it:
     # render_node reads through its own connection, so an open transaction would
     # hide the rows it needs. Unwind by hand if a step fails.
-    image_id = base["image_id"]
     created: list[int] = []
     node_at = {0: node_id}
     try:
@@ -682,7 +694,7 @@ def apply_preset(node_id: int, body: PresetApply):
                 step["effect"],
                 step["params"],
                 parent2_id,
-                step["selection"],
+                step["selection"] if override is None else override,
             )
             created.append(node["id"])
             node_at[i] = node["id"]
