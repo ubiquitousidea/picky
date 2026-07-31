@@ -146,8 +146,82 @@ def apply_gamma(img: np.ndarray, params: dict) -> np.ndarray:
     return lut.clip(0, 255).astype(np.uint8)[img]
 
 
+PIXEL_SHAPES = ["square", "hexagon"]
+
+# `_hex_pixelate` assigns pixels a band of rows at a time, so its peak memory is
+# set by the band rather than by the image — originals run to 40 MP, where a
+# single full-frame float temporary is ~160 MB.
+_HEX_BAND_ROWS = 1024
+
+
+def _hex_pixelate(img: np.ndarray, block: int) -> np.ndarray:
+    """Pointy-top hexagonal bins: every pixel takes the mean color of the hex
+    it falls in. `block` is the hex width (center-to-center within a row), so it
+    means the same thing it does for square blocks.
+
+    Hex centers are a triangular lattice — rows `block*sqrt(3)/2` apart with
+    alternate rows offset half a cell — whose Voronoi cells are regular
+    hexagons. Splitting it into its even and odd rows leaves two plain
+    rectangular lattices, and the nearest point of a rectangular lattice is
+    coordinate-wise rounding; so a pixel is assigned by rounding twice and
+    comparing, with no search. Those offsets factor into an x part and a y part,
+    which is why the per-pixel work below is broadcast from 1-D arrays.
+    """
+    h, w = img.shape[:2]
+    sx = float(block)
+    sy = block * np.sqrt(3.0)  # one sublattice skips a row, so its period is 2h
+
+    # nearest center in each sublattice, per column and per row. Computed in
+    # float64 — `rows - j*sy` cancels two large numbers, and these are 1-D.
+    cols = np.arange(w, dtype=np.float64)
+    rows = np.arange(h, dtype=np.float64)
+    ia, ib = np.rint(cols / sx), np.rint(cols / sx - 0.5)
+    ja, jb = np.rint(rows / sy), np.rint(rows / sy - 0.5)
+    dxa = ((cols - ia * sx) ** 2).astype(np.float32)[None, :]
+    dxb = ((cols - (ib + 0.5) * sx) ** 2).astype(np.float32)[None, :]
+    dya = ((rows - ja * sy) ** 2).astype(np.float32)
+    dyb = ((rows - (jb + 0.5) * sy) ** 2).astype(np.float32)
+
+    # x, y >= 0 puts every index at 0 or above (np.rint(-0.5) is -0.0), and the
+    # offset lattice's indices never exceed the aligned one's
+    nx, ny = int(ia.max()) + 1, int(ja.max()) + 1
+    n_bins = 2 * nx * ny
+    # row and column halves of each sublattice's bin id, kept 1-D and broadcast
+    # inside the loop — combining them up here would cost two full-frame arrays
+    row_a, col_a = (ja * nx).astype(np.int32), ia.astype(np.int32)
+    row_b = (jb * nx).astype(np.int32) + nx * ny
+    col_b = ib.astype(np.int32)
+
+    labels = np.empty((h, w), dtype=np.int32)
+    sums = np.zeros((n_bins, 3), dtype=np.float32)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    for y0 in range(0, h, _HEX_BAND_ROWS):
+        y1 = min(y0 + _HEX_BAND_ROWS, h)
+        band = np.where(
+            dya[y0:y1, None] + dxa <= dyb[y0:y1, None] + dxb,
+            row_a[y0:y1, None] + col_a[None, :],
+            row_b[y0:y1, None] + col_b[None, :],
+        )
+        labels[y0:y1] = band
+        flat = band.ravel()
+        counts += np.bincount(flat, minlength=n_bins)
+        for c in range(3):
+            sums[:, c] += np.bincount(
+                flat, weights=img[y0:y1, :, c].ravel(), minlength=n_bins
+            )
+
+    # bins outside the image get no pixels and are never indexed back out; the
+    # clamp is only there to keep the division defined
+    means = np.rint(sums / np.maximum(counts, 1)[:, None]).astype(np.uint8)
+    return means[labels]
+
+
 def pixelate(img: np.ndarray, params: dict) -> np.ndarray:
     block = int(params["block"])
+    # nodes made before the param existed carry no "shape", the same reason
+    # rendering.py reads blend's weight with a default
+    if params.get("shape", "square") == "hexagon":
+        return _hex_pixelate(img, block)
     im = Image.fromarray(img)
     w, h = im.size
     small = im.resize(
@@ -232,6 +306,7 @@ EFFECTS = {
         "apply": pixelate,
         "params": [
             {"name": "block", "label": "Block size", "type": "int", "min": 2, "max": 64, "default": 12},
+            {"name": "shape", "label": "Bin shape", "type": "choice", "options": PIXEL_SHAPES, "default": "square"},
         ],
     },
 }

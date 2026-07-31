@@ -78,7 +78,11 @@ Key invariants that cut across files:
   `main.py` and `rendering.py`. Blend's `weight` param (share of the second
   image) only affects the `average` mode; `rendering.py` reads it with
   `.get("weight", 0.5)` because nodes created before the param existed lack
-  the key — keep that default when touching the call site.
+  the key — keep that default when touching the call site. Pixelate's `shape`
+  (`square` | `hexagon`) is read the same way, for the same reason: a param
+  added to a shipped effect is always absent from the rows already on disk,
+  since nothing migrates node params and `validate_params` only backfills on
+  the next write.
 - **Previews never persist, and run by default.** `POST /api/nodes/{id}/preview`
   renders an effect against a node's cached pixels entirely in memory
   (`rendering.render_preview`) — no DB row, no file in `data/renders/`. It shares
