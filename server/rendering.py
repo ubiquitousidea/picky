@@ -11,10 +11,22 @@ from PIL import Image, ImageFilter
 import json
 
 from . import db, sam
-from .effects import EFFECTS, apply_blend, kmeans_cluster_data, validate_selection
+from .effects import (
+    EFFECTS,
+    apply_blend,
+    apply_geometry,
+    is_identity_crop,
+    kmeans_cluster_data,
+    validate_selection,
+)
 
 THUMB_SIZE = 320
 JPEG_QUALITY = 92
+# The rotated-but-uncropped proxy the frame editor drags over. Capped well below
+# full size because the angle slider re-renders it on every change, and the frame
+# is stored as *fractions* of the canvas — so a proxy and the full-size render
+# describe the same crop, and nothing is lost by dragging against the small one.
+CROP_PREVIEW_PX = 1600
 
 
 def original_path(image_id: int) -> Path:
@@ -27,6 +39,10 @@ def render_path(node_id: int) -> Path:
 
 def thumb_path(node_id: int) -> Path:
     return db.RENDERS_DIR / f"{node_id}.thumb.jpg"
+
+
+def output_path(node_id: int) -> Path:
+    return db.RENDERS_DIR / f"{node_id}.out.jpg"
 
 
 def _apply(
@@ -90,6 +106,75 @@ def render_node(node_id: int) -> Path:
     return out
 
 
+# ---------- The output stage: the image's one framing, applied last ----------
+#
+# A crop is not a node. The work tree computes every node at the original's
+# dimensions — which is what keeps saved masks, `compute_mask` and blend's resize
+# all working on one shared size — and the image's framing is applied once, here,
+# to whatever the tree produced. Everything a user *sees* comes through this
+# stage; everything the tree *computes* is upstream of it and never sees a crop.
+
+
+def image_crop(image_id: int) -> dict | None:
+    image = db.get_image(image_id)
+    return image["crop"] if image else None
+
+
+def render_output(node_id: int) -> Path:
+    """The node's rendered JPEG with its image's framing applied — what every
+    viewer of this node gets: the preview, the tree thumbnail, and Export.
+
+    Falls straight through to `render_path` when the crop is the identity, so an
+    uncropped library pays nothing: no second decode, no second file on disk.
+    That short-circuit is why `output_path` may simply not exist, and why
+    `is_identity_crop` has to agree with what this writes.
+    """
+    node = db.get_node(node_id)
+    if node is None:
+        raise KeyError(f"node {node_id} not found")
+    rendered = render_node(node_id)
+    crop = image_crop(node["image_id"])
+    if is_identity_crop(crop):
+        return rendered
+
+    out = output_path(node_id)
+    if out.exists():
+        return out
+    im = Image.open(rendered).convert("RGB")
+    apply_geometry(im, crop, Image.Resampling.BICUBIC).save(out, quality=JPEG_QUALITY)
+    return out
+
+
+def crop_preview(node_id: int, crop: dict | None) -> bytes:
+    """The node's pixels rotated onto the expanded canvas but *not* framed —
+    the backdrop the frame editor drags over, so the user can see what falls
+    outside the frame and what the black corners will be.
+
+    Downscaled first: the editor re-renders this on every touch of the angle
+    slider, and the frame is stored as fractions of the canvas, so the proxy and
+    the full-size output describe the same crop.
+    """
+    im = Image.open(render_node(node_id)).convert("RGB")
+    im.thumbnail((CROP_PREVIEW_PX, CROP_PREVIEW_PX), Image.Resampling.BICUBIC)
+    # rect ignored on purpose — the SVG overlay draws the frame, this is the canvas
+    angle = float((crop or {}).get("angle") or 0.0)
+    if angle:
+        im = im.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=0)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def delete_output_files(node_ids: list[int]) -> None:
+    """Drop just the output stage's cache. Changing an image's framing calls
+    this and nothing else: the effect renders upstream are unaffected by a crop,
+    and they are the expensive ones — not re-running k-means to re-crop is the
+    whole point of the crop being an output stage."""
+    for node_id in node_ids:
+        output_path(node_id).unlink(missing_ok=True)
+        thumb_path(node_id).unlink(missing_ok=True)
+
+
 def render_preview(
     node_id: int,
     effect: str,
@@ -98,10 +183,19 @@ def render_preview(
     selection: dict | None = None,
 ) -> bytes:
     """Render an effect applied to a node's image in memory — no node row, no
-    cache file. Shows exactly what a child created by Apply would look like."""
+    cache file. Shows exactly what a child created by Apply would look like.
+
+    Framed on the way out like every other viewer, so toggling live preview off
+    and on never changes the framing under the user.
+    """
     result = _apply(render_node(node_id), effect, params, parent2_id, selection, node_id)
+    im = Image.fromarray(result)
+    node = db.get_node(node_id)
+    crop = image_crop(node["image_id"]) if node else None
+    if not is_identity_crop(crop):
+        im = apply_geometry(im, crop, Image.Resampling.BICUBIC)
     buf = io.BytesIO()
-    Image.fromarray(result).save(buf, format="JPEG", quality=JPEG_QUALITY)
+    im.save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
 
 
@@ -109,7 +203,8 @@ def render_thumb(node_id: int) -> Path:
     out = thumb_path(node_id)
     if out.exists():
         return out
-    im = Image.open(render_node(node_id)).convert("RGB")
+    # from the framed output, so a tree chip shows what the node exports
+    im = Image.open(render_output(node_id)).convert("RGB")
     im.thumbnail((THUMB_SIZE, THUMB_SIZE))
     im.save(out, quality=85)
     return out
@@ -327,8 +422,28 @@ def _overlay_png(mask: np.ndarray) -> bytes:
 
 
 def mask_png(node_id: int, selection: dict) -> bytes:
-    """The overlay PNG for a selection on a node — either shape."""
-    return _overlay_png(compute_mask(node_id, selection))
+    """The overlay PNG for a selection on a node — either shape, framed to match
+    what the preview is showing.
+
+    The framing here is **display only**. The mask that actually gets composited
+    in `_apply` is computed and used at node dimensions and is never warped —
+    that is the point of keeping the crop out of the work tree. This one is
+    warped because it is laid over the *framed* preview, and an unframed outline
+    would sit off the object once the image is rotated.
+
+    NEAREST, not bicubic: the outline is already antialiased into its casing, and
+    interpolating an RGBA stencil smears its alpha into a halo.
+    """
+    png = _overlay_png(compute_mask(node_id, selection))
+    node = db.get_node(node_id)
+    crop = image_crop(node["image_id"]) if node else None
+    if is_identity_crop(crop):
+        return png
+    with Image.open(io.BytesIO(png)) as im:
+        framed = apply_geometry(im.convert("RGBA"), crop, Image.Resampling.NEAREST)
+    buf = io.BytesIO()
+    framed.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 HIST_SAMPLE = 512
@@ -354,6 +469,7 @@ def histogram(node_id: int) -> dict:
 def delete_render_files(node_ids: list[int]) -> None:
     for node_id in node_ids:
         render_path(node_id).unlink(missing_ok=True)
+        output_path(node_id).unlink(missing_ok=True)
         thumb_path(node_id).unlink(missing_ok=True)
         clusters_path(node_id).unlink(missing_ok=True)
         embedding_path(node_id).unlink(missing_ok=True)
@@ -371,6 +487,7 @@ def storage_stats() -> dict:
     frozen pixels are exactly what re-running SAM would not reproduce."""
     renders = list(db.RENDERS_DIR.iterdir())
     thumbs = [p for p in renders if p.name.endswith(".thumb.jpg")]
+    outputs = [p for p in renders if p.name.endswith(".out.jpg")]
     clusters = [p for p in renders if p.name.endswith(".clusters.json")]
     embeddings = [p for p in renders if p.name.endswith(".embedding.npy")]
     return {
@@ -378,11 +495,17 @@ def storage_stats() -> dict:
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
         "originals": _totals(db.ORIGINALS_DIR.iterdir()),
         "masks": _totals(db.MASKS_DIR.iterdir()),
-        # a thumb is also a .jpg, so exclude it rather than matching on suffix
+        # thumbs and framed outputs are also .jpg, so exclude them by name rather
+        # than matching on suffix — otherwise their bytes would be counted twice
         "renders": _totals(
-            p for p in renders if p.suffix == ".jpg" and not p.name.endswith(".thumb.jpg")
+            p
+            for p in renders
+            if p.suffix == ".jpg"
+            and not p.name.endswith((".thumb.jpg", ".out.jpg"))
         ),
         "thumbs": _totals(thumbs),
+        # the framed output stage — regenerable from the renders plus the crop
+        "outputs": _totals(outputs),
         "clusters": _totals(clusters),
         # SAM image embeddings, ~4 MB apiece — big enough to deserve a line
         "embeddings": _totals(embeddings),

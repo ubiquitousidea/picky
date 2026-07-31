@@ -1,5 +1,7 @@
 """Effect implementations. Each operates on an RGB uint8 numpy array."""
 
+import math
+
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -335,6 +337,152 @@ BLEND_SPEC = {
 }
 
 
+# ---------- Crop & rotate: an output stage, not an effect ----------
+#
+# A crop is one framing per image, applied after every node on the way out, so
+# it is deliberately *not* an entry in EFFECTS: every registry effect maps an
+# array to an array of the same size, and the app leans on that everywhere
+# (masked apply, blend's resize, `rendering.compute_mask`). Keeping the crop
+# outside the work tree is what lets that invariant stay true — every node still
+# renders at the original's dimensions, so no saved mask is ever warped.
+#
+# It lives beside BLEND_SPEC for the same reason blend does: a spec the frontend
+# needs and `validate_params` must accept, that is not a registry entry.
+
+# The smallest fraction of the canvas a frame may shrink to. A zero-width frame
+# has no pixels, and PIL's crop of an empty box returns an image JPEG cannot
+# encode.
+MIN_RECT = 0.01
+
+CROP_SPEC = {
+    "label": "Frame",
+    "params": [
+        # positive is counter-clockwise, which is PIL's direction — the label
+        # says so because a slider gives no other clue
+        {"name": "angle", "label": "Rotate (° ccw)", "type": "float", "min": -90.0, "max": 90.0, "step": 0.1, "default": 0.0},
+        {"name": "rect", "label": "Frame", "type": "rect", "min": MIN_RECT, "default": [0.0, 0.0, 1.0, 1.0]},
+    ],
+}
+
+IDENTITY_CROP = {"angle": 0.0, "rect": [0.0, 0.0, 1.0, 1.0]}
+
+# Named specs `validate_params` accepts that are not entries in EFFECTS.
+NON_EFFECT_SPECS = {"blend": BLEND_SPEC, "crop": CROP_SPEC}
+
+
+def is_identity_crop(crop: dict | None) -> bool:
+    """True when a crop would leave the image untouched, so callers can skip the
+    whole output stage — an uncropped library must pay nothing, in time or in
+    bytes on disk."""
+    if not crop:
+        return True
+    clean = validate_params("crop", crop)
+    return clean["angle"] == 0.0 and clean["rect"] == IDENTITY_CROP["rect"]
+
+
+def _rotate_transform(size: tuple[int, int], angle: float) -> tuple[tuple[int, int], list[float]]:
+    """The expanded canvas and inverse affine of `Image.rotate(angle, expand=True)`.
+
+    This is PIL's own arithmetic, not a formula for it. The obvious
+    `round(w·cos + h·sin)` disagrees with PIL by 1-2 px at most angles (400×300
+    at −13°: PIL 458×384, the formula 457×382), and we need the matrix regardless
+    — `Image.transform`'s AFFINE matrix *is* the output→source map the frontend
+    uses to place a click. Deriving the size and the matrix from two different
+    places is the drift this avoids, so they come out of one computation.
+
+    The 15-place rounding is PIL's: it makes cos(±90°) exactly 0, which is what
+    makes a quarter turn land on integer pixels instead of 6e-17 off them.
+    """
+    w, h = size
+    cx, cy = w / 2.0, h / 2.0
+    a = -math.radians(angle)
+    m = [
+        round(math.cos(a), 15), round(math.sin(a), 15), 0.0,
+        round(-math.sin(a), 15), round(math.cos(a), 15), 0.0,
+    ]
+
+    def xform(x: float, y: float) -> tuple[float, float]:
+        return m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]
+
+    m[2], m[5] = xform(-cx, -cy)
+    m[2] += cx
+    m[5] += cy
+    if angle % 360.0 in (90.0, 270.0):
+        # PIL short-circuits a quarter turn to a transpose, which is exactly
+        # (h, w). The general path's ceil/floor can come out a pixel larger on
+        # odd dimensions (2×3 at 90° → 4×3, not 3×2), so follow the fast path.
+        nw, nh = h, w
+    else:
+        xs, ys = zip(*(xform(x, y) for x, y in ((0, 0), (w, 0), (w, h), (0, h))))
+        nw = math.ceil(max(xs)) - math.floor(min(xs))
+        nh = math.ceil(max(ys)) - math.floor(min(ys))
+    # the expand offset is *rotated*, not added: PIL multiplies a translation
+    # matrix in from the right, so it arrives through the same transform
+    m[2], m[5] = xform(-(nw - w) / 2.0, -(nh - h) / 2.0)
+    return (nw, nh), m
+
+
+def crop_geometry(size: tuple[int, int], crop: dict | None) -> dict:
+    """How an image's output pixels relate to its source pixels — the one place
+    the crop's geometry is worked out.
+
+    - `canvas` is the rotation's expanded size, `box` the frame taken from it in
+      whole pixels, `output` the result's size.
+    - `inverse` is `[a, b, c, d, e, f]` mapping an *output* pixel back to a
+      *source* pixel: `sx = a·ox + b·oy + c`, `sy = d·ox + e·oy + f`. The
+      frontend uses it to turn a click on the framed preview into a coordinate in
+      the node's own space, which is what keeps trigonometry — and PIL's expand
+      rounding — out of the browser entirely.
+
+    `rect` is fractions of the *rotated* canvas, so a frame survives a change of
+    angle. Corners the rotation leaves empty are inside that canvas and render
+    black, which needs no code: `rotate` fills them and `crop` pads with zeros.
+    """
+    crop = validate_params("crop", crop or {})
+    angle = crop["angle"]
+    if angle:
+        canvas, m = _rotate_transform(size, angle)
+    else:
+        canvas, m = (size[0], size[1]), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+    cw, ch = canvas
+    x, y, rw, rh = crop["rect"]
+    left, top = round(x * cw), round(y * ch)
+    # at least one pixel each way, whatever the rounding did to a tiny frame
+    right = max(left + 1, round((x + rw) * cw))
+    bottom = max(top + 1, round((y + rh) * ch))
+    return {
+        "crop": crop,
+        "source": [size[0], size[1]],
+        "canvas": [cw, ch],
+        "box": [left, top, right, bottom],
+        "output": [right - left, bottom - top],
+        # composing the box offset into the translation is the whole of "then
+        # crop": a crop is a translation of the output origin
+        "inverse": [
+            m[0], m[1], m[0] * left + m[1] * top + m[2],
+            m[3], m[4], m[3] * left + m[4] * top + m[5],
+        ],
+    }
+
+
+def apply_geometry(im: Image.Image, crop: dict | None, resample) -> Image.Image:
+    """Rotate about the center onto an expanded canvas, then take the frame from
+    that canvas (Lightroom's straighten model).
+
+    Takes its box from `crop_geometry` rather than recomputing it, so the pixels
+    a caller gets are always the ones its `inverse` describes. Shared by the
+    photo path (bicubic) and the mask-outline path (nearest) for the same reason
+    `_curve_lut` has exactly one implementation per side of the wire.
+    """
+    geom = crop_geometry(im.size, crop)
+    if geom["crop"]["angle"]:
+        im = im.rotate(
+            geom["crop"]["angle"], resample=resample, expand=True, fillcolor=0
+        )
+    return im.crop(tuple(geom["box"]))
+
+
 def effect_specs() -> list[dict]:
     """Registry as JSON-safe specs for the frontend."""
     specs = [
@@ -375,6 +523,31 @@ def _clean_points(value, p: dict) -> list[list[int]]:
     if len(pts) > p["max_points"]:
         pts = pts[: p["max_points"] - 1] + pts[-1:]
     return pts
+
+
+def _clean_rect(value, p: dict) -> list[float]:
+    """Coerce a crop frame into `[x, y, w, h]` fractions `crop_geometry` can
+    always eat. Total for the same reason as `_clean_points`: `validate_params`
+    is called unguarded, so a raise here is a 500 rather than a 400.
+
+    The frame is clamped inside the rotated canvas rather than allowed to hang
+    off it. Black corners are still reachable — they are *inside* the canvas the
+    rotation expanded to — so nothing is lost by keeping the numbers in 0..1.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return list(p["default"])
+    try:
+        x, y, w, h = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return list(p["default"])
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        return list(p["default"])
+    x = min(max(x, 0.0), 1.0 - p["min"])
+    y = min(max(y, 0.0), 1.0 - p["min"])
+    # clamp the size against the origin, so a frame never extends past the edge
+    w = min(max(w, p["min"]), 1.0 - x)
+    h = min(max(h, p["min"]), 1.0 - y)
+    return [x, y, w, h]
 
 
 # How decode_mask picks among SAM's candidate masks for a click: the model's
@@ -459,7 +632,9 @@ def validate_selection(value) -> dict | None:
 
 def validate_params(effect: str, params: dict) -> dict:
     """Clamp and coerce params against the effect's spec; raises on unknown effect."""
-    spec = BLEND_SPEC if effect == "blend" else EFFECTS[effect]
+    # blend and crop are the two specs that are not registry entries: one takes
+    # two images, the other is not an effect at all
+    spec = NON_EFFECT_SPECS.get(effect) or EFFECTS[effect]
     clean = {}
     for p in spec["params"]:
         value = params.get(p["name"], p["default"])
@@ -467,6 +642,8 @@ def validate_params(effect: str, params: dict) -> dict:
             clean[p["name"]] = value if value in p["options"] else p["default"]
         elif p["type"] == "points":
             clean[p["name"]] = _clean_points(value, p)
+        elif p["type"] == "rect":
+            clean[p["name"]] = _clean_rect(value, p)
         elif p["type"] == "float":
             value = float(value)
             clean[p["name"]] = max(p["min"], min(p["max"], value))

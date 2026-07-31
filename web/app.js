@@ -7,6 +7,12 @@ const state = {
   nodeId: null,    // selected node
   presets: [],     // saved effect chains, reusable across images
   masks: [],       // saved masks — image-scoped, so refetched per image
+  // The image's one framing, and the geometry it implies. The crop is an output
+  // stage outside the work tree, so this describes *every* node of the image at
+  // once — including the `inverse` affine that turns a click on the framed
+  // preview back into a coordinate in the node's own (uncropped) pixel space.
+  crop: null,
+  geometry: null,
   // The Apply panel's current selection. It lives here rather than in the DOM
   // because the effect controls are torn down and rebuilt on every effect
   // switch, which used to take the pick with them. nodeId/imageId record what
@@ -30,6 +36,14 @@ async function api(path, opts) {
 
 // ---------- Gallery ----------
 
+// A gallery thumb is cached by URL, and re-framing an image changes its pixels
+// without changing its node id — so the crop rides along as a version tag, the
+// same trick the mask grid's `?v=<created_at>` uses. Keyed on the crop itself
+// because an image row carries no updated_at, and absent entirely when there is
+// no crop, so an unframed library's URLs are exactly what they always were.
+const cropTag = (crop) =>
+  crop ? `&v=${crop.angle},${crop.rect.map((n) => n.toFixed(4)).join(",")}` : "";
+
 async function refreshGallery() {
   state.images = await api("/api/images");
   const ul = $("gallery");
@@ -38,7 +52,7 @@ async function refreshGallery() {
     const li = document.createElement("li");
     li.classList.toggle("selected", img.id === state.imageId);
     const thumb = document.createElement("img");
-    thumb.src = `/api/nodes/${img.root_node_id}/render?thumb=1`;
+    thumb.src = `/api/nodes/${img.root_node_id}/render?thumb=1${cropTag(img.crop)}`;
     const name = document.createElement("div");
     name.className = "name";
     name.textContent = img.name;
@@ -59,13 +73,21 @@ async function selectImage(imageId, nodeId = null) {
     state.nodes = [];
     state.nodeId = null;
     state.masks = [];
+    state.crop = null;
+    state.geometry = null;
   } else {
     // masks are image-scoped, so unlike presets they are fetched on every image
-    // change; after that only a save/rename/delete refreshes them
-    [state.nodes, state.masks] = await Promise.all([
+    // change; after that only a save/rename/delete refreshes them. The image
+    // itself comes along for its crop and geometry, which the click picker needs
+    // before the user's first click.
+    let image;
+    [state.nodes, state.masks, image] = await Promise.all([
       api(`/api/images/${imageId}/tree`),
       api(`/api/images/${imageId}/masks`),
+      api(`/api/images/${imageId}`),
     ]);
+    state.crop = image.crop;
+    state.geometry = image.geometry;
     const valid = state.nodes.some((n) => n.id === nodeId);
     state.nodeId = valid ? nodeId : state.nodes[state.nodes.length - 1].id;
   }
@@ -74,6 +96,9 @@ async function selectImage(imageId, nodeId = null) {
 
 function renderSelection() {
   exitPreview(false);
+  // crop mode borrows the preview image for its proxy, so it leaves through the
+  // same choke point the effect preview does. `false`: we are already repainting.
+  exitCropMode(false);
   document.querySelectorAll("#gallery li").forEach((li, i) => {
     li.classList.toggle("selected", state.images[i]?.id === state.imageId);
   });
@@ -84,6 +109,7 @@ function renderSelection() {
   $("delete-btn").hidden = !hasImage;
   $("export-btn").hidden = !hasImage;
   $("apply-btn").disabled = !hasImage;
+  $("crop-section").hidden = !hasImage;
   if (hasImage) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
@@ -188,13 +214,26 @@ function initZoom() {
     ) {
       return; // letterbox area around the image
     }
-    const x = Math.round(((e.clientX - rect.left) / rect.width) * img.naturalWidth);
-    const y = Math.round(((e.clientY - rect.top) / rect.height) * img.naturalHeight);
-    selPicker.armed.pick(
-      Math.min(x, img.naturalWidth - 1),
-      Math.min(y, img.naturalHeight - 1)
-    );
+    const ox = ((e.clientX - rect.left) / rect.width) * img.naturalWidth;
+    const oy = ((e.clientY - rect.top) / rect.height) * img.naturalHeight;
+    const [x, y] = toNodeSpace(ox, oy);
+    selPicker.armed.pick(x, y);
   });
+}
+
+// A click lands on the *framed* preview, but a selection spec is stored in the
+// node's own pixel space — the crop is an output stage, so nodes and saved masks
+// never see it. The server hands over the inverse affine with the image
+// (`geometry.inverse`), so this is six multiplies and no trigonometry here: the
+// browser never needs to know how PIL rounds an expanded rotation.
+function toNodeSpace(ox, oy) {
+  const g = state.geometry;
+  const [a, b, c, d, e, f] = g?.inverse || [1, 0, 0, 0, 1, 0];
+  const [w, h] = g?.source || [Infinity, Infinity];
+  return [
+    Math.min(Math.max(Math.round(a * ox + b * oy + c), 0), w - 1),
+    Math.min(Math.max(Math.round(d * ox + e * oy + f), 0), h - 1),
+  ];
 }
 
 // ---------- Work tree ----------
@@ -1196,6 +1235,371 @@ async function refreshPreview() {
   }
 }
 
+// ---------- Crop & rotate: the image's one framing ----------
+//
+// Not an effect and not a node — a crop applies after the whole work tree, so it
+// belongs to the image rather than to any node, and the panel sits outside the
+// Apply flow. Crop mode swaps the preview for a *rotated but unframed* proxy, so
+// the user can see what falls outside the frame and where the black corners will
+// be; the SVG overlay draws the frame on top of it.
+
+const CROP = { handlePx: 9, grabPx: 12, minFrac: 0.01 };
+const cropTool = { armed: null };
+// `active` is crop mode; `angle`/`rect` are the unsaved edit. `seq` drops stale
+// proxy responses the same way preview.seq drops stale renders.
+const crop = { active: false, angle: 0, rect: [0, 0, 1, 1], seq: 0, timer: null, url: null };
+
+// `toggleAttribute`, not `.hidden`: the overlay is an <svg>, and `hidden` is an
+// HTMLElement property that SVGElement does not implement — assigning it sets a
+// plain JS expando and leaves the attribute (and so `display: none`) in place.
+const showCropOverlay = (on) => $("crop-overlay").toggleAttribute("hidden", !on);
+
+function disarmCrop() {
+  cropTool.armed = null;
+  $("preview-wrap").classList.remove("cropping");
+  showCropOverlay(false);
+}
+
+// Client coords -> a fraction of the displayed image. The img's bounding rect is
+// post-transform, so this needs no pan/zoom inversion — the same reasoning as
+// the click picker's mapping and the curve editor's atEvent.
+function cropAtEvent(e) {
+  const r = $("preview").getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) / r.width,
+    y: (e.clientY - r.top) / r.height,
+    // a grab radius in fractions, so hit-testing is in the same units as the rect
+    slopX: CROP.grabPx / r.width,
+    slopY: CROP.grabPx / r.height,
+  };
+}
+
+// Which part of the frame is under the pointer: a corner, an edge, the inside,
+// or nothing. Corners win over edges, so the diagonal grab is never stolen.
+function cropHit(rect, pos) {
+  const [x, y, w, h] = rect;
+  const nearL = Math.abs(pos.x - x) <= pos.slopX;
+  const nearR = Math.abs(pos.x - (x + w)) <= pos.slopX;
+  const nearT = Math.abs(pos.y - y) <= pos.slopY;
+  const nearB = Math.abs(pos.y - (y + h)) <= pos.slopY;
+  const inX = pos.x >= x - pos.slopX && pos.x <= x + w + pos.slopX;
+  const inY = pos.y >= y - pos.slopY && pos.y <= y + h + pos.slopY;
+  if (inX && inY) {
+    const edges = (nearL ? "w" : nearR ? "e" : "") + (nearT ? "n" : nearB ? "s" : "");
+    if (edges) return edges;
+    if (pos.x > x && pos.x < x + w && pos.y > y && pos.y < y + h) return "move";
+  }
+  return null;
+}
+
+const CROP_CURSORS = {
+  nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize",
+  n: "ns-resize", s: "ns-resize", w: "ew-resize", e: "ew-resize", move: "move",
+};
+
+const clamp01 = (v, size) => Math.min(Math.max(v, 0), 1 - size);
+
+// Repaint the frame. Everything is drawn in the *displayed image's* pixel space
+// (the viewBox), so the fractions in the store survive the natural-size change
+// that dragging the angle causes.
+function drawCropOverlay(rect) {
+  const svg = $("crop-overlay");
+  const img = $("preview");
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  if (!iw || !ih) return;
+  // intrinsic dimensions: this is what makes the SVG resolve to the same box as
+  // the fitted img, with no measurement (see #crop-overlay in style.css)
+  svg.setAttribute("width", iw);
+  svg.setAttribute("height", ih);
+  svg.setAttribute("viewBox", `0 0 ${iw} ${ih}`);
+  svg.replaceChildren();
+
+  const [fx, fy, fw, fh] = rect;
+  const x = fx * iw, y = fy * ih, w = fw * iw, h = fh * ih;
+  // handles keep a roughly constant size on screen, so they stay grabbable on a
+  // 24-megapixel image and do not swallow the frame on a small one
+  const box = svg.getBoundingClientRect();
+  const unit = box.width ? iw / box.width : 1;
+
+  // An invisible but *painted* full-size rect, purely as a hit target. SVG hit
+  // testing only finds painted geometry, and at a full-frame rect the dim path
+  // below encloses zero area — so without this the first "drag across the image"
+  // gesture, the one the whole tool opens with, would fall straight through to
+  // the page. `fill-opacity: 0` still counts as painted; `fill: none` would not.
+  svg.appendChild(svgEl("rect", {
+    x: 0, y: 0, width: iw, height: ih, fill: "#000", "fill-opacity": 0,
+  }));
+  // everything outside the frame, dimmed — one evenodd path rather than four
+  // rects, so the frame's interior is a hole and nothing overlaps at the seams
+  svg.appendChild(svgEl("path", {
+    d: `M 0 0 H ${iw} V ${ih} H 0 Z M ${x} ${y} H ${x + w} V ${y + h} H ${x} Z`,
+    "fill-rule": "evenodd", fill: "#000", "fill-opacity": 0.55,
+  }));
+  for (let i = 1; i < 3; i++) {
+    svg.appendChild(svgEl("path", {
+      d: `M ${x + (w * i) / 3} ${y} V ${y + h} M ${x} ${y + (h * i) / 3} H ${x + w}`,
+      stroke: "#fff", "stroke-opacity": 0.35, "stroke-width": unit,
+    }));
+  }
+  svg.appendChild(svgEl("rect", {
+    x, y, width: w, height: h,
+    fill: "none", stroke: "#fff", "stroke-width": 1.5 * unit,
+  }));
+  const s = CROP.handlePx * unit;
+  for (const [hx, hy] of [
+    [x, y], [x + w / 2, y], [x + w, y],
+    [x, y + h / 2], [x + w, y + h / 2],
+    [x, y + h], [x + w / 2, y + h], [x + w, y + h],
+  ]) {
+    svg.appendChild(svgEl("rect", {
+      x: hx - s / 2, y: hy - s / 2, width: s, height: s,
+      fill: "#fff", stroke: "#000", "stroke-opacity": 0.6, "stroke-width": unit,
+    }));
+  }
+}
+
+// One pointerdown -> one gesture. Pointer capture on the overlay, like the curve
+// editor's canvas, so nothing leaks a window-level listener per rebuild.
+function initCropOverlay() {
+  const svg = $("crop-overlay");
+  let drag = null;
+
+  svg.addEventListener("pointermove", (e) => {
+    if (!cropTool.armed || drag) return;
+    const mode = cropHit(cropTool.armed.rect, cropAtEvent(e));
+    svg.style.cursor = CROP_CURSORS[mode] || "crosshair";
+  });
+
+  svg.addEventListener("pointerdown", (e) => {
+    const tool = cropTool.armed;
+    if (!tool || e.button !== 0) return;
+    e.preventDefault(); // or the wrapper's pan handler takes the drag
+    e.stopPropagation();
+    const pos = cropAtEvent(e);
+    let mode = cropHit(tool.rect, pos);
+    // A frame filling the canvas has no slack to slide into, so "move" would be
+    // a no-op — and that is the *opening* state, which would leave "drag on the
+    // image to frame" doing nothing at all. Fall through to a fresh frame
+    // instead. Edges and corners still resize, and a frame with slack in either
+    // axis still moves.
+    if (mode === "move" && tool.rect[2] >= 1 && tool.rect[3] >= 1) mode = null;
+    // on the dimmed area: start a fresh frame from this corner, which is the
+    // "drag across the image" gesture
+    drag = mode
+      ? { mode, start: pos, rect: [...tool.rect] }
+      : { mode: "se", start: pos, rect: [pos.x, pos.y, CROP.minFrac, CROP.minFrac] };
+    if (!mode) tool.commit(drag.rect);
+    svg.setPointerCapture(e.pointerId);
+  });
+
+  svg.addEventListener("pointermove", (e) => {
+    const tool = cropTool.armed;
+    if (!drag || !tool) return;
+    const pos = cropAtEvent(e);
+    const dx = pos.x - drag.start.x;
+    const dy = pos.y - drag.start.y;
+    let [x, y, w, h] = drag.rect;
+    if (drag.mode === "move") {
+      // moving keeps the size and slides inside the image
+      x = clamp01(x + dx, w);
+      y = clamp01(y + dy, h);
+    } else {
+      // resizing works on edges, then normalizes — dragging one edge past its
+      // opposite flips the frame rather than pinning it at zero
+      let l = x, t = y, r = x + w, b = y + h;
+      if (drag.mode.includes("w")) l = Math.min(Math.max(pos.x, 0), 1);
+      if (drag.mode.includes("e")) r = Math.min(Math.max(pos.x, 0), 1);
+      if (drag.mode.includes("n")) t = Math.min(Math.max(pos.y, 0), 1);
+      if (drag.mode.includes("s")) b = Math.min(Math.max(pos.y, 0), 1);
+      [x, w] = l <= r ? [l, r - l] : [r, l - r];
+      [y, h] = t <= b ? [t, b - t] : [b, t - b];
+      w = Math.max(w, CROP.minFrac);
+      h = Math.max(h, CROP.minFrac);
+      x = clamp01(x, w);
+      y = clamp01(y, h);
+    }
+    tool.commit([x, y, w, h]);
+  });
+
+  const endDrag = (e) => {
+    if (!drag) return;
+    drag = null;
+    svg.releasePointerCapture(e.pointerId);
+  };
+  svg.addEventListener("pointerup", endDrag);
+  svg.addEventListener("pointercancel", endDrag);
+
+  // The proxy changes size whenever the angle does, so both the overlay's
+  // intrinsic dimensions and the panel's pixel readout have to be re-derived
+  // from whatever just loaded — hence paint(), not drawCropOverlay() alone.
+  $("preview").addEventListener("load", () => cropTool.armed?.paint());
+
+  $("crop-section").addEventListener("toggle", () => {
+    if ($("crop-section").open) enterCropMode();
+    else exitCropMode(true);
+  });
+  $("crop-save-btn").onclick = saveCrop;
+  $("crop-reset-btn").onclick = () => {
+    crop.angle = 0;
+    crop.rect = [0, 0, 1, 1];
+    renderCropControls();
+    refreshCropProxy();
+  };
+}
+
+// The panel: an angle slider, a frame readout, and the hint. Rebuilt whenever
+// the numbers change, and it is what arms the overlay — so, like
+// appendSelectionControls, a rebuild is the moment a stale commit closure would
+// start writing into a detached row, and it disarms first.
+function renderCropControls() {
+  const box = $("crop-controls");
+  box.replaceChildren();
+  disarmCrop();
+  if (!crop.active) return;
+
+  const row = document.createElement("div");
+  row.className = "param-row";
+  const label = document.createElement("label");
+  const name = document.createElement("span");
+  name.textContent = "Rotate (° ccw)";
+  const val = document.createElement("span");
+  val.textContent = crop.angle.toFixed(1);
+  label.append(name, val);
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = -90;
+  slider.max = 90;
+  slider.step = 0.1;
+  slider.value = crop.angle;
+  slider.oninput = () => {
+    crop.angle = parseFloat(slider.value);
+    val.textContent = crop.angle.toFixed(1);
+    // the proxy is a render, so it is debounced like the effect preview; the
+    // frame is in canvas fractions, so it needs no adjustment as the angle moves
+    scheduleCropProxy();
+  };
+  row.append(label, slider);
+
+  const readout = document.createElement("div");
+  readout.className = "hint";
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "drag on the image to frame · drag the handles to adjust";
+
+  box.append(row, readout, hint);
+
+  function paint() {
+    const img = $("preview");
+    const px = img.naturalWidth
+      ? ` · ${Math.max(1, Math.round(crop.rect[2] * img.naturalWidth))}×${Math.max(
+          1, Math.round(crop.rect[3] * img.naturalHeight))} px`
+      : "";
+    readout.textContent =
+      `${Math.round(crop.rect[2] * 100)}% × ${Math.round(crop.rect[3] * 100)}%${px}`;
+    if (cropTool.armed) drawCropOverlay(crop.rect);
+  }
+
+  cropTool.armed = {
+    rect: crop.rect,
+    paint,
+    commit(next) {
+      crop.rect = next;
+      cropTool.armed.rect = next;
+      paint();
+    },
+  };
+  showCropOverlay(true);
+  $("preview-wrap").classList.add("cropping");
+  paint();
+}
+
+function enterCropMode() {
+  if (state.imageId === null || crop.active) return;
+  // crop mode owns the preview image, so the effect preview has to let go of it
+  exitPreview(false);
+  clearMaskOverlay(); // the framed outline means nothing over an unframed proxy
+  crop.active = true;
+  const saved = state.crop || {};
+  crop.angle = saved.angle || 0;
+  crop.rect = Array.isArray(saved.rect) ? [...saved.rect] : [0, 0, 1, 1];
+  renderCropControls();
+  refreshCropProxy();
+}
+
+// `repaint` is false when renderSelection() is the caller: it is about to redraw
+// everything anyway, and re-entering it here would recurse.
+function exitCropMode(repaint) {
+  if (!crop.active) return;
+  crop.active = false;
+  crop.seq++; // drop any proxy still in flight
+  clearTimeout(crop.timer);
+  crop.timer = null;
+  disarmCrop();
+  $("crop-controls").replaceChildren();
+  $("crop-status").classList.remove("busy");
+  if (crop.url) {
+    URL.revokeObjectURL(crop.url);
+    crop.url = null;
+  }
+  $("crop-section").open = false;
+  if (repaint) renderSelection();
+}
+
+function scheduleCropProxy() {
+  clearTimeout(crop.timer);
+  crop.timer = setTimeout(refreshCropProxy, 250);
+}
+
+async function refreshCropProxy() {
+  if (!crop.active || state.nodeId === null) return;
+  const seq = ++crop.seq;
+  $("crop-status").classList.add("busy");
+  try {
+    const res = await fetch(`/api/images/${state.imageId}/crop-preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: state.nodeId, angle: crop.angle }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (seq !== crop.seq || !crop.active) return; // stale response or exited
+    const url = URL.createObjectURL(blob);
+    $("preview").src = url; // the load handler redraws the frame at the new size
+    if (crop.url) URL.revokeObjectURL(crop.url);
+    crop.url = url;
+  } catch (err) {
+    console.warn("crop preview failed:", err); // keep the last frame, as preview does
+  } finally {
+    $("crop-status").classList.remove("busy");
+  }
+}
+
+async function saveCrop() {
+  if (!crop.active) return;
+  const body = { crop: { angle: crop.angle, rect: crop.rect } };
+  try {
+    const image = await api(`/api/images/${state.imageId}/crop`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    state.crop = image.crop;
+    state.geometry = image.geometry;
+  } catch (err) {
+    alert(`Could not save the frame: ${err.message}`);
+    return;
+  }
+  // every node's framed output just changed, so the overlay cache — which is
+  // keyed on the selection, not the crop — would otherwise serve outlines
+  // framed the old way
+  clearOverlayCache();
+  // and the gallery's thumb URLs carry the crop, so they need rebuilding from
+  // the refreshed image rows or the tile keeps the old framing
+  await refreshGallery();
+  exitCropMode(true);
+}
+
 // ---------- Click-to-segment selection ----------
 
 // One overlay, one armed picker — the same single-slot model as `preview`:
@@ -1806,9 +2210,11 @@ async function openStats() {
   statRow(body, "Originals", `${formatBytes(st.originals.bytes)} · ${st.originals.files} files`);
   statRow(body, "Masks", `${formatBytes(st.masks.bytes)} · ${st.masks.files} files`);
   const cacheBytes =
-    st.renders.bytes + st.thumbs.bytes + st.clusters.bytes + st.embeddings.bytes;
+    st.renders.bytes + st.outputs.bytes + st.thumbs.bytes +
+    st.clusters.bytes + st.embeddings.bytes;
   statRow(body, "Render cache", formatBytes(cacheBytes));
   statRow(body, "renders", `${formatBytes(st.renders.bytes)} · ${st.renders.files} files`, true);
+  statRow(body, "framed output", `${formatBytes(st.outputs.bytes)} · ${st.outputs.files} files`, true);
   statRow(body, "thumbnails", `${formatBytes(st.thumbs.bytes)} · ${st.thumbs.files} files`, true);
   statRow(body, "cluster data", `${formatBytes(st.clusters.bytes)} · ${st.clusters.files} files`, true);
   statRow(body, "embeddings", `${formatBytes(st.embeddings.bytes)} · ${st.embeddings.files} files`, true);
@@ -2133,6 +2539,7 @@ async function init() {
   setEffect(EFFECT_BUTTONS[0].effects[0]);
 
   initZoom();
+  initCropOverlay();
   initClusterPlot();
   $("apply-btn").onclick = applyEffect;
   // the preference outlives the session; only an explicit "" means opted out

@@ -26,6 +26,7 @@
     <div id="preview-wrap" hidden>
       <img id="preview" alt="preview" draggable="false">
       <img id="mask-overlay" hidden alt="" draggable="false">
+      <svg id="crop-overlay" hidden></svg>
     </div>
     <div id="zoom-hud" hidden>scroll to zoom · drag to pan · double-click to reset</div>
   </main>
@@ -52,6 +53,15 @@
       </div>
       <button id="apply-btn" disabled>Apply</button>
     </section>
+    <details id="crop-section">
+      <summary>3 · Frame</summary>
+      <div id="crop-controls"></div>
+      <div class="modal-actions">
+        <span id="crop-status">rendering…</span>
+        <button id="crop-reset-btn">Reset</button>
+        <button id="crop-save-btn">Save frame</button>
+      </div>
+    </details>
     <details id="presets-section">
       <summary>Presets</summary>
       <button id="save-preset-btn" disabled>Save chain as preset</button>

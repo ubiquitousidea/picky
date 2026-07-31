@@ -354,6 +354,47 @@ Key invariants that cut across files:
   `whiten=True` so grayscale/solid images (zero chroma variance) don't divide
   by zero. Centroids are inverse-transformed back to RGB; all sampling is
   seeded so the effect and its cluster-plot data agree.
+- **Crop & rotate is an output stage, not a node.** One framing per image
+  (`images.crop`, JSON `{angle, rect}`, NULL = none), applied *after* the whole
+  work tree on the way out. Deliberately not an entry in `EFFECTS`: every
+  registry effect maps an array to an array of the same size, and the app leans
+  on that everywhere — so a crop node would break the "every node of an image
+  shares its dimensions" invariant above, and paying that off meant storing masks
+  in the original's space and warping them forward through each node's crops.
+  Keeping the crop outside the tree makes that invariant *stay true*: the tree
+  computes at original dimensions, **no saved mask is ever warped**, and
+  `compute_mask`, `_check_selection` and masked apply need no geometric case.
+  Presets are unaffected, because a crop is not a node to capture.
+  `rendering.render_output()` is the one place it is applied — every viewer
+  (preview, thumbnail, Export) goes through it, and it *short-circuits to
+  `render_path` when the crop is the identity*, so an uncropped library pays
+  nothing in time or bytes. Otherwise it caches `renders/<id>.out.jpg`; that
+  suffix has to be excluded by name in `storage_stats` (a `.out.jpg` is also a
+  `.jpg`, like `.thumb.jpg`) and swept in `delete_render_files`. Changing a crop
+  sweeps **only** `.out.jpg` + `.thumb.jpg` for that image's nodes — the
+  expensive effect renders upstream never saw the crop, and not re-running
+  k-means to re-frame is the entire point.
+- **`effects.crop_geometry()` is the only place PIL's rotate-expand rounding is
+  known.** It returns `{crop, source, canvas, box, output, inverse}`, and
+  `apply_geometry` takes its box from it rather than recomputing — so the pixels
+  a caller gets are always the ones its `inverse` describes. The arithmetic is
+  PIL's own, not a formula for it: `round(w·cos + h·sin)` disagrees with PIL by
+  1–2 px at most angles (400×300 at −13° → PIL 458×384, the formula 457×382),
+  PIL's expand offset is *rotated* rather than added, and PIL short-circuits a
+  quarter turn to a transpose whose size differs from the general path's
+  ceil/floor on odd dimensions (2×3 at 90° → 3×2, not 4×3). All three are
+  reproduced and were verified exact across 120 size/angle combinations.
+  `inverse` is `[a,b,c,d,e,f]` mapping an output pixel back to a source pixel;
+  the frontend applies it in `toNodeSpace()` so a click on the framed preview
+  becomes a coordinate in the node's own space with no trigonometry — and no
+  knowledge of any of the above — in the browser.
+- **The mask *outline* is framed; the mask itself never is.** `mask_png` runs the
+  overlay PNG through the same `apply_geometry` (NEAREST — the outline is already
+  antialiased into its casing, and interpolating an RGBA stencil smears its alpha
+  into a halo). That is display-only, so the outline registers on the framed
+  preview; the mask that gets *composited* in `_apply` is computed and used at
+  node dimensions. Do not confuse the two — the second one is the mask warping
+  this design exists to avoid.
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
   ALTER TABLE) — user databases contain real work, never require a wipe.
 - **Node ids are topological.** `GET /api/images/{id}/tree` returns nodes
@@ -379,10 +420,35 @@ Key invariants that cut across files:
 The side panel is ordered by the workflow it serves — pick an object, save it as
 a mask, repeat, then choose an effect, tick the masks it applies to, tune, and
 Apply. So: **1 · Select** (`#select-controls`), **2 · Effect**
-(`#effects-section`), then Presets and the RGB cluster plot as collapsed
-`<details>` (reference material, not part of the loop) and Export/Delete pinned
-to the bottom with `margin-top: auto`. The work tree left the panel entirely for
-its horizontal strip under the preview.
+(`#effects-section`), **3 · Frame** (`#crop-section`), then Presets and the RGB
+cluster plot as collapsed `<details>` (reference material, not part of the loop)
+and Export/Delete pinned to the bottom with `margin-top: auto`. The work tree
+left the panel entirely for its horizontal strip under the preview.
+
+**3 · Frame** is a `<details>` whose open state *is* crop mode: opening it swaps
+the preview for a rotated-but-unframed proxy
+(`POST /api/images/{id}/crop-preview`, capped at ~1600 px — the angle slider
+re-renders it on every change, and the frame is stored as fractions of the
+canvas, so the proxy and the full-size output describe the same crop), hides the
+mask overlay, and arms `#crop-overlay`. Crop mode leaves through
+`renderSelection()`'s `exitCropMode(false)`, the same choke point `exitPreview()`
+uses, so any change of selection ends it exactly once. Two things about the
+overlay are load-bearing and were both bugs first: it is an `<svg>`, so
+visibility is toggled with `toggleAttribute("hidden")` — `hidden` is an
+`HTMLElement` property that `SVGElement` does not implement, and assigning it
+sets a silent JS expando while the attribute (and `display: none`) stays put; and
+it carries an invisible but *painted* full-size `<rect>` as a hit target, because
+SVG hit testing only finds painted geometry and at a full-size frame the dimming
+path encloses zero area — without it the opening "drag across the image" gesture
+falls straight through the page. For the same reason a full-size frame treats an
+interior drag as a *new* frame rather than a move: a frame with no slack cannot
+move, so the gesture the hint describes would do nothing.
+
+Gallery thumbnails carry the crop as a `?v=` tag (`cropTag()`), because
+re-framing changes an image's pixels without changing its node id and the URL is
+what the browser caches — the same trick as the mask grid's `?v=<created_at>`.
+The tag is absent when there is no crop, so an unframed library's URLs are
+unchanged.
 
 Frontend state lives in one `state` object in `web/app.js`; selection flows
 through `selectImage()` → `renderSelection()`, which updates preview, export

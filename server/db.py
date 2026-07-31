@@ -22,7 +22,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS images (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  crop TEXT              -- JSON {angle, rect}; NULL = no framing at all
 );
 CREATE TABLE IF NOT EXISTS nodes (
   id INTEGER PRIMARY KEY,
@@ -65,6 +66,9 @@ def init() -> None:
             )
         if "selection" not in cols:
             conn.execute("ALTER TABLE nodes ADD COLUMN selection TEXT")
+        image_cols = [r["name"] for r in conn.execute("PRAGMA table_info(images)")]
+        if "crop" not in image_cols:
+            conn.execute("ALTER TABLE images ADD COLUMN crop TEXT")
 
 
 def connect() -> sqlite3.Connection:
@@ -101,6 +105,20 @@ def node_dict(row: sqlite3.Row) -> dict:
     }
 
 
+def image_dict(row: sqlite3.Row) -> dict:
+    """An image row as a dict, with its crop parsed. NULL stays None — "never
+    framed" is worth telling apart from "framed back to the identity", since only
+    the former is guaranteed to have no `.out.jpg` files behind it.
+
+    Deliberately *not* normalized through `validate_params` the way `node_dict`
+    normalizes selections: a crop has only ever had one shape, so there is
+    nothing to upgrade, and `crop_geometry` is total anyway.
+    """
+    d = dict(row)
+    d["crop"] = json.loads(d["crop"]) if d.get("crop") else None
+    return d
+
+
 def create_image(name: str) -> dict:
     with connect() as conn:
         now = _now()
@@ -114,26 +132,55 @@ def create_image(name: str) -> dict:
             (image_id, now),
         )
         root_id = cur.lastrowid
-    return {"id": image_id, "name": name, "created_at": now, "root_node_id": root_id}
+    return {
+        "id": image_id,
+        "name": name,
+        "created_at": now,
+        "crop": None,
+        "root_node_id": root_id,
+    }
 
 
 def list_images() -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
-            """SELECT i.id, i.name, i.created_at,
+            """SELECT i.id, i.name, i.created_at, i.crop,
                       (SELECT id FROM nodes n WHERE n.image_id = i.id
                        AND n.parent_id IS NULL) AS root_node_id
                FROM images i ORDER BY i.created_at DESC"""
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [image_dict(r) for r in rows]
 
 
 def get_image(image_id: int) -> dict | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT id, name, created_at FROM images WHERE id = ?", (image_id,)
+            "SELECT id, name, created_at, crop FROM images WHERE id = ?", (image_id,)
         ).fetchone()
-    return dict(row) if row else None
+    return image_dict(row) if row else None
+
+
+def set_image_crop(image_id: int, crop: dict | None) -> dict:
+    """Store an image's framing. `None` clears it back to the whole frame."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE images SET crop = ? WHERE id = ?",
+            (json.dumps(crop) if crop else None, image_id),
+        )
+    return get_image(image_id)
+
+
+def image_node_ids(image_id: int) -> list[int]:
+    """Every node of an image — the set whose output cache a crop change
+    invalidates. Not `descendant_ids`: a crop applies after the *whole* tree, so
+    it stales every branch at once, not a subtree."""
+    with connect() as conn:
+        return [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM nodes WHERE image_id = ?", (image_id,)
+            )
+        ]
 
 
 def get_tree(image_id: int) -> list[dict]:

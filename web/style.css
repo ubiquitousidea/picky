@@ -20,6 +20,9 @@
      .fx-* classes; these two exist only so curves and gamma get their own */
   --rb-pink: #cf8fb5;
   --rb-cyan: #7fb0c8;
+  /* and this one for the frame panel, which is not an effect and so has no
+     .fx-* class to borrow a hue from */
+  --rb-sand: #c2ab94;
 }
 
 /* The gallery and the side panel run the full height; the middle column splits
@@ -54,6 +57,7 @@ h2, summary {
 }
 #select-section h2 { color: var(--rb-teal); }
 #effects-section h2 { color: var(--rb-orange); }
+#crop-section summary { color: var(--rb-sand); }
 #presets-section summary { color: var(--rb-teal); }
 #cluster-section summary { color: var(--rb-violet); }
 #stats-modal h2 { color: var(--rb-blue); }
@@ -186,6 +190,21 @@ details[open] > summary { margin-bottom: 0.6rem; }
   pointer-events: none;
 }
 #preview-wrap.picking #preview { cursor: crosshair; }
+/* The crop frame, resolving to the same box as the fitted img by the same
+   intrinsic-dimension trick as #mask-overlay — but interactive, since the
+   frame is dragged on it. touch-action: none so a drag is a drag, not a scroll. */
+#crop-overlay {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 4px;
+  touch-action: none;
+  cursor: crosshair;
+}
+#crop-overlay[hidden] { display: none; }
+#preview-wrap.cropping #preview { cursor: crosshair; }
 #drop-hint { color: var(--muted); font-size: 1.1rem; }
 #zoom-hud {
   position: absolute;
@@ -344,8 +363,14 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #live-preview { accent-color: var(--rb-blue); }
 /* same idiom as #edit-status: the text is always there, `.busy` reveals it, so
    the row never reflows when a render starts */
-#preview-status { color: var(--muted); font-size: 0.7rem; visibility: hidden; }
-#preview-status.busy { visibility: visible; }
+#preview-status, #crop-status { color: var(--muted); font-size: 0.7rem; visibility: hidden; }
+#preview-status.busy, #crop-status.busy { visibility: visible; }
+/* the frame panel borrows the modals' action row, but it lives in the flow of
+   the side panel rather than at the foot of a dialog */
+#crop-section .modal-actions { margin-top: 0.6rem; }
+#crop-section[hidden] { display: none; }
+#crop-save-btn { border-color: var(--rb-sand); color: var(--rb-sand); }
+#crop-save-btn:hover:not(:disabled) { background: var(--rb-sand); color: var(--bg); }
 
 /* Work tree — a horizontal strip under the preview, one column per node in id
    order, with the commit-graph lanes running left to right above the chips. */

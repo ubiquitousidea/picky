@@ -60,6 +60,21 @@ restarts.
   their union, so one blur can cover two objects. **Save selection** banks an
   object you are not ready to use yet. A mask belongs to its image, and one
   still in use cannot be deleted out from under the nodes that reference it.
+- **Crop & rotate** — **3 · Frame** opens a framing tool: drag across the image
+  to draw a crop frame, drag its handles or edges to adjust, and use the
+  **rotate** slider (±90°, counter-clockwise) to straighten. The image is
+  rotated about its center onto an expanded canvas and the frame is taken from
+  *that*, so a frame may include the empty corners a rotation leaves — they come
+  out black, which is often what you want for a deliberate tilt. While framing,
+  the preview shows the rotated but uncropped image with everything outside the
+  frame dimmed, so you can see what you are giving up. **Save frame** applies it
+  everywhere at once: preview, gallery thumbnails, and Export.
+
+  The crop is *not* a step in the work tree — it belongs to the image and is
+  applied after every effect, on the way out. So re-framing costs nothing but
+  the crop itself (no effect is recomputed), saved masks stay in the image's
+  original coordinates and never need re-picking, and presets carry no framing
+  with them.
 - **Presets** — save the chain that produced a node as a named recipe and
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
@@ -140,6 +155,18 @@ effect to a fresh pick saves it that way first, so the object outlives the
 click — a click is only meaningful on the node it was made on, and applying an
 effect moves you off that node.
 
+The crop deliberately sits *outside* the work tree, as an output stage applied
+after every effect. Every registry effect maps an array to an array of the same
+size, and much of the app depends on that — most of all saved masks, whose frozen
+pixels line up with any node of their image precisely because every node shares
+the original's dimensions. A crop node would break that and force masks to be
+warped forward through it; a crop applied on the way out leaves it intact. The
+practical payoffs: re-framing recomputes no effect (only the framing itself is
+cached, as `renders/<id>.out.jpg`, and skipped entirely when the crop is the
+identity), and clicks on the framed preview are mapped back into node
+coordinates by an affine the server publishes with the image — so the browser
+places a pick without knowing any of the geometry.
+
 A selection is a *union* in either form — a list of click points, or a list of
 saved mask ids — OR'd together with one `invert` over the result. Selections
 written before unions existed are upgraded when they are read, so nothing on
@@ -155,6 +182,9 @@ the preset is replayed against.
 | GET    | `/api/effects` | effect registry with parameter specs |
 | POST   | `/api/images` | upload a JPG (multipart) |
 | GET    | `/api/images` | list images |
+| GET    | `/api/images/{id}` | one image with its `crop` and the `geometry` that crop implies (output size, and the affine mapping a framed pixel back to the node's own space) |
+| PUT    | `/api/images/{id}/crop` | set the image's framing (`crop`: `{angle, rect}`, or `null` to clear); drops only the framed-output cache, never the effect renders |
+| POST   | `/api/images/{id}/crop-preview` | the rotated but *unframed* proxy the frame editor drags over (`node_id`, `angle`), rendered small |
 | GET    | `/api/images/{id}/tree` | all work-tree nodes for an image |
 | POST   | `/api/images/{id}/nodes` | apply an effect (`parent_id`, `effect`, `params`, optional `parent2_id` for blend, optional `selection` to mask it) |
 | PATCH  | `/api/nodes/{id}` | edit a node's `params`, `parent2_id`, or `selection` in place, re-rendering it and dropping its descendants' caches |

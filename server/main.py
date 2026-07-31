@@ -11,7 +11,13 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import db, rendering
-from .effects import EFFECTS, effect_specs, validate_params, validate_selection
+from .effects import (
+    EFFECTS,
+    crop_geometry,
+    effect_specs,
+    validate_params,
+    validate_selection,
+)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -78,6 +84,32 @@ class PresetApply(BaseModel):
     selection: dict | None = None
 
 
+class CropUpdate(BaseModel):
+    # null clears the framing back to the whole image
+    crop: dict | None = None
+
+
+class CropPreviewRequest(BaseModel):
+    node_id: int
+    angle: float = 0.0
+
+
+def _image_response(image: dict) -> dict:
+    """An image plus the geometry its crop implies.
+
+    The source size is the *original's*, which is also every node's: the crop is
+    an output stage outside the work tree, so nothing in the tree changes
+    dimensions. That is what lets one geometry describe every node of the image.
+
+    Sent with the image rather than fetched separately because the frontend needs
+    the `inverse` affine to place a click, and a second round trip for six
+    numbers it will need on the very next interaction is a round trip wasted.
+    """
+    with Image.open(rendering.original_path(image["id"])) as im:
+        size = im.size  # header-only; no decode
+    return {**image, "geometry": crop_geometry(size, image["crop"])}
+
+
 def _check_selection(selection: dict | None, image_id: int) -> dict | None:
     """Resolve saved-mask references. `validate_selection` cannot do this —
     effects.py imports no DB — so ownership becomes a 400 here, mirroring the
@@ -117,6 +149,46 @@ async def upload_image(file: UploadFile):
 @app.get("/api/images")
 def list_images():
     return db.list_images()
+
+
+@app.get("/api/images/{image_id}")
+def get_image(image_id: int):
+    image = db.get_image(image_id)
+    if image is None:
+        raise HTTPException(404, "image not found")
+    return _image_response(image)
+
+
+@app.put("/api/images/{image_id}/crop")
+def set_crop(image_id: int, body: CropUpdate):
+    """Set the image's one framing — applied after every node, on the way out.
+
+    Invalidation is deliberately narrow: only the output stage's cache goes
+    (`.out.jpg` and `.thumb.jpg`). The effect renders upstream never saw the
+    crop, so re-framing must not throw away a subtree of k-means work — that is
+    the whole reason the crop is not a node.
+    """
+    image = db.get_image(image_id)
+    if image is None:
+        raise HTTPException(404, "image not found")
+    crop = validate_params("crop", body.crop) if body.crop else None
+    image = db.set_image_crop(image_id, crop)
+    rendering.delete_output_files(db.image_node_ids(image_id))
+    return _image_response(image)
+
+
+@app.post("/api/images/{image_id}/crop-preview")
+def crop_preview(image_id: int, body: CropPreviewRequest):
+    """The rotated-but-unframed backdrop the frame editor drags over."""
+    node = db.get_node(body.node_id)
+    if node is None or node["image_id"] != image_id:
+        raise HTTPException(400, "node does not belong to this image")
+    angle = validate_params("crop", {"angle": body.angle})["angle"]
+    try:
+        data = rendering.crop_preview(body.node_id, {"angle": angle})
+    except Exception as exc:
+        raise HTTPException(500, f"crop preview failed: {exc}")
+    return Response(content=data, media_type="image/jpeg")
 
 
 @app.get("/api/images/{image_id}/tree")
@@ -223,7 +295,9 @@ def get_render(node_id: int, thumb: bool = False, download: bool = False):
     node = db.get_node(node_id)
     if node is None:
         raise HTTPException(404, "node not found")
-    path = rendering.render_thumb(node_id) if thumb else rendering.render_node(node_id)
+    # render_output, not render_node: what a viewer gets is the framed result,
+    # which is what makes Export framed for free. render_thumb frames too.
+    path = rendering.render_thumb(node_id) if thumb else rendering.render_output(node_id)
     if download:
         image = db.get_image(node["image_id"])
         stem = Path(image["name"]).stem or "image"
