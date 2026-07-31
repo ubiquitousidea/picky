@@ -29,9 +29,15 @@ restarts.
     a monotone cubic spline, so the curve never overshoots between points and
     never inverts local contrast. Behind the same button, *Gamma* offers the
     one-slider version of the same idea.
-  - *Gaussian blur*, *Sobel edges*, *Floyd–Steinberg dither*, *Pixelate*
+  - *Pixelate* — average pixels into bins of a chosen size, in a **square
+    grid** or a **hexagonal** one. Hex bins are a pointy-top honeycomb: rows
+    offset by half a cell, each pixel taking the mean color of the hexagon it
+    falls in.
+  - *Gaussian blur*, *Sobel edges*, *Floyd–Steinberg dither*
   - *Blend* — combine the selected node with any other node in the tree using
-    average, additive, multiplicative, or subtractive blending.
+    average, additive, multiplicative, or subtractive blending. A **weight**
+    slider sets the second node's share of the result; it applies to *average*
+    only, the other three modes being unweighted.
 - **Click to segment** — *Limit to object* confines any effect to one thing
   instead of the whole frame. Hit **Select object** and click the subject; a
   [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) model finds it and
@@ -58,8 +64,11 @@ restarts.
   replay it on any other image. A preset stores its steps with *relative*
   parent references, not node ids, so a branching recipe (say `edges` blended
   back onto the original) reproduces its shape on whatever node you apply it
-  to. Applying one is all-or-nothing: if any step fails, the nodes it already
-  created are rolled back.
+  to. Tick an object first and the whole recipe is confined to it — every step
+  is masked to what you ticked, in place of whatever the recipe captured, so a
+  chain built on one photo's subject can be aimed at another photo's. Applying
+  one is all-or-nothing: if any step fails, the nodes it already created are
+  rolled back.
 - **Preview zoom** — scroll to zoom (cursor-anchored), drag to pan,
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
@@ -110,9 +119,13 @@ are materialized at node creation and re-derived lazily if a cache file is
 missing. Blend nodes carry a second parent reference (`parent2_id`), and
 deleting a node cascades through both parent links.
 
-Effects declare their parameter specs (range, default) in the registry, and
-the frontend generates its controls from `GET /api/effects` — adding a new
-effect is a single entry in `server/effects.py`.
+Effects declare their parameter specs (range, default, choices) in the
+registry, and the frontend generates its controls from `GET /api/effects`, so
+an effect's *parameters* cost nothing on the client. The effect itself needs
+four things: the registry entry in `server/effects.py`, an `EFFECT_BUTTONS`
+entry in `web/app.js`, an inline SVG icon painting with `currentColor`, and a
+`.fx-<name>` hue in `web/style.css`. The button list is not derived from the
+registry — a registry effect missing from it throws when selected.
 
 Segmentation splits into a heavy image encoder and a light prompt decoder.
 The encoder's output is cached per node alongside its render, so the cost is
@@ -154,7 +167,7 @@ the preset is replayed against.
 | DELETE | `/api/images/{id}` | delete an image, its tree, and its files |
 | GET    | `/api/presets` | list saved presets with their steps |
 | POST   | `/api/presets` | save a node's ancestor chain as a preset (`name`, `node_id`) |
-| POST   | `/api/nodes/{id}/apply-preset` | replay a preset onto a node (`preset_id`) |
+| POST   | `/api/nodes/{id}/apply-preset` | replay a preset onto a node (`preset_id`, optional `selection` to mask every step of it — it replaces the selections the recipe carries) |
 | DELETE | `/api/presets/{id}` | delete a preset |
 | GET    | `/api/images/{id}/masks` | list an image's saved masks, each with a `used_by` count |
 | POST   | `/api/images/{id}/masks` | freeze a click selection into a mask (`node_id`, `selection`, optional `name` — omit it and the server picks the next unused *Object N*) |
