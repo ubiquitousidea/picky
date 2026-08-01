@@ -358,7 +358,7 @@ CROP_SPEC = {
     "label": "Frame",
     "params": [
         # positive is counter-clockwise, which is PIL's direction — the label
-        # says so because a slider gives no other clue
+        # says so because a bare number gives no other clue
         {"name": "angle", "label": "Rotate (° ccw)", "type": "float", "min": -90.0, "max": 90.0, "step": 0.1, "default": 0.0},
         {"name": "rect", "label": "Frame", "type": "rect", "min": MIN_RECT, "default": [0.0, 0.0, 1.0, 1.0]},
     ],

@@ -371,6 +371,20 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #crop-section[hidden] { display: none; }
 #crop-save-btn { border-color: var(--rb-sand); color: var(--rb-sand); }
 #crop-save-btn:hover:not(:disabled) { background: var(--rb-sand); color: var(--bg); }
+/* the straighten tool, in the Frame section's sand where .sel-pick is teal —
+   the same armed-fills idiom, since both take over the preview's pointer */
+.crop-level {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--rb-sand);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--rb-sand);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.crop-level:hover { background: var(--rb-sand); color: var(--bg); }
+.crop-level.armed { background: var(--rb-sand); color: var(--bg); }
 
 /* Work tree — a horizontal strip under the preview, one column per node in id
    order, with the commit-graph lanes running left to right above the chips. */

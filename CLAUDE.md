@@ -427,10 +427,10 @@ left the panel entirely for its horizontal strip under the preview.
 
 **3 · Frame** is a `<details>` whose open state *is* crop mode: opening it swaps
 the preview for a rotated-but-unframed proxy
-(`POST /api/images/{id}/crop-preview`, capped at ~1600 px — the angle slider
-re-renders it on every change, and the frame is stored as fractions of the
-canvas, so the proxy and the full-size output describe the same crop), hides the
-mask overlay, and arms `#crop-overlay`. Crop mode leaves through
+(`POST /api/images/{id}/crop-preview`, capped at ~1600 px — straightening
+re-renders it, and the frame is stored as fractions of the canvas, so the proxy
+and the full-size output describe the same crop), hides the mask overlay, and
+arms `#crop-overlay`. Crop mode leaves through
 `renderSelection()`'s `exitCropMode(false)`, the same choke point `exitPreview()`
 uses, so any change of selection ends it exactly once. Two things about the
 overlay are load-bearing and were both bugs first: it is an `<svg>`, so
@@ -443,6 +443,32 @@ path encloses zero area — without it the opening "drag across the image" gestu
 falls straight through the page. For the same reason a full-size frame treats an
 interior drag as a *new* frame rather than a move: a frame with no slack cannot
 move, so the gesture the hint describes would do nothing.
+
+**Rotation is a drawn line, not a slider, and the readout's pixels come off the
+wire.** The angle was a `<input type="range">` whose every step scheduled a fresh
+server rotation of the proxy, so the image lurched along behind the thumb; and an
+angle is not what anyone knows about a photograph anyway — they know where the
+horizon is. The **Straighten** button arms the overlay to draw a line instead of
+a frame (`crop.level` / `crop.line`, and `pointerdown` checks it *before*
+`cropHit`), and on release `lineAngle()` turns that line into an angle. Three
+things about it are load-bearing: it is a **delta** added to `crop.angle`, since
+the proxy on screen is already rotated and a line drawn on it is measured in that
+rotated canvas — which is exactly what makes a second line refine the first
+rather than restate it; it is measured in **displayed pixels**, because the
+stored fractions have a different denominator per axis and an angle taken from
+them is skewed by the aspect ratio; and the gesture ends in one
+`refreshCropProxy()` with no debounce, which is the whole of the fix — one
+gesture, one render. A too-short drag is a tap, so it is discarded and the tool
+stays armed rather than silently rotating by whatever a twitch measured.
+The pixel readout used to multiply the frame fractions by `#preview`'s
+`naturalWidth`, which in crop mode is the *proxy* — a 3000×2000 image reported
+1600×1067. The proxy response now carries the full-size rotated canvas in
+`X-Canvas-Width`/`-Height` (headers, not a second endpoint: the readout changes
+on every frame drag but the canvas only on a change of angle), and `frameSizePx()`
+mirrors `crop_geometry`'s box block — including `pyRound`, Python's half-to-even,
+which one frame in a few hundred needs to agree to the pixel. The *canvas* is
+never recomputed in the browser, so PIL's rotate-expand rounding still lives in
+exactly one place.
 
 Gallery thumbnails carry the crop as a `?v=` tag (`cropTag()`), because
 re-framing changes an image's pixels without changing its node id and the URL is

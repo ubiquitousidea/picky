@@ -179,16 +179,27 @@ def set_crop(image_id: int, body: CropUpdate):
 
 @app.post("/api/images/{image_id}/crop-preview")
 def crop_preview(image_id: int, body: CropPreviewRequest):
-    """The rotated-but-unframed backdrop the frame editor drags over."""
+    """The rotated-but-unframed backdrop the frame editor drags over.
+
+    The full-size rotated canvas rides along in headers, because the proxy is
+    downscaled and the editor's pixel readout must report what will actually
+    export. Headers rather than a second endpoint: the readout changes on every
+    *frame* drag, but the canvas only on a change of *angle* — so one number
+    pair per proxy covers every repaint with no extra round trip.
+    """
     node = db.get_node(body.node_id)
     if node is None or node["image_id"] != image_id:
         raise HTTPException(400, "node does not belong to this image")
     angle = validate_params("crop", {"angle": body.angle})["angle"]
     try:
-        data = rendering.crop_preview(body.node_id, {"angle": angle})
+        data, canvas = rendering.crop_preview(body.node_id, {"angle": angle})
     except Exception as exc:
         raise HTTPException(500, f"crop preview failed: {exc}")
-    return Response(content=data, media_type="image/jpeg")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"X-Canvas-Width": str(canvas[0]), "X-Canvas-Height": str(canvas[1])},
+    )
 
 
 @app.get("/api/images/{image_id}/tree")

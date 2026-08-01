@@ -15,6 +15,7 @@ from .effects import (
     EFFECTS,
     apply_blend,
     apply_geometry,
+    crop_geometry,
     is_identity_crop,
     kmeans_cluster_data,
     validate_selection,
@@ -23,9 +24,11 @@ from .effects import (
 THUMB_SIZE = 320
 JPEG_QUALITY = 92
 # The rotated-but-uncropped proxy the frame editor drags over. Capped well below
-# full size because the angle slider re-renders it on every change, and the frame
-# is stored as *fractions* of the canvas — so a proxy and the full-size render
-# describe the same crop, and nothing is lost by dragging against the small one.
+# full size because straightening re-renders it, and the frame is stored as
+# *fractions* of the canvas — so a proxy and the full-size render describe the
+# same crop, and nothing is lost by dragging against the small one. What *is*
+# lost is the true pixel count, which is why `crop_preview` also returns the
+# full-size canvas.
 CROP_PREVIEW_PX = 1600
 
 
@@ -145,24 +148,31 @@ def render_output(node_id: int) -> Path:
     return out
 
 
-def crop_preview(node_id: int, crop: dict | None) -> bytes:
+def crop_preview(node_id: int, crop: dict | None) -> tuple[bytes, list[int]]:
     """The node's pixels rotated onto the expanded canvas but *not* framed —
     the backdrop the frame editor drags over, so the user can see what falls
     outside the frame and what the black corners will be.
 
-    Downscaled first: the editor re-renders this on every touch of the angle
-    slider, and the frame is stored as fractions of the canvas, so the proxy and
-    the full-size output describe the same crop.
+    Downscaled first: the frame is stored as fractions of the canvas, so the
+    proxy and the full-size output describe the same crop.
+
+    Returns the JPEG *and* the canvas the full-size render would rotate onto,
+    which is the one number the editor cannot work out for itself: the frame
+    readout has to report the pixels that will actually export, and deriving
+    them from the proxy's own size is how it came to lie about them. Measured
+    from `im.size` before the downscale — the render this proxy stands for —
+    rather than from the original, so nothing here assumes the two match.
     """
     im = Image.open(render_node(node_id)).convert("RGB")
-    im.thumbnail((CROP_PREVIEW_PX, CROP_PREVIEW_PX), Image.Resampling.BICUBIC)
     # rect ignored on purpose — the SVG overlay draws the frame, this is the canvas
     angle = float((crop or {}).get("angle") or 0.0)
+    canvas = crop_geometry(im.size, {"angle": angle})["canvas"]
+    im.thumbnail((CROP_PREVIEW_PX, CROP_PREVIEW_PX), Image.Resampling.BICUBIC)
     if angle:
         im = im.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=0)
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    return buf.getvalue(), canvas
 
 
 def delete_output_files(node_ids: list[int]) -> None:

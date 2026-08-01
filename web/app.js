@@ -1243,11 +1243,18 @@ async function refreshPreview() {
 // the user can see what falls outside the frame and where the black corners will
 // be; the SVG overlay draws the frame on top of it.
 
-const CROP = { handlePx: 9, grabPx: 12, minFrac: 0.01 };
+const CROP = { handlePx: 9, grabPx: 12, minFrac: 0.01, minLinePx: 8 };
 const cropTool = { armed: null };
 // `active` is crop mode; `angle`/`rect` are the unsaved edit. `seq` drops stale
-// proxy responses the same way preview.seq drops stale renders.
-const crop = { active: false, angle: 0, rect: [0, 0, 1, 1], seq: 0, timer: null, url: null };
+// proxy responses the same way preview.seq drops stale renders. `canvas` is the
+// *full-size* rotated canvas the current proxy stands for, straight off the
+// proxy response — the readout's pixel count comes from it rather than from the
+// downscaled proxy on screen. `level` is the straighten tool, `line` the line it
+// is drawing (fractions of the displayed proxy, for painting only).
+const crop = {
+  active: false, angle: 0, rect: [0, 0, 1, 1],
+  seq: 0, url: null, canvas: null, level: false, line: null,
+};
 
 // `toggleAttribute`, not `.hidden`: the overlay is an <svg>, and `hidden` is an
 // HTMLElement property that SVGElement does not implement — assigning it sets a
@@ -1299,10 +1306,37 @@ const CROP_CURSORS = {
 
 const clamp01 = (v, size) => Math.min(Math.max(v, 0), 1 - size);
 
-// Repaint the frame. Everything is drawn in the *displayed image's* pixel space
-// (the viewBox), so the fractions in the store survive the natural-size change
-// that dragging the angle causes.
-function drawCropOverlay(rect) {
+// What the frame will actually export, in whole pixels. This is the box block of
+// `crop_geometry` in server/effects.py — including its "at least one pixel each
+// way" clamp — deliberately spelled twice, for the same reason `_curve_lut` is:
+// the panel has to name the number before anything is saved, and asking the
+// server per pointermove is a round trip per drag. Change one, change the other.
+// The *canvas* is not recomputed here; it comes from the proxy response, so
+// PIL's rotate-expand rounding stays where it is known.
+function frameSizePx(rect, canvas) {
+  const [cw, ch] = canvas;
+  const [x, y, w, h] = rect;
+  const left = pyRound(x * cw), top = pyRound(y * ch);
+  const right = Math.max(left + 1, pyRound((x + w) * cw));
+  const bottom = Math.max(top + 1, pyRound((y + h) * ch));
+  return [right - left, bottom - top];
+}
+
+// Python's round(): half to *even*, where Math.round is half up. An edge landing
+// on an exact half pixel is rare (0.625 × 3604) but not never — about one frame
+// in three hundred — and a readout that exists to be believed should not be off
+// by a pixel from the file it describes.
+function pyRound(v) {
+  const f = Math.floor(v);
+  const diff = v - f;
+  if (diff !== 0.5) return diff > 0.5 ? f + 1 : f;
+  return f % 2 === 0 ? f : f + 1;
+}
+
+// Repaint the frame, and the straighten line when one is being drawn. Everything
+// is drawn in the *displayed image's* pixel space (the viewBox), so the fractions
+// in the store survive the natural-size change that straightening causes.
+function drawCropOverlay(rect, line) {
   const svg = $("crop-overlay");
   const img = $("preview");
   const iw = img.naturalWidth;
@@ -1357,6 +1391,35 @@ function drawCropOverlay(rect) {
       fill: "#fff", stroke: "#000", "stroke-opacity": 0.6, "stroke-width": unit,
     }));
   }
+  if (!line) return;
+  // The straighten line, drawn last so it sits over the dimming. A white core in
+  // a dark casing, like the mask outline: it has to read on any photograph, and
+  // it is dragged across the whole frame. End caps mark the two points, since a
+  // line laid along a horizon is otherwise hard to see against it.
+  const [x0, y0, x1, y1] = [line.x0 * iw, line.y0 * ih, line.x1 * iw, line.y1 * ih];
+  const d = `M ${x0} ${y0} L ${x1} ${y1}`;
+  for (const [stroke, width] of [["#000", 4 * unit], ["#fff", 1.5 * unit]]) {
+    svg.appendChild(svgEl("path", { d, stroke, "stroke-width": width, fill: "none" }));
+  }
+  for (const [cx, cy] of [[x0, y0], [x1, y1]]) {
+    svg.appendChild(svgEl("circle", {
+      cx, cy, r: 3 * unit,
+      fill: "#fff", stroke: "#000", "stroke-opacity": 0.6, "stroke-width": unit,
+    }));
+  }
+}
+
+// How far a drawn line is off horizontal, in degrees, positive when it falls to
+// the right — which is also how far counter-clockwise the image must turn to
+// level it, PIL's direction. Measured in *displayed* pixels rather than in the
+// stored fractions: the two axes have different denominators, so an angle taken
+// straight from fractions would be skewed by the image's aspect ratio.
+function lineAngle(line) {
+  const r = $("preview").getBoundingClientRect();
+  let dx = (line.x1 - line.x0) * r.width;
+  let dy = (line.y1 - line.y0) * r.height;
+  if (dx < 0) { dx = -dx; dy = -dy; } // a line has no direction
+  return { deg: (Math.atan2(dy, dx) * 180) / Math.PI, len: Math.hypot(dx, dy) };
 }
 
 // One pointerdown -> one gesture. Pointer capture on the overlay, like the curve
@@ -1367,7 +1430,9 @@ function initCropOverlay() {
 
   svg.addEventListener("pointermove", (e) => {
     if (!cropTool.armed || drag) return;
-    const mode = cropHit(cropTool.armed.rect, cropAtEvent(e));
+    // the straighten tool owns the whole surface, so the frame's edges and
+    // corners stop advertising themselves while it is armed
+    const mode = crop.level ? null : cropHit(cropTool.armed.rect, cropAtEvent(e));
     svg.style.cursor = CROP_CURSORS[mode] || "crosshair";
   });
 
@@ -1377,6 +1442,14 @@ function initCropOverlay() {
     e.preventDefault(); // or the wrapper's pan handler takes the drag
     e.stopPropagation();
     const pos = cropAtEvent(e);
+    if (crop.level) {
+      // straightening: this gesture draws a line and leaves the frame alone
+      drag = { mode: "level" };
+      crop.line = { x0: pos.x, y0: pos.y, x1: pos.x, y1: pos.y };
+      tool.paint();
+      svg.setPointerCapture(e.pointerId);
+      return;
+    }
     let mode = cropHit(tool.rect, pos);
     // A frame filling the canvas has no slack to slide into, so "move" would be
     // a no-op — and that is the *opening* state, which would leave "drag on the
@@ -1397,6 +1470,13 @@ function initCropOverlay() {
     const tool = cropTool.armed;
     if (!drag || !tool) return;
     const pos = cropAtEvent(e);
+    if (drag.mode === "level") {
+      // deliberately unclamped: pinning the far end to the edge would pin one
+      // axis and not the other, which would bend the very angle being measured
+      crop.line = { ...crop.line, x1: pos.x, y1: pos.y };
+      tool.paint(); // the panel shows the pending angle — no render, so no lag
+      return;
+    }
     const dx = pos.x - drag.start.x;
     const dy = pos.y - drag.start.y;
     let [x, y, w, h] = drag.rect;
@@ -1422,13 +1502,31 @@ function initCropOverlay() {
     tool.commit([x, y, w, h]);
   });
 
-  const endDrag = (e) => {
+  const endDrag = (e, apply) => {
     if (!drag) return;
+    const wasLevel = drag.mode === "level";
     drag = null;
     svg.releasePointerCapture(e.pointerId);
+    if (!wasLevel) return;
+    const line = crop.line; // null if crop mode exited under the pointer
+    crop.line = null;
+    // a tap is not a line: drop it and stay armed, so a stray click on the image
+    // does not silently throw the framing away
+    if (!apply || !line || lineAngle(line).len < CROP.minLinePx) {
+      cropTool.armed?.paint();
+      return;
+    }
+    // a *delta*: the proxy on screen is already turned by crop.angle, so a line
+    // drawn on it is measured in that rotated canvas — which is what makes
+    // straightening iterative, a second line refining the first
+    const next = Math.min(90, Math.max(-90, crop.angle + lineAngle(line).deg));
+    crop.angle = Math.round(next * 10) / 10; // CROP_SPEC's step
+    crop.level = false; // one line, then back to framing
+    renderCropControls();
+    refreshCropProxy(); // one gesture, one render — no debounce to lag behind
   };
-  svg.addEventListener("pointerup", endDrag);
-  svg.addEventListener("pointercancel", endDrag);
+  svg.addEventListener("pointerup", (e) => endDrag(e, true));
+  svg.addEventListener("pointercancel", (e) => endDrag(e, false));
 
   // The proxy changes size whenever the angle does, so both the overlay's
   // intrinsic dimensions and the panel's pixel readout have to be re-derived
@@ -1443,15 +1541,22 @@ function initCropOverlay() {
   $("crop-reset-btn").onclick = () => {
     crop.angle = 0;
     crop.rect = [0, 0, 1, 1];
+    crop.level = false;
+    crop.line = null;
     renderCropControls();
     refreshCropProxy();
   };
 }
 
-// The panel: an angle slider, a frame readout, and the hint. Rebuilt whenever
-// the numbers change, and it is what arms the overlay — so, like
-// appendSelectionControls, a rebuild is the moment a stale commit closure would
-// start writing into a detached row, and it disarms first.
+// The panel: the angle with its straighten tool, a frame readout, and the hint.
+// Rebuilt whenever the numbers change, and it is what arms the overlay — so,
+// like appendSelectionControls, a rebuild is the moment a stale commit closure
+// would start writing into a detached row, and it disarms first.
+//
+// There is no angle slider. A slider's every step scheduled a fresh server
+// rotation of the proxy, so the image lurched along behind the thumb; and an
+// angle is not what a user knows anyway — they know where the horizon is. The
+// Straighten tool takes that directly, and costs exactly one render per line.
 function renderCropControls() {
   const box = $("crop-controls");
   box.replaceChildren();
@@ -1464,40 +1569,40 @@ function renderCropControls() {
   const name = document.createElement("span");
   name.textContent = "Rotate (° ccw)";
   const val = document.createElement("span");
-  val.textContent = crop.angle.toFixed(1);
   label.append(name, val);
-  const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = -90;
-  slider.max = 90;
-  slider.step = 0.1;
-  slider.value = crop.angle;
-  slider.oninput = () => {
-    crop.angle = parseFloat(slider.value);
-    val.textContent = crop.angle.toFixed(1);
-    // the proxy is a render, so it is debounced like the effect preview; the
-    // frame is in canvas fractions, so it needs no adjustment as the angle moves
-    scheduleCropProxy();
+  const levelBtn = document.createElement("button");
+  levelBtn.type = "button";
+  levelBtn.className = "crop-level" + (crop.level ? " armed" : "");
+  levelBtn.textContent = crop.level ? "Cancel" : "Straighten";
+  levelBtn.onclick = () => {
+    crop.level = !crop.level;
+    crop.line = null;
+    renderCropControls();
   };
-  row.append(label, slider);
+  row.append(label, levelBtn);
 
   const readout = document.createElement("div");
   readout.className = "hint";
   const hint = document.createElement("div");
   hint.className = "hint";
-  hint.textContent = "drag on the image to frame · drag the handles to adjust";
+  hint.textContent = crop.level
+    ? "drag a line along what should be horizontal"
+    : "drag on the image to frame · drag the handles to adjust";
 
   box.append(row, readout, hint);
 
   function paint() {
-    const img = $("preview");
-    const px = img.naturalWidth
-      ? ` · ${Math.max(1, Math.round(crop.rect[2] * img.naturalWidth))}×${Math.max(
-          1, Math.round(crop.rect[3] * img.naturalHeight))} px`
-      : "";
+    // the pending line moves the angle on screen before anything is rendered,
+    // which is the whole of the tool's feedback while the pointer is down
+    const pending = crop.line ? lineAngle(crop.line).deg : 0;
+    val.textContent = (crop.angle + pending).toFixed(1);
+    // the true output size, never the proxy's: `canvas` is the full-size rotated
+    // canvas the server reported for these pixels, so this is what will export
+    const size = crop.canvas ? frameSizePx(crop.rect, crop.canvas) : null;
+    const px = size ? ` · ${size[0]}×${size[1]} px` : "";
     readout.textContent =
       `${Math.round(crop.rect[2] * 100)}% × ${Math.round(crop.rect[3] * 100)}%${px}`;
-    if (cropTool.armed) drawCropOverlay(crop.rect);
+    if (cropTool.armed) drawCropOverlay(crop.rect, crop.line);
   }
 
   cropTool.armed = {
@@ -1523,6 +1628,9 @@ function enterCropMode() {
   const saved = state.crop || {};
   crop.angle = saved.angle || 0;
   crop.rect = Array.isArray(saved.rect) ? [...saved.rect] : [0, 0, 1, 1];
+  crop.level = false;
+  crop.line = null;
+  crop.canvas = null; // the first proxy response says how big these pixels are
   renderCropControls();
   refreshCropProxy();
 }
@@ -1533,8 +1641,9 @@ function exitCropMode(repaint) {
   if (!crop.active) return;
   crop.active = false;
   crop.seq++; // drop any proxy still in flight
-  clearTimeout(crop.timer);
-  crop.timer = null;
+  crop.level = false;
+  crop.line = null;
+  crop.canvas = null;
   disarmCrop();
   $("crop-controls").replaceChildren();
   $("crop-status").classList.remove("busy");
@@ -1546,11 +1655,8 @@ function exitCropMode(repaint) {
   if (repaint) renderSelection();
 }
 
-function scheduleCropProxy() {
-  clearTimeout(crop.timer);
-  crop.timer = setTimeout(refreshCropProxy, 250);
-}
-
+// Undebounced on purpose: with the slider gone, the only thing that changes the
+// angle is a completed straighten line, so one gesture is one render.
 async function refreshCropProxy() {
   if (!crop.active || state.nodeId === null) return;
   const seq = ++crop.seq;
@@ -1564,6 +1670,11 @@ async function refreshCropProxy() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
     if (seq !== crop.seq || !crop.active) return; // stale response or exited
+    // The full-size canvas these downscaled pixels stand for. Set *before* the
+    // src, so the load-driven repaint already reports the new output size.
+    const cw = Number(res.headers.get("X-Canvas-Width"));
+    const ch = Number(res.headers.get("X-Canvas-Height"));
+    crop.canvas = cw > 0 && ch > 0 ? [cw, ch] : null;
     const url = URL.createObjectURL(blob);
     $("preview").src = url; // the load handler redraws the frame at the new size
     if (crop.url) URL.revokeObjectURL(crop.url);
