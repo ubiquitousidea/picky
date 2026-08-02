@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS images (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  crop TEXT              -- JSON {angle, rect}; NULL = no framing at all
+  crop TEXT,             -- JSON {angle, rect}; NULL = no framing at all
+  embedding BLOB         -- raw float32 CLIP vector; NULL = not embedded yet
 );
 CREATE TABLE IF NOT EXISTS nodes (
   id INTEGER PRIMARY KEY,
@@ -69,6 +70,8 @@ def init() -> None:
         image_cols = [r["name"] for r in conn.execute("PRAGMA table_info(images)")]
         if "crop" not in image_cols:
             conn.execute("ALTER TABLE images ADD COLUMN crop TEXT")
+        if "embedding" not in image_cols:
+            conn.execute("ALTER TABLE images ADD COLUMN embedding BLOB")
 
 
 def connect() -> sqlite3.Connection:
@@ -168,6 +171,52 @@ def set_image_crop(image_id: int, crop: dict | None) -> dict:
             (json.dumps(crop) if crop else None, image_id),
         )
     return get_image(image_id)
+
+
+# ---------- CLIP embeddings (the Image map's coordinates) ----------
+#
+# Stored as a BLOB on the image row rather than as a file under `renders/`,
+# which is where every other derived artifact lives. Two reasons, and the first
+# is a correctness one:
+#
+# - Image ids are rowids, and SQLite hands them back out after a delete. A
+#   file named `<image_id>.npy` would therefore outlive its image and be read
+#   back as its successor's vector — the same hazard that keeps mask thumbnails
+#   from being files. A BLOB in the row dies with the row, through the FK
+#   cascade that already exists, with no sweep to remember.
+# - `renders/` is swept *by node id* (`delete_render_files`); an image-keyed
+#   file there has nothing that would ever clean it up.
+#
+# The cost is that ~2 KB per image lands in the "database" line of the storage
+# stats, which is otherwise reserved for things you cannot regenerate. At 512
+# float32 per image that is noise, and worth it for an invalidation edge that
+# cannot be forgotten.
+
+
+def get_embeddings() -> dict[int, bytes]:
+    """Every stored vector, keyed by image id — one query, one snapshot."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, embedding FROM images WHERE embedding IS NOT NULL"
+        ).fetchall()
+    return {r["id"]: r["embedding"] for r in rows}
+
+
+def set_embedding(image_id: int, blob: bytes) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE images SET embedding = ? WHERE id = ?", (blob, image_id)
+        )
+
+
+def clear_embedding(image_id: int) -> None:
+    """Forget an image's vector, so the next map re-embeds it. The one caller is
+    the crop endpoint: re-framing to a detail changes what the photo is *of*, so
+    its point has to move."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE images SET embedding = NULL WHERE id = ?", (image_id,)
+        )
 
 
 def image_node_ids(image_id: int) -> list[int]:

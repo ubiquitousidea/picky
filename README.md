@@ -90,14 +90,29 @@ restarts.
   chain built on one photo's subject can be aimed at another photo's. Applying
   one is all-or-nothing: if any step fails, the nodes it already created are
   rolled back.
+- **Image map** — **Image map**, under the gallery, plots the whole library as a
+  rotatable 3D point cloud in which photos of similar things sit near each
+  other: crocuses beside crocuses, graffiti beside graffiti, and duplicate
+  uploads on top of one another. Each image is embedded by the vision half of
+  [CLIP](https://openai.com/research/clip), which was trained against captions
+  and so groups by *subject*, not by palette — a red car does not land beside a
+  red sunset. Drag to rotate, double-click to pause the spin, and click a point
+  for that image's thumbnail and an **Open** button, which makes the map a way
+  to navigate a large library by eye. **PCA** is stable, so adding an image
+  nudges the map rather than reshuffling it; **t-SNE** draws tighter clumps but
+  its layout is not comparable between runs. Points are painted in each photo's
+  average color. Model weights (~335 MB) download on first use, and each image
+  is embedded once (~12 ms) and cached.
 - **Preview zoom** — scroll to zoom (cursor-anchored), drag to pan,
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
   chain (e.g. `photo-posterize-blur.jpg`).
 - **Library stats** — image, node, preset, and mask counts plus disk usage. The
-  render cache is reported apart from the database, originals, and saved masks:
-  it is ~85% of the bytes and regenerates on demand, so a single "on disk"
-  figure would badly misstate what you would actually lose.
+  render cache and the downloaded model weights are reported apart from the
+  database, originals, and saved masks: between them they are the bulk of the
+  bytes and both come back on their own (one regenerates, the other
+  re-downloads), so a single "on disk" figure would badly misstate what you
+  would actually lose.
 
 ## Setup
 

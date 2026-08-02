@@ -17,6 +17,7 @@
     </header>
     <ul id="gallery"></ul>
     <footer id="gallery-footer">
+      <button id="embed-btn" title="See the whole library as a 3D cloud, with similar photos near each other">Image map</button>
       <button id="stats-btn" title="Images, effects, and disk usage">Library stats</button>
     </footer>
   </aside>
@@ -83,6 +84,28 @@
     <div id="stats-body"></div>
     <div class="modal-actions">
       <button id="stats-close-btn">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="embed-modal">
+    <div id="embed-header">
+      <h2>Image map</h2>
+      <select id="embed-method" title="How the 512-d embedding is flattened to 3 dimensions">
+        <option value="pca">PCA</option>
+        <option value="tsne">t-SNE</option>
+      </select>
+    </div>
+    <div id="embed-stage">
+      <canvas id="embed-canvas"></canvas>
+      <div id="embed-card" hidden>
+        <img id="embed-card-img" alt="" draggable="false">
+        <div id="embed-card-name"></div>
+        <button id="embed-open-btn">Open</button>
+      </div>
+    </div>
+    <div id="embed-status" class="hint"></div>
+    <div class="modal-actions">
+      <button id="embed-close-btn">Close</button>
     </div>
   </dialog>
 

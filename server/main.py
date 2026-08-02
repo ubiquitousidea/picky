@@ -4,6 +4,7 @@ import io
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -151,6 +152,123 @@ def list_images():
     return db.list_images()
 
 
+EMBED_METHODS = ("pca", "tsne")
+
+
+def _project(vectors, method: str):
+    """Project unit-length CLIP vectors down to 3 dimensions for display.
+
+    PCA is the default because it is *stable*: adding an image nudges the map
+    instead of reshuffling it, and the axes stay real directions of variation.
+    t-SNE draws tighter, more obvious clumps, but its layout is not comparable
+    across library changes and between-cluster distances mean nothing.
+
+    Both are guarded for tiny libraries, where the defaults raise: PCA cannot
+    ask for more components than it has samples, and t-SNE's perplexity must be
+    under the sample count. Below four images there is no neighbourhood
+    structure to find at all, so t-SNE degrades to PCA rather than erroring.
+    """
+    from sklearn.decomposition import PCA
+
+    n = len(vectors)
+    if n == 1:
+        return np.zeros((1, 3), dtype=np.float32)
+
+    components = min(3, n, vectors.shape[1])
+    coords = PCA(n_components=components).fit_transform(vectors)
+
+    if method == "tsne" and n >= 4:
+        from sklearn.manifold import TSNE
+
+        # PCA first: t-SNE on 512 raw dims is slow and noisier than on the
+        # handful of components that carry the variance.
+        reduced = PCA(n_components=min(50, n, vectors.shape[1])).fit_transform(vectors)
+        coords = TSNE(
+            n_components=3,
+            # seeded, so reopening the map does not reshuffle it
+            random_state=0,
+            init="pca",
+            # sklearn requires 0 < perplexity < n_samples, so the usual 30 has
+            # to scale down for a small library — (n-1)/3 stays under n for
+            # every n >= 2, where a constant floor would not (a floor of 5 is
+            # already illegal at n = 4).
+            perplexity=min(30.0, max(1.0, (n - 1) / 3)),
+        ).fit_transform(reduced)
+
+    # zero-pad when PCA had fewer than 3 components to give
+    if coords.shape[1] < 3:
+        coords = np.pad(coords, ((0, 0), (0, 3 - coords.shape[1])))
+
+    # Normalize into the unit cube the frontend frames, so the view never has to
+    # guess a scale. A single point (or identical images) collapses to the
+    # origin, hence the guard.
+    extent = float(np.abs(coords).max())
+    return coords / extent if extent > 0 else coords
+
+
+def _collect_embeddings(images: list[dict]):
+    """Each image's vector (cached on its row, or computed now) and its point."""
+    cached = db.get_embeddings()
+    vectors, points = [], []
+    for image in images:
+        blob = cached.get(image["id"])
+        if blob:
+            vec = np.frombuffer(blob, dtype=np.float32)
+        else:
+            try:
+                vec = rendering.embed_image(image["id"], image["root_node_id"])
+            except Exception as exc:
+                raise HTTPException(500, f"could not embed {image['name']}: {exc}")
+        vectors.append(vec)
+        points.append(
+            {
+                "image_id": image["id"],
+                "node_id": image["root_node_id"],
+                "name": image["name"],
+                "color": rendering.mean_color(image["root_node_id"]),
+            }
+        )
+    return vectors, points
+
+
+@app.get("/api/embedding-map")
+def embedding_map(method: str = "pca"):
+    """Every image as a point in 3D — the Image map's data.
+
+    Library-scoped, unlike every other endpoint here, and necessarily so: the
+    projection is fitted across the whole library, so no point's coordinates are
+    a property of its own image. That is why only the 512-d vectors are cached
+    (on the image row) and the projection is redone per request — it is a
+    sub-second fit over ~100 points, against embeddings that are the expensive
+    part and are computed once.
+
+    The first call is slow in a way later ones are not: it downloads ~335 MB of
+    CLIP weights and embeds the whole library. The frontend says so.
+    """
+    if method not in EMBED_METHODS:
+        raise HTTPException(400, f"unknown method {method!r}")
+
+    images = db.list_images()
+    if not images:
+        return {"method": method, "points": []}
+
+    vectors, points = _collect_embeddings(images)
+    # Every vector must be the model's output width for the stack to be
+    # rectangular. A mixed cache means the ONNX export changed under it (a 512-d
+    # projection head vs a 768-d pooled output), so re-embed the library once
+    # rather than 500 — the map is a view, and a stale cache is not a reason to
+    # refuse to draw it.
+    if len({v.shape[0] for v in vectors}) > 1:
+        for image in images:
+            db.clear_embedding(image["id"])
+        vectors, points = _collect_embeddings(images)
+
+    coords = _project(np.vstack(vectors).astype(np.float32), method)
+    for point, (x, y, z) in zip(points, coords):
+        point["x"], point["y"], point["z"] = float(x), float(y), float(z)
+    return {"method": method, "points": points}
+
+
 @app.get("/api/images/{image_id}")
 def get_image(image_id: int):
     image = db.get_image(image_id)
@@ -174,6 +292,10 @@ def set_crop(image_id: int, body: CropUpdate):
     crop = validate_params("crop", body.crop) if body.crop else None
     image = db.set_image_crop(image_id, crop)
     rendering.delete_output_files(db.image_node_ids(image_id))
+    # The Image map embeds the *framed* thumbnail, so re-framing moves the point:
+    # crop to one detail and the photo is semantically a different photo. This is
+    # the only edge that stales an embedding — a delete takes it with the row.
+    db.clear_embedding(image_id)
     return _image_response(image)
 
 

@@ -86,13 +86,18 @@ def _model_path(kind: str) -> Path:
         return path
     path = MODELS_DIR / spec["filename"]
     if not path.is_file():
-        _download(spec["url"], path)
+        download_model(spec["url"], path)
     return path
 
 
-def _download(url: str, dest: Path) -> None:
+def download_model(url: str, dest: Path) -> None:
     """Fetch to a tmp file and os.replace() into place, so a crashed download
-    never leaves a truncated model where the existence check would trust it."""
+    never leaves a truncated model where the existence check would trust it.
+
+    Public because `embed.py` fetches its CLIP weights the same way: the atomic
+    write and the pinned-revision contract in this module's docstring must not
+    exist as two copies that can drift apart.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     digest = hashlib.sha256()

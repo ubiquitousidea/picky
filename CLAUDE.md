@@ -408,6 +408,39 @@ Key invariants that cut across files:
   preview; the mask that gets *composited* in `_apply` is computed and used at
   node dimensions. Do not confuse the two — the second one is the mask warping
   this design exists to avoid.
+- **The Image map's embedding is a column, not a file** — the one derived
+  artifact that is not. `images.embedding` holds a raw float32 CLIP vector
+  (`server/embed.py`, the vision tower of ViT-B/32 as ONNX). Everything else
+  derived lives under `renders/` keyed by node id, and this deliberately does
+  not, for the reason `mask_thumb_png` is not a file either: **image ids are
+  rowids that SQLite hands back out after a delete**, so an `<image_id>.npy`
+  would outlive its image and be read back as its successor's position in the
+  cloud — wrong, and invisible. A BLOB dies with its row through the FK cascade,
+  so there is no sweep to forget. `renders/` would also never clean it, being
+  swept by *node* id. The cost is ~2 KB per image landing in the "database" line
+  of `storage_stats`, which otherwise means "bytes you cannot regenerate"; at
+  512 floats that is noise.
+  It embeds the **thumbnail** (`render_thumb` of the root node), not the
+  original — that is why embedding a whole library takes ~12 ms an image rather
+  than a full decode of a median 10.7 MP file, and it means the map describes
+  exactly what the filmstrip shows, *framing included*. Hence the one
+  invalidation edge, `db.clear_embedding` in the crop PUT: re-framing to a
+  detail changes what the photo is of, so the point must move. Nothing else
+  stales a vector — effects are downstream of the root node and never touch it.
+  Two things in `embed.py` are load-bearing and silent when wrong: the
+  normalization constants are **CLIP's, over 0-1 floats** (SAM's are ImageNet-ish
+  over 0-255, and using them yields vectors that still draw a plausible cloud
+  whose neighbourhoods mean nothing), and the output is **L2-normalized** on the
+  way out, because CLIP is a cosine space while PCA and t-SNE only understand
+  Euclidean distance. Neither can be caught by any shape or finiteness check —
+  only by looking at whether nearest neighbours are actually similar photos.
+  The *projection* is library-wide, so it is deliberately **not** cached: no
+  point's coordinates are a property of its own image, and one image arriving
+  moves all of them. `_project` in `main.py` refits per request (sub-second at
+  ~100 points) and normalizes into the unit cube the frontend frames.
+  `sam.download_model` is public because this is the second module to fetch
+  pinned ONNX weights into `data/models/`; the atomic-write contract must not
+  exist as two copies.
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
   ALTER TABLE) — user databases contain real work, never require a wipe.
 - **Node ids are topological.** `GET /api/images/{id}/tree` returns nodes
@@ -525,12 +558,15 @@ control — so `refreshMasks()` calls that. Ticking a mask chip unions it into t
 Apply panel's selection (the analogue of a preset row acting on the selected
 node) rather than creating anything.
 
-The two modals are native `<dialog>` elements (Esc and focus trapping for free);
-`prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two gotchas:
-the global `* { margin: 0 }` reset defeats a dialog's centering, so `dialog`
-re-sets `margin: auto`; and Esc closes a dialog without going through the
-buttons, so `#edit-modal` listens for `close` to run the same teardown Cancel
-does. `openEdit()` is the one selection change that must *not* be followed by
+The three modals are native `<dialog>` elements (Esc and focus trapping for
+free); `prompt()`/`confirm()`/`alert()` remain the idiom everywhere else. Two
+gotchas: the global `* { margin: 0 }` reset defeats a dialog's centering, so
+`dialog` re-sets `margin: auto`; and Esc closes a dialog without going through
+the buttons, so `#edit-modal` and `#embed-modal` both listen for `close` to run
+the same teardown their buttons do, each guarded by a sentinel (`edit.node`,
+`embedMap.open`) so the handler does not recurse into the `.close()` inside it.
+For the Image map that listener is not a nicety: without it Esc leaves the
+`requestAnimationFrame` rotation loop spinning forever behind a hidden dialog. `openEdit()` is the one selection change that must *not* be followed by
 `renderSelection()` — it selects the node first, then calls `exitPreview(false)`
 unconditionally, and only then starts its own preview, because that choke point
 would otherwise cancel it immediately (and, with live preview, leave a debounce
@@ -540,6 +576,23 @@ successful PATCH the node id is unchanged, so `saveEdit()` clears
 and would otherwise keep drawing the old centroids.
 
 `GET /api/stats` (`db.stats()` + `rendering.storage_stats()`) backs the Library
-stats modal. It reports the render cache apart from the database, originals, and
-saved masks because the cache is ~85% of the bytes and is fully regenerable —
-one lumped "on disk" number would badly misrepresent what a user would lose.
+stats modal. It reports the render cache and the downloaded model weights apart
+from the database, originals, and saved masks because between them they are the
+bulk of the bytes and neither is lost for good — the cache regenerates, the
+models re-download. One lumped "on disk" number would badly misrepresent what a
+user would actually lose.
+
+The **Image map** (`#embed-modal`, the `embedMap` state object in `web/app.js`)
+is a deliberate sibling of the cluster plot rather than a generalization of it:
+they share the orthographic yaw-then-pitch `project()` and the painter's-
+algorithm depth sort, copied, and nothing else — one plots one node's pixels in
+RGB space in the side panel, the other plots every image of the library in a
+fitted space in a modal. Three details are load-bearing. The canvas is sized
+from its bounding rect **after** `showModal()`, because a closed `<dialog>`
+measures zero, and at `devicePixelRatio` — so all drawing *and* hit testing work
+in backing-store pixels and pointer coordinates are scaled on the way in. Each
+point's projected screen position is cached back onto the point every frame, so
+`embedPointAt` tests exactly the pixels that were drawn rather than re-deriving
+them against a cloud that has since rotated. And a pointerup only counts as a
+click if it moved less than `EMBED_DRAG_PX` from its pointerdown — otherwise
+every rotation gesture would also pick whatever point it happened to end on.

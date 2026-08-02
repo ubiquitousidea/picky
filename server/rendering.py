@@ -10,7 +10,7 @@ from PIL import Image, ImageFilter
 
 import json
 
-from . import db, sam
+from . import db, embed, sam
 from .effects import (
     EFFECTS,
     apply_blend,
@@ -235,6 +235,48 @@ def cluster_data(node_id: int) -> Path:
     data = kmeans_cluster_data(img, int(node["params"]["k"]))
     out.write_text(json.dumps(data))
     return out
+
+
+# ---------- CLIP embeddings (the Image map) ----------
+
+
+def embed_image(image_id: int, root_node_id: int) -> np.ndarray:
+    """Compute and store an image's CLIP vector, returning it.
+
+    Reads the *thumbnail*, not the original. That is the whole reason embedding
+    a library is quick: `render_thumb` is already on disk for every image (the
+    filmstrip drew it), it is already framed through `render_output`, and CLIP
+    only looks at 224px anyway — so this costs one small decode plus one forward
+    pass instead of decoding a median 10.7 MP original. The map then describes
+    exactly what the filmstrip shows, framing included.
+
+    The 320px thumb is upscaled ~5% on its short axis to reach CLIP's 224px
+    crop, which is immaterial to a model whose patches are 32px.
+    """
+    img = np.asarray(Image.open(render_thumb(root_node_id)).convert("RGB"))
+    vec = embed.compute_embedding(img)
+    db.set_embedding(image_id, vec.tobytes())
+    return vec
+
+
+# The point cloud paints each image in its own average color, which is what
+# makes the cloud read as the library rather than as abstract dots.
+MEAN_COLOR_SAMPLE = 32
+
+
+def mean_color(root_node_id: int) -> list[int]:
+    """An image's average RGB, from its thumbnail.
+
+    Not cached anywhere, for `histogram`'s reason: `draft()` lets libjpeg scale
+    during the DCT, so a 320px thumb decodes at ~40px and this costs less than
+    the stat call a cache lookup would need. No new file kind, no new
+    invalidation edge — and it re-derives from the thumb, whose own
+    invalidation is already correct.
+    """
+    im = Image.open(render_thumb(root_node_id))
+    im.draft("RGB", (MEAN_COLOR_SAMPLE, MEAN_COLOR_SAMPLE))
+    arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+    return [int(round(c)) for c in arr.reshape(-1, 3).mean(axis=0)]
 
 
 # ---------- Click-to-segment (SAM) ----------
@@ -505,6 +547,12 @@ def storage_stats() -> dict:
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
         "originals": _totals(db.ORIGINALS_DIR.iterdir()),
         "masks": _totals(db.MASKS_DIR.iterdir()),
+        # ONNX weights (MobileSAM, CLIP) — neither user data nor a cache: they
+        # re-download rather than rebuild. Reported because at ~378 MB they are
+        # the second-largest thing on disk and were previously invisible here.
+        "models": _totals(
+            sam.MODELS_DIR.iterdir() if sam.MODELS_DIR.is_dir() else []
+        ),
         # thumbs and framed outputs are also .jpg, so exclude them by name rather
         # than matching on suffix — otherwise their bytes would be counted twice
         "renders": _totals(

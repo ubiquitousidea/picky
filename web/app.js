@@ -2320,6 +2320,7 @@ async function openStats() {
   statRow(body, "Database", formatBytes(st.database.bytes));
   statRow(body, "Originals", `${formatBytes(st.originals.bytes)} · ${st.originals.files} files`);
   statRow(body, "Masks", `${formatBytes(st.masks.bytes)} · ${st.masks.files} files`);
+  statRow(body, "Models", `${formatBytes(st.models.bytes)} · ${st.models.files} files`);
   const cacheBytes =
     st.renders.bytes + st.outputs.bytes + st.thumbs.bytes +
     st.clusters.bytes + st.embeddings.bytes;
@@ -2332,13 +2333,16 @@ async function openStats() {
   statRow(
     body,
     "Total",
-    formatBytes(st.database.bytes + st.originals.bytes + st.masks.bytes + cacheBytes)
+    formatBytes(
+      st.database.bytes + st.originals.bytes + st.masks.bytes +
+      st.models.bytes + cacheBytes
+    )
   );
 
   const note = document.createElement("div");
   note.className = "hint";
   note.textContent =
-    "The render cache rebuilds itself from the originals and the work tree — only the database, originals, and saved masks are irreplaceable.";
+    "The render cache rebuilds itself from the originals and the work tree, and the models re-download — only the database, originals, and saved masks are irreplaceable.";
   body.appendChild(note);
 }
 
@@ -2604,6 +2608,258 @@ function initClusterPlot() {
   canvas.addEventListener("dblclick", () => (cluster.spin = !cluster.spin));
 }
 
+// ---------- Image map (3D embedding scatter over the whole library) ----------
+
+// The library as a point cloud, one point per image, positioned by a CLIP
+// embedding so photos of similar things land near each other. Deliberately a
+// sibling of the cluster plot rather than a generalization of it: they share
+// the projection *math* (copied below) but nothing else — that one plots pixels
+// of one node in RGB space and lives in the side panel, this one plots every
+// image of the library in a fitted space and lives in a modal.
+const embedMap = {
+  points: [],
+  method: "pca",
+  yaw: 0.8,
+  pitch: -0.45,
+  spin: true,
+  raf: null,
+  selected: null,
+  // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
+  // fires the dialog's `close` event, the same idiom #edit-modal uses.
+  open: false,
+  seq: 0,
+};
+
+const EMBED_HIT_PX = 14; // click tolerance, in backing-store pixels
+const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a click
+
+async function openEmbedMap() {
+  embedMap.open = true;
+  embedMap.selected = null;
+  $("embed-card").hidden = true;
+  $("embed-status").textContent =
+    "Embedding the library — the first run downloads the CLIP model and may take a minute.";
+  $("embed-modal").showModal();
+  // sized only now: a closed <dialog> has a zero-size bounding rect
+  sizeEmbedCanvas();
+  await loadEmbedMap();
+}
+
+function sizeEmbedCanvas() {
+  const canvas = $("embed-canvas");
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  // A backing store at device resolution, unlike the cluster canvas's fixed
+  // 268x268 — at this size a 1x buffer is visibly soft. Everything downstream
+  // (drawing and hit testing alike) therefore works in backing-store pixels,
+  // and pointer coordinates are scaled into them on the way in.
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+}
+
+async function loadEmbedMap() {
+  const seq = ++embedMap.seq;
+  try {
+    const data = await api(`/api/embedding-map?method=${embedMap.method}`);
+    if (seq !== embedMap.seq || !embedMap.open) return; // stale or closed meanwhile
+    embedMap.points = data.points;
+    $("embed-status").textContent = data.points.length
+      ? `${data.points.length} images · drag to rotate · click a point · double-click to pause`
+      : "No images yet.";
+    startEmbedLoop();
+  } catch (err) {
+    if (seq !== embedMap.seq || !embedMap.open) return;
+    embedMap.points = [];
+    $("embed-status").textContent = `Could not build the map: ${err.message}`;
+  }
+}
+
+function closeEmbedMap() {
+  embedMap.open = false;
+  // Without this the rAF loop keeps running behind a hidden dialog forever —
+  // and Esc never touches the Close button, which is why the teardown hangs off
+  // the dialog's `close` event too.
+  stopEmbedLoop();
+  embedMap.seq++; // abandon any in-flight fetch
+  $("embed-modal").close();
+}
+
+function startEmbedLoop() {
+  if (embedMap.raf) return;
+  const tick = () => {
+    if (embedMap.spin) embedMap.yaw += 0.003;
+    drawEmbedMap();
+    embedMap.raf = requestAnimationFrame(tick);
+  };
+  embedMap.raf = requestAnimationFrame(tick);
+}
+
+function stopEmbedLoop() {
+  if (embedMap.raf) cancelAnimationFrame(embedMap.raf);
+  embedMap.raf = null;
+}
+
+function drawEmbedMap() {
+  const canvas = $("embed-canvas");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  // coordinates arrive normalized into the unit cube, whose half-diagonal is √3
+  const scale = (Math.min(w, h) / 2 - 14) / Math.sqrt(3);
+  const cy = Math.cos(embedMap.yaw);
+  const sy = Math.sin(embedMap.yaw);
+  const cp = Math.cos(embedMap.pitch);
+  const sp = Math.sin(embedMap.pitch);
+  // the same orthographic yaw-then-pitch projection drawClusterPlot() uses;
+  // z comes back only to sort by depth
+  const project = (x, y, z) => {
+    const x1 = x * cy + z * sy;
+    const z1 = z * cy - x * sy;
+    const y1 = y * cp - z1 * sp;
+    const z2 = y * sp + z1 * cp;
+    return [w / 2 + x1 * scale, h / 2 - y1 * scale, z2];
+  };
+
+  ctx.strokeStyle = "rgba(139, 147, 163, 0.25)";
+  ctx.lineWidth = 1;
+  for (const a of [-1, 1]) {
+    for (const b of [-1, 1]) {
+      for (const [p, q] of [
+        [[-1, a, b], [1, a, b]],
+        [[a, -1, b], [a, 1, b]],
+        [[a, b, -1], [a, b, 1]],
+      ]) {
+        const [x1, y1] = project(...p);
+        const [x2, y2] = project(...q);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const r = 4 * dpr;
+  // Project once and cache the screen position back onto the point, so
+  // hit testing reads exactly the pixels that were drawn rather than
+  // re-deriving them against a cloud that has since rotated.
+  for (const p of embedMap.points) {
+    const [sx, sy2, z] = project(p.x, p.y, p.z);
+    p.sx = sx;
+    p.sy = sy2;
+    p.sz = z;
+  }
+  for (const p of [...embedMap.points].sort((a, b) => a.sz - b.sz)) {
+    const [cr, cg, cb] = p.color;
+    ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, p === embedMap.selected ? r * 1.6 : r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle =
+      p === embedMap.selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
+    ctx.lineWidth = (p === embedMap.selected ? 2 : 1) * dpr;
+    ctx.stroke();
+  }
+}
+
+function embedPointAt(x, y) {
+  let best = null;
+  let bestD = EMBED_HIT_PX * (window.devicePixelRatio || 1);
+  for (const p of embedMap.points) {
+    if (p.sx === undefined) continue;
+    const d = Math.hypot(p.sx - x, p.sy - y);
+    // ties go to the point nearest the camera, which is the one drawn on top
+    if (d < bestD || (d === bestD && best && p.sz > best.sz)) {
+      best = p;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+function selectEmbedPoint(point) {
+  embedMap.selected = point;
+  const card = $("embed-card");
+  if (!point) {
+    card.hidden = true;
+    return;
+  }
+  const image = state.images.find((i) => i.id === point.image_id);
+  $("embed-card-img").src =
+    `/api/nodes/${point.node_id}/render?thumb=1${cropTag(image && image.crop)}`;
+  $("embed-card-name").textContent = point.name;
+  $("embed-card-name").title = point.name;
+  card.hidden = false;
+}
+
+function initEmbedMap() {
+  const canvas = $("embed-canvas");
+  let dragging = false;
+  let lastX = 0;
+  let lastY = 0;
+  let downX = 0;
+  let downY = 0;
+
+  canvas.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    lastX = downX = e.clientX;
+    lastY = downY = e.clientY;
+  });
+  // on window, not the canvas, so a drag survives leaving it
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    embedMap.yaw += (e.clientX - lastX) * 0.01;
+    embedMap.pitch += (e.clientY - lastY) * 0.01;
+    embedMap.pitch = Math.max(-1.5, Math.min(1.5, embedMap.pitch));
+    lastX = e.clientX;
+    lastY = e.clientY;
+  });
+  window.addEventListener("mouseup", (e) => {
+    if (!dragging) return;
+    dragging = false;
+    // A rotation gesture must not also pick a point, so a pointerup that
+    // barely moved is the only thing that counts as a click.
+    if (Math.hypot(e.clientX - downX, e.clientY - downY) > EMBED_DRAG_PX) return;
+    const rect = canvas.getBoundingClientRect();
+    if (
+      e.clientX < rect.left || e.clientX > rect.right ||
+      e.clientY < rect.top || e.clientY > rect.bottom
+    ) return;
+    const dpr = window.devicePixelRatio || 1;
+    selectEmbedPoint(
+      embedPointAt((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr)
+    );
+  });
+  canvas.addEventListener("dblclick", () => (embedMap.spin = !embedMap.spin));
+
+  $("embed-method").onchange = (e) => {
+    embedMap.method = e.target.value;
+    // keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint
+    selectEmbedPoint(null);
+    $("embed-status").textContent = "Projecting…";
+    loadEmbedMap();
+  };
+  $("embed-open-btn").onclick = async () => {
+    const point = embedMap.selected;
+    if (!point) return;
+    closeEmbedMap();
+    await selectImage(point.image_id);
+    await refreshGallery();
+  };
+  $("embed-btn").onclick = openEmbedMap;
+  $("embed-close-btn").onclick = closeEmbedMap;
+  $("embed-modal").addEventListener("close", () => {
+    if (embedMap.open) closeEmbedMap();
+  });
+  // the cloud is sized from its rendered box, so a resized window needs a resize
+  window.addEventListener("resize", () => {
+    if (embedMap.open) sizeEmbedCanvas();
+  });
+}
+
 // ---------- Upload / delete ----------
 
 async function uploadFile(file) {
@@ -2652,6 +2908,7 @@ async function init() {
   initZoom();
   initCropOverlay();
   initClusterPlot();
+  initEmbedMap();
   $("apply-btn").onclick = applyEffect;
   // the preference outlives the session; only an explicit "" means opted out
   state.livePreview = localStorage.getItem("picky:livePreview") !== "";
