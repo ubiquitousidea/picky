@@ -79,10 +79,23 @@ Key invariants that cut across files:
   image) only affects the `average` mode; `rendering.py` reads it with
   `.get("weight", 0.5)` because nodes created before the param existed lack
   the key — keep that default when touching the call site. Pixelate's `shape`
-  (`square` | `hexagon`) is read the same way, for the same reason: a param
+  (`square` | `hexagon`) and blur's `kernel` (`gaussian` | `disk`) are read the
+  same way, for the same reason: a param
   added to a shipped effect is always absent from the rows already on disk,
   since nothing migrates node params and `validate_params` only backfills on
-  the next write.
+  the next write. Widening a *range* needs no such care — `validate_params`
+  clamps into `[min, max]`, so blur's radius cap going 30 → 100 leaves every
+  stored radius valid.
+- **Blur's disk kernel is a running sum, not a convolution.** A Gaussian is
+  separable, so Pillow blurs in O(w·h) at any radius; a disk is not, and the
+  2-D convolution it implies is O(w·h·r²) — ~106 s for a 40 MP frame at r=30.
+  `effects._disk_blur` instead treats the disk as a stack of horizontal runs
+  (row `dy` spans `|dx| ≤ √(r²−dy²)`) and cumsums along x, which collapses a run
+  of any length to two lookups: O(w·h·r), exact, 8.5 s at 40 MP and r=100. It is
+  banded like `_hex_pixelate` for the same memory reason, and everything stays
+  `int32` — a row sum peaks near `width·255` and the accumulator near
+  `π r²·255`, both far inside 2³¹, so the result is integer-exact rather than
+  float-rounded. Verified bitwise against a brute-force convolution.
 - **Previews never persist, and run by default.** `POST /api/nodes/{id}/preview`
   renders an effect against a node's cached pixels entirely in memory
   (`rendering.render_preview`) — no DB row, no file in `data/renders/`. It shares

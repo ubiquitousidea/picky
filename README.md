@@ -33,7 +33,10 @@ restarts.
     grid** or a **hexagonal** one. Hex bins are a pointy-top honeycomb: rows
     offset by half a cell, each pixel taking the mean color of the hexagon it
     falls in.
-  - *Gaussian blur*, *Sobel edges*, *Floyd–Steinberg dither*
+  - *Blur* — a **Gaussian** kernel for soft focus, or a flat **disk** for
+    lens-style defocus, where a highlight blooms into a hard-edged circle
+    rather than smearing.
+  - *Sobel edges*, *Floyd–Steinberg dither*
   - *Blend* — combine the selected node with any other node in the tree using
     average, additive, multiplicative, or subtractive blending. A **weight**
     slider sets the second node's share of the result; it applies to *average*

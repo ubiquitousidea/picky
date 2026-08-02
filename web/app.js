@@ -579,7 +579,7 @@ function iconBlend() {
 // Presentation only: the registry, the stored effect names, and the tree still
 // treat each pair as two separate effects.
 const EFFECT_BUTTONS = [
-  { key: "blur", label: "Gaussian blur", icon: iconBlur, effects: ["blur"] },
+  { key: "blur", label: "Blur", icon: iconBlur, effects: ["blur"] },
   { key: "edges", label: "Sobel edges", icon: iconEdges, effects: ["edges"] },
   {
     key: "posterize",
