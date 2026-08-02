@@ -2632,17 +2632,65 @@ const embedMap = {
 
 const EMBED_HIT_PX = 14; // click tolerance, in backing-store pixels
 const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a click
+const EMBED_POLL_MS = 400;
 
 async function openEmbedMap() {
   embedMap.open = true;
   embedMap.selected = null;
   $("embed-card").hidden = true;
-  $("embed-status").textContent =
-    "Embedding the library — the first run downloads the CLIP model and may take a minute.";
+  $("embed-status").textContent = "Preparing…";
   $("embed-modal").showModal();
   // sized only now: a closed <dialog> has a zero-size bounding rect
   sizeEmbedCanvas();
-  await loadEmbedMap();
+  if (await prepareEmbedMap()) await loadEmbedMap();
+}
+
+// The embedding pass runs on a thread of the server's, and this polls it so the
+// status line can say *what* is slow. On a fresh install that is a 335 MB model
+// download, which as one blocking request was indistinguishable from a hang.
+// Returns false when the map should not be drawn: either the dialog closed
+// meanwhile, or the pass failed — and in that case falling through to
+// /api/embedding-map would just repeat the whole download to reach the same
+// error, so the failure is reported rather than retried.
+async function prepareEmbedMap() {
+  const seq = ++embedMap.seq;
+  const stale = () => seq !== embedMap.seq || !embedMap.open;
+  try {
+    let job = await api("/api/embedding-map/prepare", { method: "POST" });
+    while (job.state === "running") {
+      if (stale()) return false;
+      $("embed-status").textContent = embedJobText(job);
+      await new Promise((done) => setTimeout(done, EMBED_POLL_MS));
+      if (stale()) return false;
+      job = await api("/api/embedding-map/progress");
+    }
+    if (stale()) return false;
+    if (job.state === "error") {
+      $("embed-status").textContent = `Could not embed the library: ${job.error}`;
+      return false;
+    }
+    $("embed-status").textContent = "Projecting…";
+    return true;
+  } catch (err) {
+    if (stale()) return false;
+    $("embed-status").textContent = `Could not embed the library: ${err.message}`;
+    return false;
+  }
+}
+
+// `done`/`total` change units with the phase — bytes while downloading, images
+// while embedding — so each phase gets its own sentence rather than one bar
+// whose numbers silently mean something else halfway through.
+function embedJobText(job) {
+  const mb = (bytes) => Math.round(bytes / 1e6);
+  if (job.phase === "download") {
+    const of = job.total ? ` of ${mb(job.total)}` : ""; // no Content-Length
+    return `Downloading the CLIP model — ${mb(job.done)}${of} MB (first run only)`;
+  }
+  if (job.phase === "embed" && job.total) {
+    return `Embedding the library — ${job.done} of ${job.total} images`;
+  }
+  return "Preparing…";
 }
 
 function sizeEmbedCanvas() {

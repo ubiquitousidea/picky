@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import db, rendering
+from . import db, embed_job, rendering
 from .effects import (
     EFFECTS,
     crop_geometry,
@@ -242,8 +242,10 @@ def embedding_map(method: str = "pca"):
     sub-second fit over ~100 points, against embeddings that are the expensive
     part and are computed once.
 
-    The first call is slow in a way later ones are not: it downloads ~335 MB of
-    CLIP weights and embeds the whole library. The frontend says so.
+    Any vector this finds missing it computes on the spot, so the map is correct
+    regardless of whether anyone called `prepare` first. That is deliberately
+    left in place: it makes the endpoint answerable on its own, and it means the
+    prepare job is only ever an optimization that can be skipped or fail.
     """
     if method not in EMBED_METHODS:
         raise HTTPException(400, f"unknown method {method!r}")
@@ -267,6 +269,29 @@ def embedding_map(method: str = "pca"):
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
     return {"method": method, "points": points}
+
+
+@app.post("/api/embedding-map/prepare")
+def prepare_embedding_map():
+    """Start the background embedding pass, and report where it already is.
+
+    The point is that the first open of the Image map is not an unexplained
+    wait: the ~335 MB model download and the pass over the library happen off
+    the request, and the modal polls `/progress` for a status line rather than
+    holding one connection open for a minute with nothing to show.
+
+    The frontend calls this unconditionally instead of guessing whether it is
+    needed — when everything is cached this answers `done` synchronously, so
+    the usual case costs one round trip and no poll.
+    """
+    return embed_job.start()
+
+
+@app.get("/api/embedding-map/progress")
+def embedding_map_progress():
+    """Where the pass from `prepare` got to. Safe to call at any time; a library
+    nobody has prepared this run reports `idle`."""
+    return embed_job.snapshot()
 
 
 @app.get("/api/images/{image_id}")

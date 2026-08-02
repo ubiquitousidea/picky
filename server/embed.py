@@ -58,16 +58,34 @@ _PIXEL_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 _PIXEL_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
 
-def _model_path() -> Path:
+def model_path() -> Path:
+    """Where the weights live — env override, else `data/models/`.
+
+    The file need not exist yet: `.is_file()` on this is exactly the question
+    "would opening the map download 335 MB?", which is what `embed_job.start()`
+    answers without touching the network.
+    """
     override = os.environ.get(_ENV_VAR)
-    if override:
-        path = Path(override)
-        if not path.is_file():
-            raise FileNotFoundError(f"{_ENV_VAR} points at missing file {path}")
+    return Path(override) if override else MODELS_DIR / _FILENAME
+
+
+def ensure_model(on_progress=None) -> Path:
+    """The weights, downloading them on first use.
+
+    Public, and separate from `_session`, so the Image map's prepare job can do
+    the slow part *up front* and report it: at ~335 MB the download is the whole
+    reason opening the map for the first time used to look like a hang. Since
+    `download_model` only calls `on_progress` while bytes move, a caller learns
+    for free whether a download happened at all.
+    """
+    path = model_path()
+    if path.is_file():
         return path
-    path = MODELS_DIR / _FILENAME
-    if not path.is_file():
-        download_model(_HF_URL, path)
+    if os.environ.get(_ENV_VAR):
+        # An explicit override that points nowhere is a misconfiguration, not an
+        # invitation to fetch our own copy over the top of it.
+        raise FileNotFoundError(f"{_ENV_VAR} points at missing file {path}")
+    download_model(_HF_URL, path, on_progress=on_progress)
     return path
 
 
@@ -79,7 +97,7 @@ def _session():
     import onnxruntime
 
     return onnxruntime.InferenceSession(
-        str(_model_path()), providers=["CPUExecutionProvider"]
+        str(ensure_model()), providers=["CPUExecutionProvider"]
     )
 
 

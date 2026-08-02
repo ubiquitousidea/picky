@@ -441,6 +441,39 @@ Key invariants that cut across files:
   `sam.download_model` is public because this is the second module to fetch
   pinned ONNX weights into `data/models/`; the atomic-write contract must not
   exist as two copies.
+- **The embedding pass is warmed off the request, and the map does not depend on
+  it.** `server/embed_job.py` runs the download-and-embed on a daemon thread;
+  `POST /api/embedding-map/prepare` starts it and `GET …/progress` reports
+  `{state, phase, done, total, error}`. This exists because the first run is a
+  ~335 MB download plus a pass over the library, and inside one blocking GET
+  that is indistinguishable from a hung server. But `GET /api/embedding-map`
+  still embeds whatever it finds missing, so the job is **only ever an
+  optimization**: the map is correct if nobody prepared, if the job died, or if
+  both run at once — concurrent passes write the same vector for the same image
+  through `db.set_embedding`, so the worst case is computing one twice. Keep it
+  that way; a prepare the map *required* would be a second source of truth.
+  Four details are load-bearing. `start()` marks the job running **inside the
+  lock, before** deciding what it involves, so two concurrent prepares (sync
+  endpoints, hence a threadpool) cannot both spawn a thread — and the pre-check
+  that follows is wrapped, because an exception there would otherwise latch
+  `running` forever with nothing running. It answers `done` **synchronously**
+  when nothing is pending and the weights are on disk, which is every open after
+  the first: that is what keeps the common case at one round trip and no poll
+  (~90 ms end to end) rather than paying a poll interval to be told there was no
+  work. It does **not** latch `done` — a finished pass says nothing about images
+  uploaded since, and re-running skips cached vectors. And `download_model`'s
+  `on_progress` fires *only while bytes move*, so `_downloading` sets
+  `phase="download"` per chunk rather than once up front: an already-downloaded
+  model never shows a download phase at all, and no caller has to ask a second
+  question to find out whether a fetch happened. Note `done`/`total` change
+  units with the phase (bytes, then images), which is why `embedJobText()` gives
+  each phase its own sentence instead of driving one bar whose numbers silently
+  change meaning halfway through. On the frontend `prepareEmbedMap()` returns
+  false when the dialog closed mid-poll *or* the pass failed, and `openEmbedMap`
+  only calls `loadEmbedMap()` on true — falling through to the blocking endpoint
+  after a failure would repeat the entire download to arrive at the same error.
+  Its stale check is `embedMap.seq`, the same counter `loadEmbedMap` and
+  `closeEmbedMap` use, so closing the modal abandons the poll at the next tick.
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
   ALTER TABLE) — user databases contain real work, never require a wipe.
 - **Node ids are topological.** `GET /api/images/{id}/tree` returns nodes

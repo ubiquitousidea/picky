@@ -102,7 +102,9 @@ restarts.
   nudges the map rather than reshuffling it; **t-SNE** draws tighter clumps but
   its layout is not comparable between runs. Points are painted in each photo's
   average color. Model weights (~335 MB) download on first use, and each image
-  is embedded once (~12 ms) and cached.
+  is embedded once (~12 ms) and cached. That first run reports itself — the
+  status line counts the megabytes down and then the images — instead of leaving
+  the modal blank for a minute.
 - **Preview zoom** — scroll to zoom (cursor-anchored), drag to pan,
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect

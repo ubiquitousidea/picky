@@ -90,22 +90,35 @@ def _model_path(kind: str) -> Path:
     return path
 
 
-def download_model(url: str, dest: Path) -> None:
+def download_model(url: str, dest: Path, on_progress=None) -> None:
     """Fetch to a tmp file and os.replace() into place, so a crashed download
     never leaves a truncated model where the existence check would trust it.
 
     Public because `embed.py` fetches its CLIP weights the same way: the atomic
     write and the pinned-revision contract in this module's docstring must not
     exist as two copies that can drift apart.
+
+    `on_progress(bytes_done, bytes_total)` is called once per chunk, and only
+    while bytes are actually moving — so a caller can tell "downloading" from
+    "already on disk" without asking a second question. `bytes_total` is None
+    when the server sends no Content-Length. This is what lets the Image map's
+    prepare job say *which* minute of the first run you are in; nothing else
+    passes a callback, and the default keeps these downloads silent.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "wb") as out, urllib.request.urlopen(url, timeout=60) as resp:
+            length = resp.headers.get("Content-Length")
+            total = int(length) if length and length.isdigit() else None
+            done = 0
             while chunk := resp.read(1 << 20):
                 out.write(chunk)
                 digest.update(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
         os.replace(tmp, dest)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
