@@ -20,6 +20,8 @@ const state = {
   selection: { value: null, nodeId: null, imageId: null },
   // Preview runs by default; the checkbox is how you get back to the original.
   livePreview: true,
+  // The filmstrip is off by default — the Image map is the picker it defers to.
+  filmstrip: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -62,6 +64,18 @@ async function refreshGallery() {
   }
 }
 
+// The filmstrip is the last row of the bar, so showing it never reorders
+// anything above — the preview simply gives up the height.
+function setFilmstrip(on) {
+  state.filmstrip = on;
+  localStorage.setItem("picky:filmstrip", on ? "1" : "");
+  $("film-section").hidden = !on;
+  $("film-btn").classList.toggle("on", on);
+  // the strip scrolls, and the selected image is anywhere in the library
+  if (on) document.querySelector("#gallery li.selected")
+    ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+}
+
 async function selectImage(imageId, nodeId = null) {
   if (imageId !== state.imageId) {
     resetZoom();
@@ -100,7 +114,11 @@ function renderSelection() {
   // same choke point the effect preview does. `false`: we are already repainting.
   exitCropMode(false);
   document.querySelectorAll("#gallery li").forEach((li, i) => {
-    li.classList.toggle("selected", state.images[i]?.id === state.imageId);
+    const on = state.images[i]?.id === state.imageId;
+    li.classList.toggle("selected", on);
+    // the strip scrolls sideways, so the current image can be off its end —
+    // most visibly right after an upload, which lands at one
+    if (on && state.filmstrip) li.scrollIntoView({ inline: "nearest", block: "nearest" });
   });
   const hasImage = state.imageId !== null;
   $("preview-wrap").hidden = !hasImage;
@@ -109,7 +127,7 @@ function renderSelection() {
   $("delete-btn").hidden = !hasImage;
   $("export-btn").hidden = !hasImage;
   $("apply-btn").disabled = !hasImage;
-  $("crop-section").hidden = !hasImage;
+  $("frame-btn").disabled = !hasImage;
   if (hasImage) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
@@ -1533,9 +1551,25 @@ function initCropOverlay() {
   // from whatever just loaded — hence paint(), not drawCropOverlay() alone.
   $("preview").addEventListener("load", () => cropTool.armed?.paint());
 
-  $("crop-section").addEventListener("toggle", () => {
-    if ($("crop-section").open) enterCropMode();
-    else exitCropMode(true);
+  // show(), not showModal(): the frame is dragged on the preview underneath,
+  // which showModal() would make inert — the same constraint openEdit() lives
+  // under, taken the other way. Opening the dialog and entering crop mode are
+  // one thing, so `close` is the single teardown path however it was reached;
+  // exitCropMode() closes the dialog in turn, and its own `crop.active` guard is
+  // what stops the two re-entering each other.
+  $("frame-btn").onclick = () => {
+    $("crop-modal").show();
+    enterCropMode();
+  };
+  $("crop-modal").addEventListener("close", () => exitCropMode(true));
+  $("crop-close-btn").onclick = () => $("crop-modal").close();
+  // Only *modal* dialogs get Esc from the platform, so the one dialog that
+  // deliberately is not one has to listen for it — otherwise Frame would be the
+  // single panel in the app that Esc could not dismiss. The `:modal` guard is
+  // for the case where something else is up: that dialog owns the key.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !$("crop-modal").open) return;
+    if (!document.querySelector("dialog:modal")) $("crop-modal").close();
   });
   $("crop-save-btn").onclick = saveCrop;
   $("crop-reset-btn").onclick = () => {
@@ -1651,7 +1685,7 @@ function exitCropMode(repaint) {
     URL.revokeObjectURL(crop.url);
     crop.url = null;
   }
-  $("crop-section").open = false;
+  $("crop-modal").close(); // a no-op when the close event is what got us here
   if (repaint) renderSelection();
 }
 
@@ -2484,8 +2518,11 @@ const cluster = {
 async function updateClusterPlot() {
   const node = state.nodes.find((n) => n.id === state.nodeId);
   const show = !!node && node.effect === "posterize";
-  $("cluster-section").hidden = !show;
+  // the plot lives in a dialog now, so selecting a posterize node only offers
+  // it — it does not open it
+  $("cluster-btn").hidden = !show;
   if (!show) {
+    $("cluster-modal").close();
     stopClusterLoop();
     cluster.nodeId = null;
     return;
@@ -2502,12 +2539,23 @@ async function updateClusterPlot() {
       cluster.centroids = [];
     }
   }
-  startClusterLoop();
+  // Only spin while the dialog is up: the loop is animation, and animating
+  // behind a closed dialog is a frame budget spent on nothing. Moving between
+  // posterize nodes with the plot open re-points it at the new data in place.
+  if ($("cluster-modal").open) startClusterLoop();
 }
 
 function startClusterLoop() {
   if (cluster.raf) return;
   const tick = () => {
+    // The loop ends itself when the dialog goes away, rather than trusting every
+    // close path to remember to call stopClusterLoop(). One condition, checked
+    // where the cost is actually paid, is what keeps "it only spins while you
+    // are looking at it" true no matter how the dialog got dismissed.
+    if (!$("cluster-modal").open) {
+      cluster.raf = null;
+      return;
+    }
     if (cluster.spin) cluster.yaw += 0.004;
     drawClusterPlot();
     cluster.raf = requestAnimationFrame(tick);
@@ -2606,6 +2654,15 @@ function initClusterPlot() {
   });
   window.addEventListener("mouseup", () => (dragging = false));
   canvas.addEventListener("dblclick", () => (cluster.spin = !cluster.spin));
+
+  $("cluster-btn").onclick = () => {
+    $("cluster-modal").showModal();
+    startClusterLoop();
+  };
+  $("cluster-close-btn").onclick = () => $("cluster-modal").close();
+  // Esc closes without going through the button, and the loop would keep
+  // painting a canvas nobody can see
+  $("cluster-modal").addEventListener("close", stopClusterLoop);
 }
 
 // ---------- Image map (3D embedding scatter over the whole library) ----------
@@ -2614,8 +2671,8 @@ function initClusterPlot() {
 // embedding so photos of similar things land near each other. Deliberately a
 // sibling of the cluster plot rather than a generalization of it: they share
 // the projection *math* (copied below) but nothing else — that one plots pixels
-// of one node in RGB space and lives in the side panel, this one plots every
-// image of the library in a fitted space and lives in a modal.
+// of one node in RGB space, this one plots every image of the library in a
+// fitted space, and it owns the whole viewport rather than a small dialog.
 const embedMap = {
   points: [],
   method: "pca",
@@ -3359,8 +3416,16 @@ async function init() {
   $("delete-btn").onclick = deleteImage;
   $("save-preset-btn").onclick = savePreset;
 
+  // The Image map is the intended way to pick an image, so the filmstrip is
+  // opt-in — only an explicit "1" turns it on. Like livePreview's, the choice
+  // outlives the session.
+  setFilmstrip(localStorage.getItem("picky:filmstrip") === "1");
+  $("film-btn").onclick = () => setFilmstrip(!state.filmstrip);
+
   $("stats-btn").onclick = openStats;
   $("stats-close-btn").onclick = () => $("stats-modal").close();
+  $("presets-btn").onclick = () => $("presets-modal").showModal();
+  $("presets-close-btn").onclick = () => $("presets-modal").close();
   $("edit-cancel-btn").onclick = () => closeEdit(true);
   $("edit-save-btn").onclick = saveEdit;
   $("edit-params").addEventListener("input", schedulePreview);

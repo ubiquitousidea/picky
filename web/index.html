@@ -7,20 +7,29 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <aside id="gallery-panel">
-    <header>
-      <h1>Picky</h1>
-      <label class="upload-btn">
-        + Add JPG
-        <input type="file" id="file-input" accept=".jpg,.jpeg,image/jpeg" hidden>
-      </label>
-    </header>
-    <ul id="gallery"></ul>
-    <footer id="gallery-footer">
-      <button id="embed-btn" title="See the whole library as a 3D cloud, with similar photos near each other">Image map</button>
-      <button id="stats-btn" title="Images, effects, and disk usage">Library stats</button>
-    </footer>
-  </aside>
+  <!-- The image owns the full width at the top; every control is a horizontal
+       row along the bottom edge. What used to be side-panel sections that are
+       not part of the pick → filter → apply loop are dialogs behind these
+       buttons instead — see #crop-modal, #presets-modal, #cluster-modal. -->
+  <header id="app-header">
+    <h1>Picky</h1>
+    <label class="upload-btn">
+      + Add JPG
+      <input type="file" id="file-input" accept=".jpg,.jpeg,image/jpeg" hidden>
+    </label>
+    <!-- Short labels: eight buttons at their old panel-width wording wrapped to
+         three lines on a phone. The title carries the full description. -->
+    <div id="header-tools">
+      <button id="embed-btn" title="See the whole library as a 3D cloud, with similar photos near each other">Map</button>
+      <button id="film-btn" title="Show a filmstrip of the library along the bottom">Film</button>
+      <button id="frame-btn" title="Crop and straighten the finished image" disabled>Frame</button>
+      <button id="presets-btn" title="Save and replay a chain of effects">Presets</button>
+      <button id="cluster-btn" hidden title="See this posterize node's colors as a 3D plot">RGB</button>
+      <button id="stats-btn" title="Images, effects, and disk usage">Stats</button>
+      <a id="export-btn" hidden download title="Download this node's render as a JPG">Export</a>
+      <button id="delete-btn" hidden title="Delete this image and its whole work tree">Delete</button>
+    </div>
+  </header>
 
   <main id="preview-panel">
     <div id="drop-hint">Drop a JPG anywhere, or use “Add JPG”</div>
@@ -32,17 +41,11 @@
     <div id="zoom-hud" hidden>scroll to zoom · drag to pan · double-click to reset</div>
   </main>
 
-  <section id="tree-section">
-    <div id="tree"></div>
-  </section>
-
-  <aside id="side-panel">
-    <section id="select-section">
-      <h2>1 · Select</h2>
-      <div id="select-controls"></div>
-    </section>
+  <!-- Row order is the workflow: choose an effect, say what it applies to, see
+       where you are in the tree. The filmstrip is last so toggling it on never
+       reorders anything above it. -->
+  <footer id="control-bar">
     <section id="effects-section">
-      <h2>2 · Effect</h2>
       <div id="effect-buttons" role="group" aria-label="Effect"></div>
       <div id="effect-params"></div>
       <div id="preview-row">
@@ -54,36 +57,53 @@
       </div>
       <button id="apply-btn" disabled>Apply</button>
     </section>
-    <details id="crop-section">
-      <summary>3 · Frame</summary>
-      <div id="crop-controls"></div>
-      <div class="modal-actions">
-        <span id="crop-status">rendering…</span>
-        <button id="crop-reset-btn">Reset</button>
-        <button id="crop-save-btn">Save frame</button>
-      </div>
-    </details>
-    <details id="presets-section">
-      <summary>Presets</summary>
-      <button id="save-preset-btn" disabled>Save chain as preset</button>
-      <ul id="preset-list"></ul>
-    </details>
-    <details id="cluster-section" hidden>
-      <summary>RGB clusters</summary>
-      <canvas id="cluster-canvas" width="268" height="268"></canvas>
-      <div class="hint">drag to rotate · double-click to pause spin</div>
-    </details>
-    <section id="actions-section">
-      <a id="export-btn" hidden download>Export JPG</a>
-      <button id="delete-btn" hidden>Delete image</button>
+    <section id="select-section">
+      <div id="select-controls"></div>
     </section>
-  </aside>
+    <section id="tree-section">
+      <div id="tree"></div>
+    </section>
+    <section id="film-section" hidden>
+      <ul id="gallery"></ul>
+    </section>
+  </footer>
 
   <dialog id="stats-modal">
     <h2>Library</h2>
     <div id="stats-body"></div>
     <div class="modal-actions">
       <button id="stats-close-btn">Close</button>
+    </div>
+  </dialog>
+
+  <!-- Opened with show(), not showModal(): framing is dragged on the preview
+       image, which showModal() would make inert. See enterCropMode(). -->
+  <dialog id="crop-modal">
+    <h2>Frame</h2>
+    <div id="crop-controls"></div>
+    <div class="modal-actions">
+      <span id="crop-status">rendering…</span>
+      <button id="crop-reset-btn">Reset</button>
+      <button id="crop-save-btn">Save frame</button>
+      <button id="crop-close-btn">Done</button>
+    </div>
+  </dialog>
+
+  <dialog id="presets-modal">
+    <h2>Presets</h2>
+    <button id="save-preset-btn" disabled>Save chain as preset</button>
+    <ul id="preset-list"></ul>
+    <div class="modal-actions">
+      <button id="presets-close-btn">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="cluster-modal">
+    <h2>RGB clusters</h2>
+    <canvas id="cluster-canvas" width="268" height="268"></canvas>
+    <div class="hint">drag to rotate · double-click to pause spin</div>
+    <div class="modal-actions">
+      <button id="cluster-close-btn">Close</button>
     </div>
   </dialog>
 

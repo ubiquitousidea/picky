@@ -198,10 +198,36 @@ one place silently breaks another.
   stale `app.js` against a new backend produces phantom UI bugs.
 - **Modals are native `<dialog>`.** Esc closes one without going through its
   buttons, so each listens for `close` to run the same teardown (guarded by a
-  sentinel) — for the Image map that is what stops a `requestAnimationFrame` loop
-  spinning behind a hidden dialog.
-- The side panel is ordered by the workflow: **1 · Select**, **2 · Effect**,
-  **3 · Frame** (a `<details>` whose open state *is* crop mode), then Presets and
-  the RGB cluster plot as collapsed reference, with Export/Delete pinned to the
-  bottom. The work tree is a horizontal strip under the preview.
+  sentinel).
+- **Frame is the one dialog opened with `show()`, not `showModal()`** — the crop
+  rectangle is dragged on the preview underneath, which a modal would make inert
+  (the same inertness `openEdit()` documents as its reason for not re-picking).
+  Being non-modal costs it the platform's Esc handling, so `initCropOverlay()`
+  wires a `keydown` for it, guarded by `dialog:modal` so a real modal keeps the
+  key. Opening the dialog and entering crop mode are one thing: `exitCropMode()`
+  closes it, `close` re-enters `exitCropMode()`, and the `crop.active` guard is
+  what makes that loop terminate.
+- **A `requestAnimationFrame` loop ends itself**; it does not trust callers to
+  stop it. The RGB cluster plot's `tick` returns when `#cluster-modal` is closed,
+  so "it only spins while you are looking at it" holds however the dialog was
+  dismissed — a `close` listener alone would be one forgotten path from a leak.
+- **The page is one column**: a header of dialog-openers, the image at full width,
+  and a `#control-bar` of horizontal rows along the bottom — effect + params +
+  Apply, then the selection's controls with its saved masks as a strip, then the
+  work tree, then the filmstrip. It replaced a three-column desktop grid so the
+  app fits a portrait screen; there are no media queries, and `body > *` needs
+  `min-width: 0` or a grid item's automatic minimum size widens the single column
+  past the viewport and `scrollIntoView()` starts scrolling the whole page.
+- **The bar's rows scroll; the two rows that must not hide anything wrap.**
+  Effect and selection controls wrap (Apply is the app's primary action), while
+  the mask strip, the tree and the filmstrip scroll sideways — a scroller is only
+  right where the content is a list you pan through.
+- **Bar layout is scoped to `#effect-params` / `#select-controls`, never written
+  into `.param-row` or `.sel-mask-list` themselves.** `buildParamControls()` and
+  `appendSelectionControls()` build into the edit modal too, where the stacked
+  column and the mask *grid* are the right shapes. The scoping is what lets one
+  component render as a row in the bar and a column in the dialog.
+- **The filmstrip is opt-in** (`picky:filmstrip` in localStorage, off by
+  default): the Image map is the intended picker. It is the bar's last row, so
+  toggling it never reorders anything above it.
 - Deep links `?image=N&node=M` override the localStorage last-image.

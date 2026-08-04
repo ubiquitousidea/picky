@@ -25,20 +25,25 @@
   --rb-sand: #c2ab94;
 }
 
-/* The gallery and the side panel run the full height; the middle column splits
-   into the preview and, under it, the work tree's horizontal strip. */
+/* The image gets the full width between a thin header and the control bar; the
+   bar's rows are `auto` and the preview takes whatever is left. dvh rather than
+   vh so mobile browser chrome cannot push the bar off the bottom. */
 body {
   display: grid;
-  grid-template-columns: 220px 1fr 300px;
-  grid-template-rows: 1fr auto;
-  height: 100vh;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr auto;
+  height: 100dvh;
+  overflow: hidden;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
-#gallery-panel, #side-panel { grid-row: 1 / 3; }
-#preview-panel { grid-row: 1; grid-column: 2; }
-#tree-section { grid-row: 2; grid-column: 2; }
+/* A grid item's automatic minimum size is its min-content width, which would
+   let the header's button row widen the single `1fr` column past the viewport —
+   and then the tree's scrollIntoView() would scroll the whole page sideways.
+   min-width:0 pins the column to the viewport and makes the rows wrap and
+   scroll within it, which is the whole point of the layout. */
+body > * { min-width: 0; }
 
 h1 {
   font-size: 1.25rem;
@@ -49,75 +54,83 @@ h1 {
   background-clip: text;
   color: transparent;
 }
-h2, summary {
+h2 {
   font-size: 0.85rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-bottom: 0.6rem;
 }
-#select-section h2 { color: var(--rb-teal); }
-#effects-section h2 { color: var(--rb-orange); }
-#crop-section summary { color: var(--rb-sand); }
-#presets-section summary { color: var(--rb-teal); }
-#cluster-section summary { color: var(--rb-violet); }
 #stats-modal h2 { color: var(--rb-blue); }
 #edit-modal h2 { color: var(--rb-orange); }
 #embed-modal h2 { color: var(--rb-green); }
-/* Presets and the cluster plot are reference material, not part of the
-   pick → filter → apply loop, so they collapse out of the way by default. */
-summary { cursor: pointer; }
-details[open] > summary { margin-bottom: 0.6rem; }
+#crop-modal h2 { color: var(--rb-sand); }
+#presets-modal h2 { color: var(--rb-teal); }
+#cluster-modal h2 { color: var(--rb-violet); }
 
+/* The 268x268 backing store in the markup was sized for the old side panel; the
+   dialog is a little wider, so aspect-ratio keeps the CSS box square and the
+   projection (which reads canvas.width/height) undistorted. */
 #cluster-canvas {
   width: 100%;
+  aspect-ratio: 1;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   cursor: grab;
 }
 #cluster-canvas:active { cursor: grabbing; }
-#cluster-section .hint {
+#cluster-modal .hint {
   font-size: 0.7rem;
   color: var(--muted);
   text-align: center;
   margin-top: 0.3rem;
 }
 
-/* Gallery */
-#gallery-panel {
-  background: var(--panel);
-  border-right: 1px solid var(--border);
+/* Header — the title, the uploader, and everything that is not part of the
+   pick → filter → apply loop, each opening a dialog. It wraps rather than
+   scrolls: a control you cannot see is worse than a two-line header. */
+#app-header {
   display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-#gallery-panel header {
-  padding: 1rem;
-  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
-#gallery-footer {
-  padding: 0.5rem;
-  border-top: 1px solid var(--border);
+#header-tools {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
   gap: 0.4rem;
+  margin-left: auto;
+  min-width: 0; /* or the row keeps its max-content width and never wraps */
 }
-#stats-btn,
-#embed-btn {
-  width: 100%;
+/* one shape for every header button; the hover hue is what tells them apart,
+   carried over from when these lived in their own coloured panel sections */
+#header-tools > * {
   background: transparent;
   border: 1px solid var(--border);
   color: var(--muted);
-  padding: 0.4rem;
+  padding: 0.25rem 0.45rem;
   border-radius: 6px;
-  font-size: 0.75rem;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  font-family: inherit;
+  text-decoration: none;
   cursor: pointer;
 }
+#header-tools > *:disabled { opacity: 0.4; cursor: default; }
 #stats-btn:hover { border-color: var(--rb-blue); color: var(--rb-blue); }
 #embed-btn:hover { border-color: var(--rb-green); color: var(--rb-green); }
+#film-btn:hover, #presets-btn:hover { border-color: var(--rb-teal); color: var(--rb-teal); }
+#frame-btn:hover:not(:disabled) { border-color: var(--rb-sand); color: var(--rb-sand); }
+#cluster-btn:hover { border-color: var(--rb-violet); color: var(--rb-violet); }
+#export-btn:hover { border-color: var(--rb-green); color: var(--rb-green); }
+#delete-btn:hover { border-color: var(--rb-red); color: var(--rb-red); }
+/* the filmstrip toggle is the one header button with a state to show */
+#film-btn.on { border-color: var(--rb-teal); color: var(--rb-teal); background: var(--panel-2); }
 .upload-btn {
   background: var(--panel-2);
   border: 1px solid var(--rb-blue);
@@ -128,38 +141,52 @@ details[open] > summary { margin-bottom: 0.6rem; }
   cursor: pointer;
 }
 .upload-btn:hover { background: var(--rb-blue); color: var(--bg); }
+/* The filmstrip — opt-in, since the Image map is the intended picker. Same
+   thumbnail treatment as the old gallery column, laid out along the row. */
 #gallery {
   list-style: none;
-  overflow-y: auto;
-  padding: 0.5rem;
-  flex: 1;
+  display: flex;
+  flex-direction: row;
+  gap: 0.4rem;
 }
 #gallery li {
+  flex: none;
+  width: 84px;
   border-radius: 8px;
-  padding: 0.4rem;
+  padding: 0.25rem;
   cursor: pointer;
-  margin-bottom: 0.4rem;
   border: 2px solid transparent;
 }
 #gallery li.selected { border-color: var(--rb-teal); background: var(--panel-2); }
-#gallery li img { width: 100%; border-radius: 4px; display: block; }
+/* a fixed box rather than the column's full-bleed thumbnails: the strip is a
+   row of the bar, and a portrait photo would otherwise make it twice as tall as
+   the work tree's row and eat the preview */
+#gallery li img {
+  width: 100%;
+  height: 58px;
+  object-fit: cover;
+  border-radius: 4px;
+  display: block;
+}
 #gallery li .name {
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   color: var(--rb-teal);
-  margin-top: 0.25rem;
+  margin-top: 0.2rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Preview */
+/* Preview — min-height:0 is what lets the 1fr row actually shrink under the
+   bar; without it a grid row refuses to go below its content's size. */
 #preview-panel {
   position: relative;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  padding: 1rem;
+  padding: 0.5rem;
 }
 /* The wrapper fills the panel and carries the zoom/pan transform, so the
    image and the mask overlay move as one. It has to fill (not shrink-wrap):
@@ -229,25 +256,48 @@ details[open] > summary { margin-bottom: 0.6rem; }
 }
 body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offset: -12px; }
 
-/* Side panel */
-#side-panel {
+/* Control bar — a stack of horizontal rows along the bottom edge. Every row is
+   its own scroller, so a long mask list and a long work tree scroll
+   independently and neither can push the other off screen. */
+#control-bar {
   background: var(--panel);
-  border-left: 1px solid var(--border);
-  padding: 1rem;
+  border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
-  overflow-y: auto;
+  min-height: 0;
 }
+#control-bar > section {
+  flex: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.4rem 0.6rem;
+}
+#control-bar > section + section { border-top: 1px solid var(--border); }
+#control-bar > section[hidden] { display: none; }
+/* Step 2 — the effect, its params, and Apply on one line where there is room.
+   It wraps rather than scrolls, unlike the rows below: Apply is the primary
+   action of the whole app, and hiding it off the end of a scroller would be a
+   worse trade than a second line. */
+#effects-section {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+#effects-section > * { flex: none; }
+#apply-btn { margin-left: auto; }
 /* icon buttons; each takes its color from the .fx-* class it also carries */
 #effect-buttons {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  display: flex;
+  flex-direction: row;
   gap: 0.35rem;
-  margin-bottom: 0.6rem;
 }
+/* a fixed square, not aspect-ratio against a fractional track: in a flex row
+   there is no track to be a fraction of, and the icons would grow unbounded */
 .fx-btn {
-  aspect-ratio: 1;
+  width: 2.4rem;
+  height: 2.4rem;
   padding: 0.3rem;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -277,9 +327,11 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   color: var(--text);
   border: 1px solid var(--border);
 }
-/* modelled on #cluster-canvas, but sized in % so the one canvas fits both the
-   300px side panel and the narrower edit modal. `color` is what the curve and
-   its handles are drawn in — canvas has no currentColor to inherit. */
+/* modelled on #cluster-canvas, but sized in % so the one canvas fills whatever
+   column it is dropped into — the edit modal's. The control bar overrides it to
+   a fixed square (see #effect-params below), since a percentage of a row that
+   wide would be taller than the page. `color` is what the curve and its handles
+   are drawn in — canvas has no currentColor to inherit. */
 .curve-canvas {
   width: 100%;
   aspect-ratio: 1;
@@ -305,6 +357,22 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   text-align: center;
   margin-top: 0.3rem;
 }
+
+/* The bar lays the same controls out in a line. Every rule here is scoped to an
+   ancestor in the bar rather than written into .param-row itself, because
+   buildParamControls() and appendSelectionControls() also build into the edit
+   modal, where the stacked layout above is the right one. Change these and the
+   modal is unaffected — which is the point. */
+#effect-params {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+#effect-params .param-row { flex: none; min-width: 8rem; margin-bottom: 0; }
+#effect-params .curve-canvas { width: 120px; height: 120px; aspect-ratio: auto; }
+#effect-params .param-row .hint { margin-top: 0.15rem; }
+
 /* Click-to-segment selection controls */
 .sel-row { display: flex; align-items: center; gap: 0.4rem; }
 .sel-row + .sel-row { margin-top: 0.35rem; }
@@ -347,9 +415,52 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   color: var(--text);
 }
 .sel-invert input { accent-color: var(--rb-teal); }
+
+/* Step 1 in the bar: the picker, its options and Save on the left, then the
+   saved masks as a strip running parallel to the work tree's row below. Scoped
+   for the same reason #effect-params is — the edit modal builds this control
+   too, and there it stays a stacked column with a grid of masks. */
+#select-controls .param-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.5rem;
+  margin-bottom: 0;
+}
+#select-controls .param-row > label {
+  flex: none;
+  display: block;
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+#select-controls .sel-coords { margin-left: 0.35rem; }
+#select-controls .sel-row { flex: none; }
+#select-controls .sel-row + .sel-row { margin-top: 0; }
+#select-controls .sel-pick { flex: none; }
+/* an explicit width, because the base `.param-row select { width: 100% }` is
+   circular in a shrink-to-fit row — the select claims the whole row and the
+   invert checkbox gets laid out on top of the next control */
+#select-controls .sel-level { flex: none; width: 11rem; }
+#select-controls .sel-save-mask { flex: none; width: auto; margin-top: 0; }
+/* the strip takes a line of its own once the picker's controls have had theirs,
+   which is what puts it parallel to the work tree's row below */
+#select-controls .sel-mask-list {
+  display: flex;
+  flex-direction: row;
+  flex: 1 1 100%;
+  min-width: 0;
+  gap: 0.35rem;
+  margin-top: 0;
+  overflow-x: auto;
+}
+#select-controls .mask-chip { flex: none; width: 52px; }
+/* the empty-state line has no grid column to span here, and would otherwise
+   wrap to one word per line in a flex row */
+#select-controls .sel-mask-list .hint { flex: none; white-space: nowrap; }
+
 #apply-btn {
-  width: 100%;
-  padding: 0.5rem;
+  padding: 0.5rem 1rem;
   border: 1px solid var(--rb-orange);
   border-radius: 6px;
   background: transparent;
@@ -364,8 +475,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #preview-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 0.5rem;
+  gap: 0.4rem;
   font-size: 0.8rem;
 }
 #live-preview-label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
@@ -374,10 +484,6 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
    the row never reflows when a render starts */
 #preview-status, #crop-status { color: var(--muted); font-size: 0.7rem; visibility: hidden; }
 #preview-status.busy, #crop-status.busy { visibility: visible; }
-/* the frame panel borrows the modals' action row, but it lives in the flow of
-   the side panel rather than at the foot of a dialog */
-#crop-section .modal-actions { margin-top: 0.6rem; }
-#crop-section[hidden] { display: none; }
 #crop-save-btn { border-color: var(--rb-sand); color: var(--rb-sand); }
 #crop-save-btn:hover:not(:disabled) { background: var(--rb-sand); color: var(--bg); }
 /* the straighten tool, in the Frame section's sand where .sel-pick is teal —
@@ -395,15 +501,9 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .crop-level:hover { background: var(--rb-sand); color: var(--bg); }
 .crop-level.armed { background: var(--rb-sand); color: var(--bg); }
 
-/* Work tree — a horizontal strip under the preview, one column per node in id
-   order, with the commit-graph lanes running left to right above the chips. */
-#tree-section {
-  border-top: 1px solid var(--border);
-  background: var(--panel);
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding: 0.5rem 0.75rem;
-}
+/* Work tree — a row of the control bar (which supplies the border, padding and
+   horizontal scroll), one column per node in id order, with the commit-graph
+   lanes running left to right above the chips. */
 #tree {
   display: flex;
   flex-direction: row;
@@ -468,35 +568,6 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .tree-node:hover .node-del { visibility: visible; }
 .node-edit:hover { color: var(--rb-yellow); background: var(--panel); }
 .node-del:hover { color: var(--rb-red); background: var(--panel); }
-
-/* Actions — per-image, not part of the editing loop, so they sit at the bottom */
-#actions-section {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  margin-top: auto;
-  font-size: 0.8rem;
-}
-#export-btn {
-  display: block;
-  text-align: center;
-  text-decoration: none;
-  padding: 0.45rem;
-  border: 1px solid var(--rb-green);
-  color: var(--rb-green);
-  border-radius: 6px;
-}
-#export-btn:hover { background: var(--rb-green); color: var(--bg); }
-#delete-btn {
-  width: 100%;
-  padding: 0.45rem;
-  border: 1px solid var(--rb-red);
-  background: transparent;
-  color: var(--rb-red);
-  border-radius: 6px;
-  cursor: pointer;
-}
-#delete-btn:hover { background: var(--rb-red); color: var(--bg); }
 
 /* Presets and saved masks — same row/button shapes, different hue */
 #save-preset-btn, .sel-save-mask {
@@ -603,6 +674,19 @@ dialog {
   overflow-y: auto;
 }
 dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
+/* Frame is the one dialog opened with show() rather than showModal(), because
+   the crop rectangle is dragged on the preview underneath and showModal() would
+   make it inert. So it parks against the right edge instead of centring over
+   what you are framing — and, being non-modal, it gets no backdrop to dim it. */
+#crop-modal {
+  position: fixed;
+  margin: 0;
+  top: 50%;
+  left: auto; /* the UA sheet sets left:0 on dialogs, which would beat `right` */
+  right: 1rem;
+  transform: translateY(-50%);
+  width: 260px;
+}
 .modal-actions {
   display: flex;
   align-items: center;
