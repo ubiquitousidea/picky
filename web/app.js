@@ -2621,6 +2621,11 @@ const embedMap = {
   method: "pca",
   yaw: 0.8,
   pitch: -0.45,
+  // zoom multiplies the derived world→screen scale, pan offsets the projected
+  // result — so both live in backing-store pixels, like everything else here.
+  zoom: 1,
+  panX: 0,
+  panY: 0,
   spin: true,
   raf: null,
   selected: null,
@@ -2634,9 +2639,21 @@ const EMBED_HIT_PX = 14; // click tolerance, in backing-store pixels
 const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a click
 const EMBED_POLL_MS = 400;
 
+// Zoomed all the way out there is only one sensible framing — the whole cloud,
+// centred — so 1x and "no pan" are the same state, and reaching either restores
+// both. That is what saves the map a reset button it has no room for.
+function resetEmbedView() {
+  embedMap.zoom = 1;
+  embedMap.panX = 0;
+  embedMap.panY = 0;
+}
+
 async function openEmbedMap() {
   embedMap.open = true;
   embedMap.selected = null;
+  // yaw/pitch persist across opens on purpose, but the framing does not: a map
+  // reopened still parked at 16x on some corner reads as a broken map.
+  resetEmbedView();
   $("embed-card").hidden = true;
   $("embed-status").textContent = "Preparing…";
   $("embed-modal").showModal();
@@ -2712,7 +2729,7 @@ async function loadEmbedMap() {
     if (seq !== embedMap.seq || !embedMap.open) return; // stale or closed meanwhile
     embedMap.points = data.points;
     $("embed-status").textContent = data.points.length
-      ? `${data.points.length} images · drag to rotate · click a point · double-click to pause`
+      ? `${data.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to pause`
       : "No images yet.";
     startEmbedLoop();
   } catch (err) {
@@ -2754,19 +2771,24 @@ function drawEmbedMap() {
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
   // coordinates arrive normalized into the unit cube, whose half-diagonal is √3
-  const scale = (Math.min(w, h) / 2 - 14) / Math.sqrt(3);
+  const scale = ((Math.min(w, h) / 2 - 14) / Math.sqrt(3)) * embedMap.zoom;
   const cy = Math.cos(embedMap.yaw);
   const sy = Math.sin(embedMap.yaw);
   const cp = Math.cos(embedMap.pitch);
   const sp = Math.sin(embedMap.pitch);
   // the same orthographic yaw-then-pitch projection drawClusterPlot() uses;
-  // z comes back only to sort by depth
+  // z comes back only to sort by depth. Zoom and pan ride along here and
+  // nowhere else, so the wireframe cube below stays welded to the cloud.
   const project = (x, y, z) => {
     const x1 = x * cy + z * sy;
     const z1 = z * cy - x * sy;
     const y1 = y * cp - z1 * sp;
     const z2 = y * sp + z1 * cp;
-    return [w / 2 + x1 * scale, h / 2 - y1 * scale, z2];
+    return [
+      w / 2 + embedMap.panX + x1 * scale,
+      h / 2 + embedMap.panY - y1 * scale,
+      z2,
+    ];
   };
 
   ctx.strokeStyle = "rgba(139, 147, 163, 0.25)";
@@ -2845,31 +2867,45 @@ function selectEmbedPoint(point) {
 function initEmbedMap() {
   const canvas = $("embed-canvas");
   let dragging = false;
+  let panning = false; // a secondary-button drag pans instead of rotating
   let lastX = 0;
   let lastY = 0;
   let downX = 0;
   let downY = 0;
 
   canvas.addEventListener("mousedown", (e) => {
+    // also what suppresses Windows Chrome's middle-click autoscroll
     e.preventDefault();
     dragging = true;
+    panning = e.button !== 0;
     lastX = downX = e.clientX;
     lastY = downY = e.clientY;
   });
+  // or the menu would land in the middle of a right-drag
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   // on window, not the canvas, so a drag survives leaving it
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    embedMap.yaw += (e.clientX - lastX) * 0.01;
-    embedMap.pitch += (e.clientY - lastY) * 0.01;
-    embedMap.pitch = Math.max(-1.5, Math.min(1.5, embedMap.pitch));
+    if (panning) {
+      // pan is applied after projection, so it takes screen deltas straight —
+      // scaled into backing-store pixels, the unit drawEmbedMap() works in
+      const dpr = window.devicePixelRatio || 1;
+      embedMap.panX += (e.clientX - lastX) * dpr;
+      embedMap.panY += (e.clientY - lastY) * dpr;
+    } else {
+      embedMap.yaw += (e.clientX - lastX) * 0.01;
+      embedMap.pitch += (e.clientY - lastY) * 0.01;
+      embedMap.pitch = Math.max(-1.5, Math.min(1.5, embedMap.pitch));
+    }
     lastX = e.clientX;
     lastY = e.clientY;
   });
   window.addEventListener("mouseup", (e) => {
     if (!dragging) return;
     dragging = false;
-    // A rotation gesture must not also pick a point, so a pointerup that
-    // barely moved is the only thing that counts as a click.
+    // A rotation or pan gesture must not also pick a point, so a left-button
+    // mouseup that barely moved is the only thing that counts as a click.
+    if (panning || e.button !== 0) return;
     if (Math.hypot(e.clientX - downX, e.clientY - downY) > EMBED_DRAG_PX) return;
     const rect = canvas.getBoundingClientRect();
     if (
@@ -2882,6 +2918,26 @@ function initEmbedMap() {
     );
   });
   canvas.addEventListener("dblclick", () => (embedMap.spin = !embedMap.spin));
+  // The preview panel's initZoom() arithmetic, in backing-store pixels against
+  // the canvas centre: keep whatever is under the cursor under the cursor.
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const next = Math.min(16, Math.max(1, embedMap.zoom * factor));
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const cx = (e.clientX - rect.left) * dpr - canvas.width / 2;
+      const cy = (e.clientY - rect.top) * dpr - canvas.height / 2;
+      const k = next / embedMap.zoom;
+      embedMap.panX = cx - (cx - embedMap.panX) * k;
+      embedMap.panY = cy - (cy - embedMap.panY) * k;
+      embedMap.zoom = next;
+      if (next === 1) resetEmbedView(); // scrolling back out reframes the cloud
+    },
+    { passive: false }
+  );
 
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;

@@ -647,15 +647,36 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   line-height: 1.4;
 }
 
-/* Image map — the 3D embedding cloud. Wide, unlike the 320px base dialog. */
-#embed-modal { width: min(92vw, 760px); }
+/* Image map — the 3D embedding cloud. Full viewport, unlike the 320px base
+   dialog: the cloud is the content, so everything else is a thin strip around
+   it. `overflow: hidden` is load-bearing — the base rule's `auto` would scroll
+   the dialog instead of letting the canvas grow into the height below. */
+#embed-modal {
+  width: 100vw;
+  max-width: 100vw;
+  height: 100dvh;
+  max-height: 100dvh;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+/* An id setting `display` outranks the UA's `dialog:not([open]) { display: none }`
+   — without this the closed dialog covers the whole app. The base `dialog` rule
+   never had to care because it sets no `display` at all. */
+#embed-modal:not([open]) { display: none; }
 #embed-header {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
+  align-items: center;
+  gap: 0.6rem;
 }
-#embed-method {
+/* pushes the method picker and Close together on the right */
+#embed-header h2 { margin-right: auto; }
+/* Close sits in the header rather than its own row, so it needs the chip look
+   #embed-method has instead of the `.modal-actions button` it left behind. */
+#embed-method, #embed-close-btn {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -663,13 +684,17 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   padding: 0.2rem 0.4rem;
   font-size: 0.75rem;
 }
+#embed-close-btn { padding: 0.2rem 0.7rem; cursor: pointer; }
+#embed-close-btn:hover { background: var(--panel); }
 /* the card floats over the canvas rather than displacing it, so picking points
-   never reflows the cloud you are picking them from */
-#embed-stage { position: relative; }
+   never reflows the cloud you are picking them from.
+   `min-height: 0` is what lets the stage shrink to the space left over instead
+   of insisting on its content's height. */
+#embed-stage { position: relative; flex: 1; min-height: 0; }
 #embed-canvas {
   display: block;
   width: 100%;
-  aspect-ratio: 4 / 3;
+  height: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -680,7 +705,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   position: absolute;
   right: 0.6rem;
   bottom: 0.6rem;
-  width: 150px;
+  width: 200px;
   padding: 0.5rem;
   background: var(--panel-2);
   border: 1px solid var(--rb-green);
@@ -715,8 +740,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   font-size: 0.7rem;
   color: var(--muted);
   text-align: center;
-  margin-top: 0.4rem;
-  min-height: 1em;
+  min-height: 1em; /* no margin: the dialog's flex `gap` spaces this strip */
 }
 
 /* Edit effect — anchored right so the live preview stays visible behind it */
