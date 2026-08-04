@@ -3045,7 +3045,7 @@ function drawEmbedMap() {
     }
   }
 
-  drawEmbedLabels(ctx, project, dpr);
+  drawEmbedLabels(ctx, project, dpr, fade);
 }
 
 // One text label per cluster, floated over the cloud where its images are.
@@ -3054,8 +3054,16 @@ function drawEmbedMap() {
 // with them: a label drawn in its own depth order disappears behind whatever
 // happens to be nearer, and in a dense collage that is most of them — which
 // would hide exactly the labels sitting on the busiest, most worth naming part
-// of the map. Being an overlay, it is the one thing here that ignores depth.
-function drawEmbedLabels(ctx, project, dpr) {
+// of the map. So a label is never *occluded*, but it still recedes: it shares
+// the sprites' `fade` curve, so a group at the back of the cloud is exactly as
+// far back as its own pictures.
+//
+// Note this fades by transparency where the sprites use a wash of the
+// background colour, which above is called out as the wrong thing to do. The
+// reason it inverts here is the same reason the pass exists: a wash preserves
+// overlap as a depth cue, and these never overlap anything. With occlusion
+// given up, alpha is the only depth cue a label has left.
+function drawEmbedLabels(ctx, project, dpr, fade) {
   const font = 13 * dpr;
   ctx.font = `600 ${font}px system-ui, sans-serif`;
   ctx.textBaseline = "middle";
@@ -3100,6 +3108,9 @@ function drawEmbedLabels(ctx, project, dpr) {
 
     const left = x - w / 2;
     const top = y - h / 2;
+    // `fade` tops out at a 0.5 wash, so the furthest label is drawn at half
+    // opacity — receding without becoming a thing you have to squint at.
+    ctx.globalAlpha = 1 - fade(cluster.p[2]);
     // A pill, not bare text: `fillText` over a collage of photographs is
     // unreadable about half the time, and which half changes as the cloud spins.
     ctx.beginPath();
@@ -3115,6 +3126,8 @@ function drawEmbedLabels(ctx, project, dpr) {
     ctx.fillStyle = "rgba(230, 233, 239, 0.45)";
     ctx.fillText(suffix, left + padX + textW, y + 0.5 * dpr);
   }
+  // The context is shared with the next frame's sprites, which assume 1.
+  ctx.globalAlpha = 1;
 }
 
 // Hit testing runs against the extents the last frame *drew* (`hw`/`hh`), not
