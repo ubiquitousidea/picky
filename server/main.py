@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import db, embed_job, rendering
+from . import db, embed_job, labels, rendering
 from .effects import (
     EFFECTS,
     crop_geometry,
@@ -206,6 +206,45 @@ def _project(vectors, method: str):
     return coords / extent if extent > 0 else coords
 
 
+MAX_CLUSTERS = 20
+
+
+def _auto_k(n: int) -> int:
+    """How many clusters to label a library of `n` images with.
+
+    Grows like sqrt(n) rather than linearly because the labels are read as a
+    legend over the cloud, not as an index of it: past a dozen they overlap, and
+    a cluster too small to see is a label pointing at nothing. ~8 at a hundred
+    images, still 12 at a thousand.
+    """
+    return max(2, min(12, round((n / 2) ** 0.5), n))
+
+
+def _cluster(vectors, k: int):
+    """Group the library in CLIP space, and name each group.
+
+    Clustering happens in the full 512-d embedding, *not* in the 3 dimensions
+    `_project` returns: the projection is a lossy shadow (PCA over CLIP keeps a
+    fraction of the variance, and t-SNE's between-cluster distances mean
+    nothing), so grouping there would name a group that only looks like one from
+    the current camera angle. Grouping here means the labels answer "what do
+    these photos have in common", which is the question.
+
+    Seeded, for exactly the reason `_project`'s t-SNE is: the map is looked at
+    repeatedly, and a library that reshuffles its labels between two identical
+    requests reads as broken.
+    """
+    from sklearn.cluster import KMeans
+
+    km = KMeans(n_clusters=k, n_init="auto", random_state=0).fit(vectors)
+    # A mean of unit vectors is not one, and `label_clusters` needs the dot
+    # product against the labels to be a cosine.
+    centroids = km.cluster_centers_.astype(np.float32)
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    centroids = np.divide(centroids, norms, out=np.zeros_like(centroids), where=norms > 0)
+    return km.labels_, labels.label_clusters(centroids)
+
+
 def _collect_embeddings(images: list[dict]):
     """Each image's vector (cached on its row, or computed now) and its point."""
     cached = db.get_embeddings()
@@ -232,7 +271,7 @@ def _collect_embeddings(images: list[dict]):
 
 
 @app.get("/api/embedding-map")
-def embedding_map(method: str = "pca"):
+def embedding_map(method: str = "pca", clusters: int = 0):
     """Every image as a point in 3D — the Image map's data.
 
     Library-scoped, unlike every other endpoint here, and necessarily so: the
@@ -246,13 +285,25 @@ def embedding_map(method: str = "pca"):
     regardless of whether anyone called `prepare` first. That is deliberately
     left in place: it makes the endpoint answerable on its own, and it means the
     prepare job is only ever an optimization that can be skipped or fail.
+
+    `clusters` is how many groups to label, or 0 to let `_auto_k` decide from the
+    library size — which is what the frontend sends until you touch the slider,
+    so the control can be initialized from the answer rather than duplicating the
+    formula.
+
+    Clustering and labelling are recomputed per request alongside the projection
+    and deliberately not cached. Both are milliseconds at this scale (k-means
+    over ~100x512, then one ~850x512 matrix product), and a cache keyed on
+    library state would be a second thing that can disagree with the map.
     """
     if method not in EMBED_METHODS:
         raise HTTPException(400, f"unknown method {method!r}")
+    if clusters and not 2 <= clusters <= MAX_CLUSTERS:
+        raise HTTPException(400, f"clusters must be 0 or 2..{MAX_CLUSTERS}")
 
     images = db.list_images()
     if not images:
-        return {"method": method, "points": []}
+        return {"method": method, "points": [], "clusters": []}
 
     vectors, points = _collect_embeddings(images)
     # Every vector must be the model's output width for the stack to be
@@ -265,10 +316,41 @@ def embedding_map(method: str = "pca"):
             db.clear_embedding(image["id"])
         vectors, points = _collect_embeddings(images)
 
-    coords = _project(np.vstack(vectors).astype(np.float32), method)
+    stacked = np.vstack(vectors).astype(np.float32)
+    coords = _project(stacked, method)
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
-    return {"method": method, "points": points}
+
+    k = min(clusters or _auto_k(len(points)), len(points))
+    if k < 2:
+        # One image is not a group, and has its own thumbnail to look at.
+        return {"method": method, "points": points, "clusters": []}
+    assignments, named = _cluster(stacked, k)
+
+    groups = []
+    for index, name in enumerate(named):
+        members = coords[assignments == index]
+        # The label's position is the mean of its members' *projected* coords,
+        # not the projection of its 512-d centroid. For PCA the two are the same
+        # point (projection is linear); for t-SNE the second does not exist at
+        # all, since t-SNE has no out-of-sample transform. Averaging afterwards
+        # is the only definition that works for both, and it is the one that
+        # puts the label where the pictures are.
+        centre = members.mean(axis=0)
+        groups.append(
+            {
+                "id": index,
+                "label": name["label"],
+                "score": name["score"],
+                "count": int(len(members)),
+                "x": float(centre[0]),
+                "y": float(centre[1]),
+                "z": float(centre[2]),
+            }
+        )
+    for point, index in zip(points, assignments):
+        point["cluster"] = int(index)
+    return {"method": method, "points": points, "clusters": groups}
 
 
 @app.post("/api/embedding-map/prepare")

@@ -687,7 +687,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-close-btn { padding: 0.2rem 0.7rem; cursor: pointer; }
 /* The sprite size slider, sitting with the other header chips. Green like the
    map's own heading, where a param slider would be orange. */
-#embed-size-row {
+#embed-size-row, #embed-cluster-row {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -695,6 +695,14 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   color: var(--muted);
 }
 #embed-size { width: 6rem; accent-color: var(--rb-green); }
+#embed-clusters { width: 5rem; accent-color: var(--rb-green); }
+/* Fixed width and tabular digits: the readout sits left of the method picker,
+   and letting 2 -> 20 shove it along makes the whole header twitch on a drag. */
+#embed-cluster-count {
+  width: 1.2rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
 #embed-close-btn:hover { background: var(--panel); }
 /* the card floats over the canvas rather than displacing it, so picking points
    never reflows the cloud you are picking them from.

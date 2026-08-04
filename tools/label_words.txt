@@ -1,0 +1,562 @@
+# Subject vocabulary for the Image map's cluster labels.
+#
+# One term per line; `#` comments and blank lines are ignored. Terms are merged
+# with the 365 Places365 scene categories (downloaded by
+# build_label_vectors.py), deduped, and encoded into server/label_vectors.npz.
+# Overlap with Places365 is fine and expected — it covers *scenes*, this covers
+# what is in the frame.
+#
+# Editing this file changes nothing until you re-run:
+#     .venv/bin/python tools/build_label_vectors.py
+#
+# Write terms as a photographer would describe the subject, not as a single
+# abstract noun: each one is substituted into "a photo of a {}." and friends, so
+# "cup of coffee" beats "coffee" and "snowy mountain peak" beats "peak".
+
+# --- people ---
+portrait
+face
+close-up of a face
+group of people
+crowd of people
+child
+baby
+couple
+family
+wedding
+self-portrait
+silhouette of a person
+hands
+eyes
+smiling person
+person walking
+person sleeping
+dancer
+musician
+athlete
+runner
+cyclist
+swimmer
+surfer
+skier
+person reading
+person cooking
+person working at a desk
+
+# --- animals ---
+dog
+puppy
+cat
+kitten
+horse
+cow
+sheep
+goat
+pig
+chicken
+duck
+goose
+swan
+bird
+songbird
+owl
+eagle
+hawk
+seagull
+pigeon
+parrot
+penguin
+fish
+shark
+whale
+dolphin
+turtle
+lizard
+snake
+frog
+butterfly
+moth
+bee
+dragonfly
+spider
+ant
+beetle
+squirrel
+rabbit
+deer
+fox
+wolf
+bear
+elephant
+giraffe
+zebra
+lion
+tiger
+monkey
+bat
+mouse
+insect
+crab
+jellyfish
+starfish
+seashell
+
+# --- plants ---
+flower
+rose
+tulip
+sunflower
+daisy
+orchid
+lily
+cherry blossom
+bouquet of flowers
+tree
+oak tree
+pine tree
+palm tree
+bare tree
+autumn leaves
+green leaves
+grass
+moss
+fern
+cactus
+succulent plant
+houseplant
+vine
+mushroom
+hedge
+wildflowers
+field of lavender
+
+# --- food and drink ---
+plate of food
+breakfast
+dinner table
+dessert
+cake
+birthday cake
+cookies
+bread
+pastry
+pizza
+pasta
+hamburger
+sandwich
+salad
+bowl of soup
+rice
+noodles
+sushi
+tacos
+barbecue
+steak
+seafood
+cheese
+eggs
+fruit
+apple
+orange
+banana
+strawberries
+berries
+grapes
+watermelon
+vegetables
+tomatoes
+peppers
+cup of coffee
+cup of tea
+glass of wine
+beer
+cocktail
+bottle of water
+ice cream
+chocolate
+candy
+honey
+
+# --- vehicles and transport ---
+car
+classic car
+sports car
+truck
+van
+bus
+motorcycle
+bicycle
+scooter
+train
+subway train
+tram
+airplane
+jet aircraft
+helicopter
+hot air balloon
+boat
+sailboat
+ferry
+cargo ship
+canoe
+kayak
+tractor
+ambulance
+fire truck
+traffic jam
+
+# --- landscape and nature ---
+landscape
+mountain
+mountain range
+snowy mountain peak
+rolling hills
+valley
+canyon
+cliff
+desert
+sand dunes
+beach
+seashore
+ocean
+crashing waves
+lake
+pond
+river
+stream
+waterfall
+glacier
+iceberg
+forest
+woods
+jungle
+meadow
+open field
+farmland
+prairie
+swamp
+marsh
+cave
+volcano
+island
+coastline
+rocks
+boulder
+pebbles
+sand
+mud
+snow
+ice
+fog
+mist
+clouds
+storm clouds
+sky
+blue sky
+sunset
+sunrise
+dusk
+dawn
+night sky
+stars
+the milky way
+moon
+full moon
+the sun
+sunbeams
+rainbow
+lightning
+rain
+raindrops
+puddle
+aurora borealis
+
+# --- city and architecture ---
+city
+cityscape
+city skyline
+skyscraper
+downtown street
+alley
+sidewalk
+crosswalk
+road
+highway
+bridge
+tunnel
+building
+house
+cabin
+cottage
+apartment building
+brick wall
+concrete wall
+window
+door
+doorway
+staircase
+roof
+balcony
+fence
+gate
+church
+cathedral
+temple
+mosque
+castle
+ruins
+monument
+statue
+fountain
+tower
+lighthouse
+windmill
+barn
+factory
+warehouse
+construction site
+parking lot
+gas station
+storefront
+market stall
+neon sign
+street sign
+graffiti
+mural
+billboard
+streetlight
+power lines
+railway tracks
+harbor
+dock
+pier
+
+# --- interiors and objects ---
+room interior
+office desk
+workshop
+bookshelf
+stack of books
+open book
+newspaper
+handwritten letter
+notebook
+pen
+pencil
+paintbrush
+camera
+film camera
+camera lens
+mobile phone
+laptop computer
+computer screen
+keyboard
+headphones
+guitar
+piano
+violin
+drum kit
+record player
+vinyl record
+loudspeaker
+clock
+wristwatch
+lamp
+candle
+lantern
+fireplace
+mirror
+chair
+table
+sofa
+bed
+rug
+curtain
+pillow
+blanket
+basket
+cardboard box
+suitcase
+backpack
+handbag
+shoes
+boots
+hat
+sunglasses
+jacket
+coat
+dress
+shirt
+scarf
+jewelry
+ring
+necklace
+umbrella
+key
+coins
+banknotes
+hand tools
+hammer
+screwdriver
+nails
+rope
+chain
+ladder
+wheel
+gears
+machine
+engine
+pipes
+tangled wires
+bottle
+glass jar
+mug
+plate
+bowl
+cutlery
+cooking pot
+frying pan
+kettle
+teapot
+vase
+toy
+doll
+teddy bear
+balloon
+kite
+ball
+chess board
+playing cards
+dice
+
+# --- texture, material, abstract ---
+texture
+repeating pattern
+abstract pattern
+geometric pattern
+stripes
+polka dots
+grid
+spiral
+wood grain
+weathered wood
+rusty metal
+polished metal
+stone
+marble
+granite
+brick
+tile
+glass
+cracked paint
+peeling paint
+fabric
+wool
+denim
+lace
+leather
+paper
+cardboard
+plastic
+bubbles
+smoke
+steam
+fire
+flames
+embers
+sparks
+dust
+rust
+reflection
+shadow
+silhouette
+blurred motion
+bokeh
+streaks of light
+lens flare
+double exposure
+close-up
+macro photograph
+aerial view
+top-down view
+symmetry
+minimalist composition
+
+# --- style and mood ---
+black and white photograph
+sepia photograph
+vintage photograph
+film grain
+high contrast image
+low light photograph
+overexposed photograph
+colorful image
+monochrome image
+pastel colors
+neon colors
+dark and moody scene
+bright and airy scene
+golden hour light
+harsh sunlight
+backlit scene
+night photography
+long exposure photograph
+painting
+oil painting
+watercolor painting
+sketch
+line drawing
+illustration
+cartoon
+comic panel
+poster
+collage
+sculpture
+mosaic
+stained glass
+pottery
+embroidery
+tattoo
+calligraphy
+typography
+screenshot
+diagram
+map
+chart
+
+# --- events and activities ---
+party
+celebration
+concert
+festival
+parade
+protest march
+sports game
+football match
+basketball game
+race
+hiking
+camping
+campfire
+picnic
+fishing
+gardening
+cooking
+baking
+dancing
+swimming
+surfing
+skiing
+snowboarding
+skateboarding
+rock climbing
+yoga
+workout
+shopping
+travel
+road trip
+graduation
+birthday party
+christmas tree
+carved pumpkin
+fireworks

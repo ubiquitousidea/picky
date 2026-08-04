@@ -2640,6 +2640,16 @@ const embedMap = {
   // the framing — it is a reading preference for a library of a given density,
   // not part of where you happen to be looking.
   spriteScale: 1,
+  // Groups of similar images, each named by the nearest CLIP text label the
+  // server could find (see server/labels.py). Positions are in the same
+  // normalized cube as the points, so they project through the same closure.
+  clusters: [],
+  // How many groups to ask for. 0 means "you choose", which is what the server
+  // does from the library size — so the slider is initialized from the first
+  // response rather than duplicating that formula here, and only pins a value
+  // once you actually drag it.
+  clusterCount: 0,
+  clusterTimer: null,
   // Thumbnails to draw at each point, keyed by URL (see embedSprite). Kept
   // across opens: a baked sprite is immutable for its key, so a reopened map
   // should be instant rather than re-fetching a library it already has.
@@ -2662,6 +2672,19 @@ const EMBED_SPRITE_WORLD = 0.26;
 // which is the whole cost of drawing a library sixty times a second. Sprites
 // only reach this size past ~8x zoom, and are merely soft beyond it.
 const EMBED_SPRITE_PX = 256;
+
+// One hue per cluster, spun by the golden angle so that however many groups
+// there are, adjacent ids land far apart on the wheel and no two of a dozen
+// collide. Derived rather than sent: the server's job is to say which group a
+// point is in, not what colour to paint it.
+function clusterColor(index, alpha = 1) {
+  return `hsla(${(index * 137.508) % 360}, 62%, 62%, ${alpha})`;
+}
+
+function setClusterSlider(count) {
+  $("embed-clusters").value = count;
+  $("embed-cluster-count").textContent = count;
+}
 
 // Zoomed all the way out there is only one sensible framing — the whole cloud,
 // centred on its own centre — so 1x, "no pan" and "no pivot" are one state, and
@@ -2783,9 +2806,18 @@ function sizeEmbedCanvas() {
 async function loadEmbedMap() {
   const seq = ++embedMap.seq;
   try {
-    const data = await api(`/api/embedding-map?method=${embedMap.method}`);
+    const data = await api(
+      `/api/embedding-map?method=${embedMap.method}&clusters=${embedMap.clusterCount}`,
+    );
     if (seq !== embedMap.seq || !embedMap.open) return; // stale or closed meanwhile
     embedMap.points = data.points;
+    embedMap.clusters = data.clusters;
+    // Adopt the count the server picked, so the slider shows the truth from the
+    // first frame. Only while `clusterCount` is still 0 — past that the slider
+    // is what asked for this number, and writing it back would fight a drag.
+    if (!embedMap.clusterCount && data.clusters.length) {
+      setClusterSlider(data.clusters.length);
+    }
     $("embed-status").textContent = data.points.length
       ? `${data.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to pause`
       : "No images yet.";
@@ -2804,6 +2836,7 @@ function closeEmbedMap() {
   // the dialog's `close` event too.
   stopEmbedLoop();
   embedMap.seq++; // abandon any in-flight fetch
+  clearTimeout(embedMap.clusterTimer); // and any re-fetch a drag left pending
   $("embed-modal").close();
 }
 
@@ -2969,6 +3002,12 @@ function drawEmbedMap() {
     const selected = p === embedMap.selected;
     const sprite = embedSprite(p);
     const dim = selected ? 0 : fade(p.sz); // the pick never dims
+    // A library too small to group (or one served by an older backend) has no
+    // cluster on its points, and keeps the hairline it always had.
+    const edge =
+      p.cluster == null
+        ? "rgba(20, 22, 27, 0.65)"
+        : clusterColor(p.cluster, 1 - dim * 1.4);
     if (sprite) {
       // half-extents, cached for the hit test: what you click is the box you saw
       const k = size / Math.max(sprite.width, sprite.height);
@@ -2979,8 +3018,12 @@ function drawEmbedMap() {
         ctx.fillStyle = `rgba(20, 22, 27, ${dim})`;
         ctx.fillRect(p.sx - p.hw, p.sy - p.hh, p.hw * 2, p.hh * 2);
       }
-      ctx.strokeStyle = selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
-      ctx.lineWidth = (selected ? 2 : 1) * dpr;
+      // The frame carries the group: a thumbnail says what it is a picture of,
+      // but nothing about it says which label out on the cloud is claiming it.
+      // Dimmed along with the sprite, or the frames of the back of the cloud
+      // would sit in front of the depth cue the wash exists to create.
+      ctx.strokeStyle = selected ? "#e6e9ef" : edge;
+      ctx.lineWidth = (selected ? 3 : 2) * dpr;
       ctx.strokeRect(p.sx - p.hw, p.sy - p.hh, p.hw * 2, p.hh * 2);
     } else {
       // Until its thumbnail arrives a point is the dot it always was, in the
@@ -2996,10 +3039,81 @@ function drawEmbedMap() {
       ctx.beginPath();
       ctx.arc(p.sx, p.sy, selected ? r * 1.6 : r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
+      ctx.strokeStyle = selected ? "#e6e9ef" : edge;
       ctx.lineWidth = (selected ? 2 : 1) * dpr;
       ctx.stroke();
     }
+  }
+
+  drawEmbedLabels(ctx, project, dpr);
+}
+
+// One text label per cluster, floated over the cloud where its images are.
+//
+// A separate pass, after every sprite, and deliberately not depth-sorted in
+// with them: a label drawn in its own depth order disappears behind whatever
+// happens to be nearer, and in a dense collage that is most of them — which
+// would hide exactly the labels sitting on the busiest, most worth naming part
+// of the map. Being an overlay, it is the one thing here that ignores depth.
+function drawEmbedLabels(ctx, project, dpr) {
+  const font = 13 * dpr;
+  ctx.font = `600 ${font}px system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  const padX = 8 * dpr;
+  const padY = 5 * dpr;
+  const lineHeight = font + padY * 2;
+
+  // Nearest last, so that where two labels genuinely cannot both be placed the
+  // one in front is the one on top — the same rule the sprites follow.
+  const ordered = embedMap.clusters
+    .filter((c) => c.label)
+    .map((c) => ({ ...c, p: project(c.x, c.y, c.z) }))
+    .sort((a, b) => a.p[2] - b.p[2]);
+
+  const placed = [];
+  for (const cluster of ordered) {
+    const suffix = ` · ${cluster.count}`;
+    const textW = ctx.measureText(cluster.label).width;
+    const w = textW + ctx.measureText(suffix).width + padX * 2;
+    const h = lineHeight;
+    const [x, home] = cluster.p;
+    // Nudge off anything already placed rather than solving a layout: a label
+    // that moved a line still points at its own group, and the alternative is a
+    // constraint solver for a dozen boxes that move every frame anyway.
+    //
+    // Offsets alternate below/above the true centre and grow — 0, +1, -1, +2 —
+    // so a crowd opens outwards from where the group actually is instead of
+    // sliding one way and pulling the last label a long way south. Bounded, so
+    // a genuine pile-up (twenty groups over a tight t-SNE) degrades to overlap
+    // rather than marching labels off the canvas.
+    const step = lineHeight + 2 * dpr;
+    let y = home;
+    for (let tries = 0; tries < 12; tries++) {
+      y = home + Math.ceil(tries / 2) * step * (tries % 2 ? 1 : -1);
+      const clash = placed.some(
+        (b) =>
+          Math.abs(b.x - x) < (b.w + w) / 2 && Math.abs(b.y - y) < (b.h + h) / 2,
+      );
+      if (!clash) break;
+    }
+    placed.push({ x, y, w, h });
+
+    const left = x - w / 2;
+    const top = y - h / 2;
+    // A pill, not bare text: `fillText` over a collage of photographs is
+    // unreadable about half the time, and which half changes as the cloud spins.
+    ctx.beginPath();
+    ctx.roundRect(left, top, w, h, h / 2);
+    ctx.fillStyle = "rgba(20, 22, 27, 0.82)";
+    ctx.fill();
+    ctx.strokeStyle = clusterColor(cluster.id);
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.stroke();
+
+    ctx.fillStyle = "#e6e9ef";
+    ctx.fillText(cluster.label, left + padX, y + 0.5 * dpr);
+    ctx.fillStyle = "rgba(230, 233, 239, 0.45)";
+    ctx.fillText(suffix, left + padX + textW, y + 0.5 * dpr);
   }
 }
 
@@ -3132,6 +3246,16 @@ function initEmbedMap() {
   // slider only has to move the number it reads.
   $("embed-size").oninput = (e) => {
     embedMap.spriteScale = Number(e.target.value);
+  };
+  // Unlike Size, this one costs a request — a different k is a different
+  // k-means fit — so the readout tracks the drag while the fetch waits for it
+  // to settle. `loadEmbedMap`'s own seq guard makes a late response harmless;
+  // the debounce is only there to stop a slow drag firing twenty of them.
+  $("embed-clusters").oninput = (e) => {
+    embedMap.clusterCount = Number(e.target.value);
+    setClusterSlider(embedMap.clusterCount);
+    clearTimeout(embedMap.clusterTimer);
+    embedMap.clusterTimer = setTimeout(loadEmbedMap, 150);
   };
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;

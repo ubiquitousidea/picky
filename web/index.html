@@ -94,6 +94,11 @@
         Size
         <input id="embed-size" type="range" min="0.5" max="1" step="0.05" value="1">
       </label>
+      <label id="embed-cluster-row" title="How many groups to find and label. Starts at a count chosen from the size of the library.">
+        Groups
+        <input id="embed-clusters" type="range" min="2" max="20" step="1" value="8">
+        <span id="embed-cluster-count">8</span>
+      </label>
       <select id="embed-method" title="How the 512-d embedding is flattened to 3 dimensions">
         <option value="pca">PCA</option>
         <option value="tsne">t-SNE</option>
