@@ -2622,10 +2622,14 @@ const embedMap = {
   yaw: 0.8,
   pitch: -0.45,
   // zoom multiplies the derived world→screen scale, pan offsets the projected
-  // result — so both live in backing-store pixels, like everything else here.
+  // result — so pan lives in backing-store pixels, like everything else here.
   zoom: 1,
   panX: 0,
   panY: 0,
+  // The world point rotation turns about, and the point pan positions: pan is
+  // its screen offset from the canvas centre. The cloud's own centre until you
+  // grab somewhere else.
+  pivot: { x: 0, y: 0, z: 0 },
   spin: true,
   raf: null,
   selected: null,
@@ -2640,12 +2644,46 @@ const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a 
 const EMBED_POLL_MS = 400;
 
 // Zoomed all the way out there is only one sensible framing — the whole cloud,
-// centred — so 1x and "no pan" are the same state, and reaching either restores
-// both. That is what saves the map a reset button it has no room for.
+// centred on its own centre — so 1x, "no pan" and "no pivot" are one state, and
+// reaching any of them restores all three. Resetting the pivot is not optional:
+// leave it on some grab point and pan 0 would centre *that*, not the cloud.
+// This is also what saves the map a reset button it has no room for.
 function resetEmbedView() {
   embedMap.zoom = 1;
   embedMap.panX = 0;
   embedMap.panY = 0;
+  embedMap.pivot = { x: 0, y: 0, z: 0 };
+}
+
+// Rotation turns the cloud about the point you grabbed rather than about its
+// centre. A grab names a 2D point, so it names a whole ray through the cloud;
+// this takes the point on that ray lying in the plane through the centre normal
+// to the view. Depth along the ray does not change what you see now, but it does
+// once you turn — and a pivot at the cloud's own depth is the one that doesn't
+// make the cloud swing.
+//
+// Screen coordinates are backing-store pixels, as everywhere else here.
+function setEmbedPivot(screenX, screenY) {
+  const { w, h, scale, cy, sy, cp, sp } = embedCamera();
+  const pivot = embedMap.pivot;
+  // view-space depth of the cloud's centre, measured from the current pivot;
+  // the new pivot has to share it, and that is the whole choice of plane
+  const oz1 = -pivot.z * cy + pivot.x * sy;
+  const z2 = -pivot.y * sp + oz1 * cp;
+  // undo project(): screen back to view space, then the inverse rotation
+  const x1 = (screenX - (w / 2 + embedMap.panX)) / scale;
+  const y1 = -(screenY - (h / 2 + embedMap.panY)) / scale;
+  const y = y1 * cp + z2 * sp;
+  const z1 = z2 * cp - y1 * sp;
+  embedMap.pivot = {
+    x: pivot.x + x1 * cy - z1 * sy,
+    y: pivot.y + y,
+    z: pivot.z + x1 * sy + z1 * cy,
+  };
+  // Re-anchoring pan on the grab is what makes the switch invisible: the new
+  // pivot projects exactly where it was clicked, so nothing on screen moves.
+  embedMap.panX = screenX - w / 2;
+  embedMap.panY = screenY - h / 2;
 }
 
 async function openEmbedMap() {
@@ -2764,26 +2802,43 @@ function stopEmbedLoop() {
   embedMap.raf = null;
 }
 
+// The camera, derived from the view state. Shared by drawEmbedMap() and the
+// pivot arithmetic, which has to invert exactly the projection that was drawn —
+// two copies of this trig would be two chances for a grab to land elsewhere.
+function embedCamera() {
+  const canvas = $("embed-canvas");
+  const w = canvas.width;
+  const h = canvas.height;
+  return {
+    w,
+    h,
+    // coordinates arrive normalized into the unit cube, half-diagonal √3
+    scale: ((Math.min(w, h) / 2 - 14) / Math.sqrt(3)) * embedMap.zoom,
+    cy: Math.cos(embedMap.yaw),
+    sy: Math.sin(embedMap.yaw),
+    cp: Math.cos(embedMap.pitch),
+    sp: Math.sin(embedMap.pitch),
+  };
+}
+
 function drawEmbedMap() {
   const canvas = $("embed-canvas");
   const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
+  const { w, h, scale, cy, sy, cp, sp } = embedCamera();
   ctx.clearRect(0, 0, w, h);
-  // coordinates arrive normalized into the unit cube, whose half-diagonal is √3
-  const scale = ((Math.min(w, h) / 2 - 14) / Math.sqrt(3)) * embedMap.zoom;
-  const cy = Math.cos(embedMap.yaw);
-  const sy = Math.sin(embedMap.yaw);
-  const cp = Math.cos(embedMap.pitch);
-  const sp = Math.sin(embedMap.pitch);
+  const pivot = embedMap.pivot;
   // the same orthographic yaw-then-pitch projection drawClusterPlot() uses;
-  // z comes back only to sort by depth. Zoom and pan ride along here and
-  // nowhere else, so the wireframe cube below stays welded to the cloud.
+  // z comes back only to sort by depth (a shared offset cannot reorder it).
+  // Pivot, zoom and pan ride along here and nowhere else, so the wireframe cube
+  // below stays welded to the cloud.
   const project = (x, y, z) => {
-    const x1 = x * cy + z * sy;
-    const z1 = z * cy - x * sy;
-    const y1 = y * cp - z1 * sp;
-    const z2 = y * sp + z1 * cp;
+    const dx = x - pivot.x;
+    const dy = y - pivot.y;
+    const dz = z - pivot.z;
+    const x1 = dx * cy + dz * sy;
+    const z1 = dz * cy - dx * sy;
+    const y1 = dy * cp - z1 * sp;
+    const z2 = dy * sp + z1 * cp;
     return [
       w / 2 + embedMap.panX + x1 * scale,
       h / 2 + embedMap.panY - y1 * scale,
@@ -2878,6 +2933,14 @@ function initEmbedMap() {
     e.preventDefault();
     dragging = true;
     panning = e.button !== 0;
+    // A rotate drag turns the cloud about wherever it was grabbed, so the pivot
+    // is chosen here, before the first move. A pan drag keeps the pivot it has:
+    // panning slides the whole cloud, pivot included.
+    if (!panning) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      setEmbedPivot((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr);
+    }
     lastX = downX = e.clientX;
     lastY = downY = e.clientY;
   });
