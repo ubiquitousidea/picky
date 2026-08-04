@@ -180,8 +180,9 @@ one place silently breaks another.
   is presentation only: nodes still store `posterize` vs `dither`, `curves` vs
   `gamma`.
 - **A URL whose bytes change without its id changing carries a version tag** —
-  the mask grid's `?v=<created_at>`, the gallery's `cropTag()` — because both are
-  served with long cache lifetimes over ids SQLite reuses.
+  the mask grid's `?v=<created_at>`, the gallery's `cropTag()` (which the Image
+  map's sprites key on too) — because both are served with long cache lifetimes
+  over ids SQLite reuses.
 - **Frontend files are served `Cache-Control: no-cache`** (`NoCacheStaticFiles`),
   and there is deliberately no cache-busting in filenames. Keep the header:
   stale `app.js` against a new backend produces phantom UI bugs.

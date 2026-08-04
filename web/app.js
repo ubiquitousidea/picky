@@ -2633,15 +2633,28 @@ const embedMap = {
   spin: true,
   raf: null,
   selected: null,
+  // Thumbnails to draw at each point, keyed by URL (see embedSprite). Kept
+  // across opens: a baked sprite is immutable for its key, so a reopened map
+  // should be instant rather than re-fetching a library it already has.
+  sprites: new Map(),
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
   seq: 0,
 };
 
-const EMBED_HIT_PX = 14; // click tolerance, in backing-store pixels
+const EMBED_HIT_PX = 14; // click tolerance for a point still drawn as a dot
 const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a click
 const EMBED_POLL_MS = 400;
+// A sprite's long edge, as a fraction of the unit cube the cloud is normalized
+// into — so it is a world size, not a screen size, and zoom grows it exactly as
+// it grows the wireframe cube.
+const EMBED_SPRITE_WORLD = 0.26;
+// Resolution the sprite is baked at, once, in device pixels. Blitting a
+// pre-scaled canvas is much cheaper per frame than resampling a 320px JPEG,
+// which is the whole cost of drawing a library sixty times a second. Sprites
+// only reach this size past ~8x zoom, and are merely soft beyond it.
+const EMBED_SPRITE_PX = 256;
 
 // Zoomed all the way out there is only one sensible framing — the whole cloud,
 // centred on its own centre — so 1x, "no pan" and "no pivot" are one state, and
@@ -2821,6 +2834,51 @@ function embedCamera() {
   };
 }
 
+// The thumbnail to draw at a point, or null while it loads — and null for good
+// if it fails, so one broken render falls back to its dot instead of refetching
+// sixty times a second.
+//
+// Keyed by URL with the crop tag in it, because re-framing an image changes the
+// bytes served under a node id that has not changed: that is the hazard
+// cropTag() exists for in the gallery, and here a stale entry would not be an
+// old thumbnail but the wrong picture entirely. Superseded keys are left in the
+// map; there are at most a few per image per session, and the alternative is a
+// second index from image to key that can only get out of step.
+function embedSprite(point) {
+  if (point.url === undefined) {
+    // Resolved once per point rather than once per point per frame — a library
+    // scan sixty times a second is quadratic in its size. Nothing invalidates
+    // it: opening the map always fetches a fresh array of points, and the map
+    // is closed for every path that could re-frame an image.
+    const image = state.images.find((i) => i.id === point.image_id);
+    point.url =
+      `/api/nodes/${point.node_id}/render?thumb=1${cropTag(image && image.crop)}`;
+  }
+  const url = point.url;
+  let entry = embedMap.sprites.get(url);
+  if (!entry) {
+    entry = { canvas: null };
+    embedMap.sprites.set(url, entry);
+    const img = new Image();
+    // no redraw on load: the rAF loop is running for as long as the map is open
+    img.onload = () => (entry.canvas = bakeEmbedSprite(img));
+    img.src = url;
+  }
+  return entry.canvas;
+}
+
+// Scale the thumbnail down once, into a canvas of its own, rather than letting
+// drawImage resample the full 320px JPEG on every frame. Never upscales: a
+// source smaller than the bake size is already as sharp as it will ever be.
+function bakeEmbedSprite(img) {
+  const k = Math.min(1, EMBED_SPRITE_PX / Math.max(img.width, img.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(img.width * k));
+  canvas.height = Math.max(1, Math.round(img.height * k));
+  canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
 function drawEmbedMap() {
   const canvas = $("embed-canvas");
   const ctx = canvas.getContext("2d");
@@ -2870,32 +2928,93 @@ function drawEmbedMap() {
   // Project once and cache the screen position back onto the point, so
   // hit testing reads exactly the pixels that were drawn rather than
   // re-deriving them against a cloud that has since rotated.
+  let zMin = Infinity;
+  let zMax = -Infinity;
   for (const p of embedMap.points) {
     const [sx, sy2, z] = project(p.x, p.y, p.z);
     p.sx = sx;
     p.sy = sy2;
     p.sz = z;
+    zMin = Math.min(zMin, z);
+    zMax = Math.max(zMax, z);
   }
+
+  // A thumbnail's long edge, in screen pixels. Derived from `scale` — the
+  // world→screen factor — so a sprite is a fixed size *in the cloud*, welded to
+  // the wireframe cube the way the points are: zoom in and the pictures grow.
+  // A billboard costs nothing to orient here, because the projection is
+  // orthographic: there is no perspective divide to face away from, so "always
+  // face the viewer" is just an axis-aligned rect at the projected point.
+  const size = EMBED_SPRITE_WORLD * scale;
+  // Sprites are sorted near-last and overlap, which is the only depth cue an
+  // orthographic view gets for free — nothing shrinks with distance. So the
+  // back of the cloud is dimmed too, over the depth range the cloud actually
+  // spans, or a dense library reads as one flat collage.
+  //
+  // Dimming is a wash of the background colour laid *over* an opaque sprite,
+  // not transparency: fading the sprite itself would let the pictures behind it
+  // show through, and once they do, overlap stops reading as one thing in front
+  // of another — which is the depth cue this is meant to reinforce.
+  const fade = (z) =>
+    zMax > zMin ? 0.5 * ((zMax - z) / (zMax - zMin)) : 0;
+
   for (const p of [...embedMap.points].sort((a, b) => a.sz - b.sz)) {
-    const [cr, cg, cb] = p.color;
-    ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
-    ctx.beginPath();
-    ctx.arc(p.sx, p.sy, p === embedMap.selected ? r * 1.6 : r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle =
-      p === embedMap.selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
-    ctx.lineWidth = (p === embedMap.selected ? 2 : 1) * dpr;
-    ctx.stroke();
+    const selected = p === embedMap.selected;
+    const sprite = embedSprite(p);
+    const dim = selected ? 0 : fade(p.sz); // the pick never dims
+    if (sprite) {
+      // half-extents, cached for the hit test: what you click is the box you saw
+      const k = size / Math.max(sprite.width, sprite.height);
+      p.hw = (sprite.width * k) / 2;
+      p.hh = (sprite.height * k) / 2;
+      ctx.drawImage(sprite, p.sx - p.hw, p.sy - p.hh, p.hw * 2, p.hh * 2);
+      if (dim) {
+        ctx.fillStyle = `rgba(20, 22, 27, ${dim})`;
+        ctx.fillRect(p.sx - p.hw, p.sy - p.hh, p.hw * 2, p.hh * 2);
+      }
+      ctx.strokeStyle = selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
+      ctx.lineWidth = (selected ? 2 : 1) * dpr;
+      ctx.strokeRect(p.sx - p.hw, p.sy - p.hh, p.hw * 2, p.hh * 2);
+    } else {
+      // Until its thumbnail arrives a point is the dot it always was, in the
+      // image's mean colour — so the map is populated the moment it opens and
+      // fills in, rather than starting empty. `hw` of 0 is what tells the hit
+      // test to fall back to a radius here.
+      p.hw = 0;
+      p.hh = 0;
+      // a dot has nothing behind it to show through, so here the wash is just
+      // the same dimming applied to the colour
+      const [cr, cg, cb] = p.color.map((c) => Math.round(c * (1 - dim)));
+      ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, selected ? r * 1.6 : r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = selected ? "#e6e9ef" : "rgba(20, 22, 27, 0.65)";
+      ctx.lineWidth = (selected ? 2 : 1) * dpr;
+      ctx.stroke();
+    }
   }
 }
 
+// Hit testing runs against the extents the last frame *drew* (`hw`/`hh`), not
+// against a tolerance, so a click lands on the picture under the cursor however
+// far the view is zoomed.
 function embedPointAt(x, y) {
   let best = null;
+  for (const p of embedMap.points) {
+    if (p.sx === undefined || !p.hw) continue;
+    if (Math.abs(p.sx - x) > p.hw || Math.abs(p.sy - y) > p.hh) continue;
+    // overlapping sprites go to the one nearest the camera — the one on top,
+    // and so the only one the click could have looked like it hit
+    if (!best || p.sz > best.sz) best = p;
+  }
+  if (best) return best;
+  // Points still waiting on a thumbnail are 4px dots, too small to hit exactly,
+  // and keep the radial tolerance they have always had.
   let bestD = EMBED_HIT_PX * (window.devicePixelRatio || 1);
   for (const p of embedMap.points) {
-    if (p.sx === undefined) continue;
+    if (p.sx === undefined || p.hw) continue;
     const d = Math.hypot(p.sx - x, p.sy - y);
-    // ties go to the point nearest the camera, which is the one drawn on top
     if (d < bestD || (d === bestD && best && p.sz > best.sz)) {
       best = p;
       bestD = d;
