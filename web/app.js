@@ -2633,6 +2633,13 @@ const embedMap = {
   spin: true,
   raf: null,
   selected: null,
+  // Multiplies the sprite size, 0.5 to 1. Not folded into `zoom`: zoom moves
+  // the camera and this resizes the things in front of it, so shrinking the
+  // sprites opens gaps between them where zooming out only makes the same
+  // collage smaller. Deliberately outlives an open, like yaw/pitch and unlike
+  // the framing — it is a reading preference for a library of a given density,
+  // not part of where you happen to be looking.
+  spriteScale: 1,
   // Thumbnails to draw at each point, keyed by URL (see embedSprite). Kept
   // across opens: a baked sprite is immutable for its key, so a reopened map
   // should be instant rather than re-fetching a library it already has.
@@ -2945,7 +2952,7 @@ function drawEmbedMap() {
   // A billboard costs nothing to orient here, because the projection is
   // orthographic: there is no perspective divide to face away from, so "always
   // face the viewer" is just an axis-aligned rect at the projected point.
-  const size = EMBED_SPRITE_WORLD * scale;
+  const size = EMBED_SPRITE_WORLD * scale * embedMap.spriteScale;
   // Sprites are sorted near-last and overlap, which is the only depth cue an
   // orthographic view gets for free — nothing shrinks with distance. So the
   // back of the cloud is dimmed too, over the depth range the cloud actually
@@ -3121,6 +3128,11 @@ function initEmbedMap() {
     { passive: false }
   );
 
+  // No redraw to schedule: the rAF loop is already drawing every frame, so the
+  // slider only has to move the number it reads.
+  $("embed-size").oninput = (e) => {
+    embedMap.spriteScale = Number(e.target.value);
+  };
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;
     // keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint

@@ -685,6 +685,16 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   font-size: 0.75rem;
 }
 #embed-close-btn { padding: 0.2rem 0.7rem; cursor: pointer; }
+/* The sprite size slider, sitting with the other header chips. Green like the
+   map's own heading, where a param slider would be orange. */
+#embed-size-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+#embed-size { width: 6rem; accent-color: var(--rb-green); }
 #embed-close-btn:hover { background: var(--panel); }
 /* the card floats over the canvas rather than displacing it, so picking points
    never reflows the cloud you are picking them from.

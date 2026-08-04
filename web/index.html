@@ -90,6 +90,10 @@
   <dialog id="embed-modal">
     <div id="embed-header">
       <h2>Image map</h2>
+      <label id="embed-size-row" title="Shrink the thumbnails to see past them in a crowded cloud">
+        Size
+        <input id="embed-size" type="range" min="0.5" max="1" step="0.05" value="1">
+      </label>
       <select id="embed-method" title="How the 512-d embedding is flattened to 3 dimensions">
         <option value="pca">PCA</option>
         <option value="tsne">t-SNE</option>
