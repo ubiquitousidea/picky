@@ -3354,16 +3354,39 @@ function initEmbedMap() {
 
 // ---------- Upload / delete ----------
 
-async function uploadFile(file) {
-  const form = new FormData();
-  form.append("file", file);
+// Uploads are serialized, not raced: each POST reads a whole JPG into server
+// memory, and going in order is what makes the counter meaningful and lands the
+// images in the order they were picked. One bad file does not stop the batch —
+// the good ones are already saved by then, so failures are collected and
+// reported once at the end, naming the files that did not make it.
+async function uploadFiles(files) {
+  const label = $("upload-label");
+  const input = $("file-input");
+  const failed = [];
+  let last = null;
+  input.disabled = true;
   try {
-    const image = await api("/api/images", { method: "POST", body: form });
-    await refreshGallery();
-    await selectImage(image.id, image.root_node_id);
-  } catch (err) {
-    alert(`Upload failed: ${err.message}`);
+    for (const [i, file] of files.entries()) {
+      label.textContent =
+        files.length > 1 ? `Adding ${i + 1} / ${files.length}…` : "Adding…";
+      const form = new FormData();
+      form.append("file", file);
+      try {
+        last = await api("/api/images", { method: "POST", body: form });
+      } catch (err) {
+        failed.push(`${file.name}: ${err.message}`);
+      }
+    }
+  } finally {
+    label.textContent = "+ Add JPG";
+    input.disabled = false;
   }
+  // one refresh for the whole batch, then land on the last image that made it
+  if (last) {
+    await refreshGallery();
+    await selectImage(last.id, last.root_node_id);
+  }
+  if (failed.length) alert(`Upload failed:\n${failed.join("\n")}`);
 }
 
 async function deleteNode(node) {
@@ -3434,8 +3457,10 @@ async function init() {
     if (edit.node) closeEdit(true);
   });
   $("file-input").onchange = (e) => {
-    if (e.target.files[0]) uploadFile(e.target.files[0]);
+    // copied out of the live FileList, which the reset below empties
+    const files = [...e.target.files];
     e.target.value = "";
+    if (files.length) uploadFiles(files);
   };
 
   document.body.addEventListener("dragover", (e) => {
@@ -3448,10 +3473,12 @@ async function init() {
   document.body.addEventListener("drop", (e) => {
     e.preventDefault();
     document.body.classList.remove("dragging");
-    const file = [...e.dataTransfer.files].find(
+    // a dropped folder full of photos is a batch like any other; anything that
+    // is not a JPEG is dropped here rather than sent for the server to 400
+    const files = [...e.dataTransfer.files].filter(
       (f) => f.type === "image/jpeg" || /\.jpe?g$/i.test(f.name)
     );
-    if (file) uploadFile(file);
+    if (files.length) uploadFiles(files);
   });
 
   await refreshGallery();

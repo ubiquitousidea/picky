@@ -141,6 +141,12 @@ h2 {
   cursor: pointer;
 }
 .upload-btn:hover { background: var(--rb-blue); color: var(--bg); }
+/* Same greyed-out-and-inert look as #apply-btn's `.busy`, but keyed off the
+   disabled input: a <label> has no state of its own, and disabling the input is
+   what actually stops a second batch being picked mid-upload. The min-width is
+   so the header does not shuffle sideways as the counter ticks. */
+.upload-btn:has(input:disabled) { opacity: 0.7; pointer-events: none; }
+#upload-label { display: inline-block; min-width: 7ch; text-align: center; }
 /* The filmstrip — opt-in, since the Image map is the intended picker. Same
    thumbnail treatment as the old gallery column, laid out along the row. */
 #gallery {

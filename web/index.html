@@ -13,9 +13,11 @@
        buttons instead — see #crop-modal, #presets-modal, #cluster-modal. -->
   <header id="app-header">
     <h1>Picky</h1>
+    <!-- The label's text is a span so a batch upload can count itself down in
+         place; the disabled input is what greys the label out meanwhile. -->
     <label class="upload-btn">
-      + Add JPG
-      <input type="file" id="file-input" accept=".jpg,.jpeg,image/jpeg" hidden>
+      <span id="upload-label">+ Add JPG</span>
+      <input type="file" id="file-input" accept=".jpg,.jpeg,image/jpeg" multiple hidden>
     </label>
     <!-- Short labels: eight buttons at their old panel-width wording wrapped to
          three lines on a phone. The title carries the full description. -->
@@ -32,7 +34,7 @@
   </header>
 
   <main id="preview-panel">
-    <div id="drop-hint">Drop a JPG anywhere, or use “Add JPG”</div>
+    <div id="drop-hint">Drop JPGs anywhere, or use “Add JPG”</div>
     <div id="preview-wrap" hidden>
       <img id="preview" alt="preview" draggable="false">
       <img id="mask-overlay" hidden alt="" draggable="false">
