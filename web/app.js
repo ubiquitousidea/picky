@@ -3440,6 +3440,10 @@ async function init() {
   initClusterPlot();
   initEmbedMap();
   $("apply-btn").onclick = applyEffect;
+  // the live-preview checkbox is gone — the feature buttons toggle the preview
+  // themselves — so sweep the preference it left in browsers that ran the old
+  // build. Nothing reads the key; this only stops it sitting there forever.
+  localStorage.removeItem("picky:livePreview");
   // both control containers drive the one debounce; the selection lives in its
   // own section now, so it needs its own listener
   for (const id of ["effect-params", "select-controls"]) {
