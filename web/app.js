@@ -1081,12 +1081,16 @@ function renderEffectControls() {
   // the unlit button, so this early-out and setEffect()'s `.selected` class have
   // to agree. Apply goes with them: with nothing to apply it is hidden outright
   // rather than greyed, so the row is just the buttons and the image below it.
+  // So does the render indicator — it reserves its line so the row does not
+  // reflow when a render starts, and there are no renders to start.
   if (state.effect === null) {
     box.innerHTML = "";
     $("apply-btn").hidden = true;
+    $("preview-status").hidden = true;
     return;
   }
   $("apply-btn").hidden = false;
+  $("preview-status").hidden = false;
   const effect = buildParamControls(box, state.effect, {}, state.nodeId);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {

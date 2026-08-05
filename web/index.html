@@ -50,8 +50,9 @@
     <section id="effects-section">
       <div id="effect-buttons" role="group" aria-label="Effect"></div>
       <div id="effect-params"></div>
-      <span id="preview-status">rendering…</span>
-      <!-- hidden until a feature button is lit, which is what init() leaves it -->
+      <!-- both hidden until a feature button is lit, which is what init() leaves
+           the panel in; renderEffectControls() owns them from there -->
+      <span id="preview-status" hidden>rendering…</span>
       <button id="apply-btn" hidden disabled>Apply</button>
     </section>
     <section id="select-section">
