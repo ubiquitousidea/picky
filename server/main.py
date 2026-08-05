@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import db, embed_job, labels, rendering, text_embed, text_job
+from . import db, depth, depth_job, embed_job, labels, rendering, text_embed, text_job
 from .effects import (
     EFFECTS,
     crop_geometry,
@@ -124,6 +124,21 @@ def _check_selection(selection: dict | None, image_id: int) -> dict | None:
             if mask is None or mask["image_id"] != image_id:
                 raise HTTPException(400, "mask does not belong to this image")
     return selection
+
+
+def _check_effect_ready(effect: str) -> None:
+    """Refuse an effect whose model is not on disk yet.
+
+    409 for `text_search`'s reason: the state is wrong rather than the server
+    unwell, and it is the caller's own `POST /api/depth-model/prepare` that
+    fixes it. Downloading 99 MB inside a render request would look exactly like
+    a hang, so bokeh is unavailable rather than slow — see `depth_job`.
+
+    Called from every path that can render an effect (create, edit, preview and
+    preset replay) rather than from `rendering`, which has no way to say 409.
+    """
+    if effect == "bokeh" and not depth.ready():
+        raise HTTPException(409, "the depth model is not downloaded yet")
 
 
 @app.get("/api/effects")
@@ -465,6 +480,25 @@ def text_model_progress():
     return text_job.snapshot()
 
 
+@app.post("/api/depth-model/prepare")
+def prepare_depth_model():
+    """Start fetching the depth model, and report where it already is.
+
+    The search box's arrangement, one door along: the frontend calls this when
+    the Bokeh button is lit, and only then. Nothing else in the app needs depth,
+    so a session that never reaches for it never pays the 99 MB.
+    """
+    return depth_job.start()
+
+
+@app.get("/api/depth-model/progress")
+def depth_model_progress():
+    """Where the fetch from `prepare` got to. Safe to call at any time; a server
+    nobody has applied bokeh on this run reports `idle` with `ready` already
+    true if an earlier run downloaded the file."""
+    return depth_job.snapshot()
+
+
 @app.post("/api/embedding-map/prepare")
 def prepare_embedding_map():
     """Start the background embedding pass, and report where it already is.
@@ -559,6 +593,7 @@ def create_node(image_id: int, body: NodeCreate):
         raise HTTPException(400, "parent node does not belong to this image")
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
+    _check_effect_ready(body.effect)
     params = validate_params(body.effect, body.params)
     selection = _check_selection(validate_selection(body.selection), image_id)
 
@@ -594,6 +629,7 @@ def update_node(node_id: int, body: NodeUpdate):
     effect = node["effect"]
     if effect not in EFFECTS and effect != "blend":
         raise HTTPException(400, f"effect '{effect}' no longer exists")
+    _check_effect_ready(effect)
     params = validate_params(effect, body.params)
     selection = _check_selection(validate_selection(body.selection), node["image_id"])
 
@@ -667,6 +703,7 @@ def preview_node(node_id: int, body: PreviewRequest):
         raise HTTPException(404, "node not found")
     if body.effect not in EFFECTS and body.effect != "blend":
         raise HTTPException(400, f"unknown effect '{body.effect}'")
+    _check_effect_ready(body.effect)
     params = validate_params(body.effect, body.params)
     selection = _check_selection(validate_selection(body.selection), node["image_id"])
 
@@ -1044,6 +1081,7 @@ def _validate_steps(steps: list[dict]) -> list[dict]:
         effect = step.get("effect") if isinstance(step, dict) else None
         if effect not in EFFECTS and effect != "blend":
             raise HTTPException(400, f"step {i}: unknown effect '{effect}'")
+        _check_effect_ready(effect)
 
         parent = step.get("parent")
         # bool is an int subclass, and a negative index would silently resolve
