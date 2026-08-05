@@ -182,8 +182,10 @@ one place silently breaks another.
   is the one place the preview starts (`enterApplyPreview()`) or stops
   (`exitPreview(true)`, which repaints the node's own render). Two things must
   stay in step with it: the lit `.selected` class on the button, and
-  `renderEffectControls()`'s early-out — an empty `#effect-params` *is* how "off"
-  looks, so a null effect must never reach `buildParamControls()` or Apply.
+  `renderEffectControls()`'s early-out — an empty `#effect-params` and a *hidden*
+  (not merely disabled) Apply are how "off" looks, so a null effect must never
+  reach `buildParamControls()` or Apply. `#apply-btn` therefore ships `hidden` in
+  the markup, since that is the state `init()` leaves the panel in.
 - **`selectImage()` → `renderSelection()` is the single choke point.** Every path
   that changes the selection leaves preview and crop mode there, and re-enters
   live preview at the end. `openEdit()` is the one deliberate exception, and must

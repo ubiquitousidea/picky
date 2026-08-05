@@ -1079,12 +1079,14 @@ function renderEffectControls() {
   const box = $("effect-params");
   // An empty params box is the off state made visible — it is the other half of
   // the unlit button, so this early-out and setEffect()'s `.selected` class have
-  // to agree. Nothing to apply either, since there is no effect to apply.
+  // to agree. Apply goes with them: with nothing to apply it is hidden outright
+  // rather than greyed, so the row is just the buttons and the image below it.
   if (state.effect === null) {
     box.innerHTML = "";
-    $("apply-btn").disabled = true;
+    $("apply-btn").hidden = true;
     return;
   }
+  $("apply-btn").hidden = false;
   const effect = buildParamControls(box, state.effect, {}, state.nodeId);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {
