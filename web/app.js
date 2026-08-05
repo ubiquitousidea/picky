@@ -1,6 +1,9 @@
 const state = {
   effects: [],
-  effect: null,    // name of the effect the Apply panel is set to
+  // Name of the effect the Apply panel is set to, or null when no feature button
+  // is lit — which is how you look at the selected node's own pixels. There is
+  // no separate live-preview control: an armed effect *is* the preview running.
+  effect: null,
   images: [],
   imageId: null,
   nodes: [],       // flat node list for the selected image
@@ -18,8 +21,6 @@ const state = {
   // switch, which used to take the pick with them. nodeId/imageId record what
   // it was picked against, so pruneSelection() can tell when it goes stale.
   selection: { value: null, nodeId: null, imageId: null },
-  // Preview runs by default; the checkbox is how you get back to the original.
-  livePreview: true,
   // The filmstrip is off by default — the Image map is the picker it defers to.
   filmstrip: false,
 };
@@ -141,10 +142,11 @@ function renderSelection() {
   renderTree();
   updatePresetControls();
   updateClusterPlot();
-  // and last, re-enter the preview this function's exitPreview() just left. The
-  // node's own render is already painted above, so the unedited pixels show
-  // immediately and the effect lands on top when the debounce fires.
-  if (state.livePreview) enterApplyPreview();
+  // and last, re-enter the preview this function's exitPreview() just left — if
+  // a feature button is lit, which is the whole of "is preview on". The node's
+  // own render is already painted above, so the unedited pixels show immediately
+  // and the effect lands on top when the debounce fires.
+  if (state.effect) enterApplyPreview();
 }
 
 // ---------- Zoom / pan ----------
@@ -635,24 +637,36 @@ function buildEffectButtons() {
     const svg = group.icon();
     svg.setAttribute("aria-hidden", "true");
     btn.appendChild(svg);
-    btn.onclick = () => setEffect(lastMethod[group.key] || group.effects[0]);
+    btn.onclick = () => toggleGroup(group);
     box.appendChild(btn);
   }
 }
 
+// The buttons are toggles, not a radio group: clicking the lit one turns the
+// effect off. That is the only way back to the unedited node, so there is no
+// separate live-preview control for it to disagree with.
+function toggleGroup(group) {
+  const lit = groupFor(state.effect) === group;
+  setEffect(lit ? null : lastMethod[group.key] || group.effects[0]);
+}
+
 // The selected effect lives in state, not in the DOM. Single write path: every
-// change rebuilds the params and re-renders any running preview.
+// change rebuilds the params and starts, restarts or stops the preview — `null`
+// included, which is what makes "no button lit" a state and not just an absence.
 function setEffect(name) {
-  const group = groupFor(name);
+  const group = name === null ? null : groupFor(name);
   state.effect = name;
-  lastMethod[group.key] = name;
+  if (group) lastMethod[group.key] = name;
   document.querySelectorAll("#effect-buttons .fx-btn").forEach((btn) => {
-    const on = btn.dataset.group === group.key;
+    const on = !!group && btn.dataset.group === group.key;
     btn.classList.toggle("selected", on);
     btn.setAttribute("aria-pressed", on);
   });
   renderEffectControls();
-  if (preview.active) schedulePreview();
+  // turning the effect off restores the node's own render — that *is* "show me
+  // the original", so there is no separate control for it
+  if (state.effect) enterApplyPreview();
+  else exitPreview(true);
 }
 
 // A grouped button picks its effect here rather than in buildParamControls(),
@@ -1063,6 +1077,14 @@ function renderSelectControls() {
 
 function renderEffectControls() {
   const box = $("effect-params");
+  // An empty params box is the off state made visible — it is the other half of
+  // the unlit button, so this early-out and setEffect()'s `.selected` class have
+  // to agree. Nothing to apply either, since there is no effect to apply.
+  if (state.effect === null) {
+    box.innerHTML = "";
+    $("apply-btn").disabled = true;
+    return;
+  }
   const effect = buildParamControls(box, state.effect, {}, state.nodeId);
   let canApply = state.imageId !== null;
   if (effect.name === "blend") {
@@ -1103,6 +1125,7 @@ function readEffectForm() {
 
 async function applyEffect() {
   const btn = $("apply-btn");
+  if (state.effect === null) return; // no button lit, nothing to apply
   const { effect, params, parent2_id, selection } = readEffectForm();
   if (effect === "blend" && parent2_id === null) return;
   exitPreview(false);
@@ -1141,7 +1164,7 @@ async function applyEffect() {
     renderSelectControls();
     alert(`Failed to apply effect: ${err.message}`);
   } finally {
-    btn.disabled = state.imageId === null;
+    btn.disabled = state.imageId === null || state.effect === null;
     btn.classList.remove("busy");
     btn.textContent = "Apply";
   }
@@ -1167,19 +1190,10 @@ function enterApplyPreview() {
   schedulePreview();
 }
 
-function toggleLivePreview() {
-  state.livePreview = $("live-preview").checked;
-  localStorage.setItem("picky:livePreview", state.livePreview ? "1" : "");
-  // unchecking restores the selected node's own render — that *is* "show me the
-  // original", so there is no separate control for it
-  if (state.livePreview) enterApplyPreview();
-  else exitPreview(true);
-}
-
 // Apply composes the effect on top of the selected node, which is exactly what
 // POST /api/nodes/{id}/preview does.
 function applyPreviewRequest() {
-  if (state.nodeId === null) return null;
+  if (state.nodeId === null || state.effect === null) return null;
   const { effect, params, parent2_id, selection } = readEffectForm();
   if (effect === "blend" && parent2_id === null) return null;
   const body = { effect, params };
@@ -1868,20 +1882,19 @@ function appendSelectionControls(
   const row = document.createElement("div");
   row.className = "param-row";
 
-  const label = document.createElement("label");
-  const nameSpan = document.createElement("span");
-  nameSpan.textContent = "Limit to object";
+  // No heading: the pick button says "Select object" itself, so a title above it
+  // only repeated the control. What is left is the summary of what is picked —
+  // a bare span rather than a <label>, since it now labels nothing.
   const coords = document.createElement("span");
   coords.className = "sel-coords";
-  label.append(nameSpan, coords);
 
   const pick = document.createElement("button");
   pick.type = "button";
   pick.className = "sel-pick";
-  const clear = document.createElement("button");
   pick.title = allowPick
     ? "Then click an object in the image to select it"
     : "The click point was made on this node's input — re-picking needs a new node from the Apply panel";
+  const clear = document.createElement("button");
   clear.type = "button";
   clear.className = "sel-clear";
   clear.textContent = "clear";
@@ -1906,7 +1919,7 @@ function appendSelectionControls(
   optRow.className = "sel-row";
   optRow.append(level, invertLabel);
 
-  row.append(label, pickRow, optRow);
+  row.append(coords, pickRow, optRow);
 
   // Save, then the saved objects themselves — the order the workflow runs in:
   // pick an object, use it (which banks it), repeat, then tick the ones this
@@ -2467,9 +2480,10 @@ function closeEdit(restoreSrc) {
   // selection, which openEdit() already left pointing at this same node
   syncMaskOverlay(state.selection, state.nodeId, null);
   $("edit-modal").close();
-  // and hand the preview back too. The Save path re-enters via selectImage(),
-  // but Cancel and Esc end here, and live preview should survive both.
-  if (state.livePreview && restoreSrc) enterApplyPreview();
+  // and hand the preview back too, to whatever feature button was left lit. The
+  // Save path re-enters via selectImage(), but Cancel and Esc end here, and the
+  // panel's own preview should survive both.
+  if (state.effect && restoreSrc) enterApplyPreview();
 }
 
 async function saveEdit() {
@@ -3418,17 +3432,14 @@ async function deleteImage() {
 async function init() {
   state.effects = await api("/api/effects");
   buildEffectButtons();
-  setEffect(EFFECT_BUTTONS[0].effects[0]);
+  // and nothing lit: the app opens showing the image as it is, and the first
+  // click on a feature button is what starts previewing an effect on top of it
 
   initZoom();
   initCropOverlay();
   initClusterPlot();
   initEmbedMap();
   $("apply-btn").onclick = applyEffect;
-  // the preference outlives the session; only an explicit "" means opted out
-  state.livePreview = localStorage.getItem("picky:livePreview") !== "";
-  $("live-preview").checked = state.livePreview;
-  $("live-preview").onchange = toggleLivePreview;
   // both control containers drive the one debounce; the selection lives in its
   // own section now, so it needs its own listener
   for (const id of ["effect-params", "select-controls"]) {
@@ -3440,8 +3451,8 @@ async function init() {
   $("save-preset-btn").onclick = savePreset;
 
   // The Image map is the intended way to pick an image, so the filmstrip is
-  // opt-in — only an explicit "1" turns it on. Like livePreview's, the choice
-  // outlives the session.
+  // opt-in — only an explicit "1" turns it on, and the choice outlives the
+  // session.
   setFilmstrip(localStorage.getItem("picky:filmstrip") === "1");
   $("film-btn").onclick = () => setFilmstrip(!state.filmstrip);
 

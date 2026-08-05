@@ -176,6 +176,14 @@ one place silently breaks another.
   (`state.selection`), the current effect (`state.effect`), the crop. The effect
   panel is torn down and rebuilt on every selection change, which used to take
   the pick with it.
+- **The feature buttons are toggles, and `state.effect === null` is the off
+  state** — it is also the whole of "live preview is off", which is why there is
+  no checkbox for that any more. `setEffect()` remains the single write path and
+  is the one place the preview starts (`enterApplyPreview()`) or stops
+  (`exitPreview(true)`, which repaints the node's own render). Two things must
+  stay in step with it: the lit `.selected` class on the button, and
+  `renderEffectControls()`'s early-out — an empty `#effect-params` *is* how "off"
+  looks, so a null effect must never reach `buildParamControls()` or Apply.
 - **`selectImage()` → `renderSelection()` is the single choke point.** Every path
   that changes the selection leaves preview and crop mode there, and re-enters
   live preview at the end. `openEdit()` is the one deliberate exception, and must

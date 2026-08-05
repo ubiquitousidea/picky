@@ -397,16 +397,18 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .sel-pick.armed { background: var(--rb-teal); color: var(--bg); }
 .sel-pick.busy { opacity: 0.7; }
 .sel-pick:disabled { opacity: 0.4; cursor: default; }
+/* a button, shaped like the .sel-pick it sits beside — muted rather than teal,
+   since it undoes what that one does */
 .sel-clear {
-  border: none;
-  background: none;
-  padding: 0;
-  font: inherit;
-  font-size: 0.8rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--muted);
+  border-radius: 6px;
+  background: transparent;
   color: var(--muted);
+  font-size: 0.8rem;
   cursor: pointer;
 }
-.sel-clear:hover:not(:disabled) { color: var(--text); }
+.sel-clear:hover:not(:disabled) { background: var(--muted); color: var(--bg); }
 .sel-clear:disabled { opacity: 0.4; cursor: default; }
 .sel-level { flex: 1; min-width: 0; }
 /* .param-row .sel-invert outranks the `.param-row label` header styling,
@@ -434,13 +436,10 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   gap: 0.4rem 0.5rem;
   margin-bottom: 0;
 }
-#select-controls .param-row > label {
-  flex: none;
-  display: block;
-  margin-bottom: 0;
-  white-space: nowrap;
-}
-#select-controls .sel-coords { margin-left: 0.35rem; }
+#select-controls .sel-coords { flex: none; white-space: nowrap; }
+/* nothing picked yet: an empty span is still a flex item, and would open the
+   row's gap before the pick button as if something were there */
+.sel-coords:empty { display: none; }
 #select-controls .sel-row { flex: none; }
 #select-controls .sel-row + .sel-row { margin-top: 0; }
 #select-controls .sel-pick { flex: none; }
@@ -483,15 +482,6 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #apply-btn:hover:not(:disabled) { background: var(--rb-orange); color: var(--bg); }
 #apply-btn:disabled { opacity: 0.4; cursor: default; }
 #apply-btn.busy { opacity: 0.7; }
-/* Preview is live by default; unchecking is how you look at the original. */
-#preview-row {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.8rem;
-}
-#live-preview-label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
-#live-preview { accent-color: var(--rb-blue); }
 /* same idiom as #edit-status: the text is always there, `.busy` reveals it, so
    the row never reflows when a render starts */
 #preview-status, #crop-status { color: var(--muted); font-size: 0.7rem; visibility: hidden; }
