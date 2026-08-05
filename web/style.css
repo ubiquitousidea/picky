@@ -789,6 +789,9 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   font-size: 0.75rem;
   color: var(--muted);
 }
+/* Match is the one of these rows that hides, and applyEmbedFilter() hides it by
+   attribute — which the id rule above beats, so it needs saying. */
+#embed-match-row[hidden] { display: none; } /* the id rule above beats UA [hidden] */
 #embed-size { width: 6rem; accent-color: var(--rb-green); }
 #embed-clusters { width: 5rem; accent-color: var(--rb-green); }
 #embed-match { width: 5rem; accent-color: var(--rb-green); }
