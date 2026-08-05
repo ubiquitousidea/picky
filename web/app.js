@@ -1158,6 +1158,13 @@ async function applyEffect() {
       body: JSON.stringify(body),
     });
     await selectImage(state.imageId, node.id);
+    // The effect is committed, so the panel goes back to nothing selected: what
+    // you see is the node you just made, not the same effect armed again on top
+    // of it. setEffect stays the single write path — it unlights the button,
+    // empties the params and stops the preview renderSelection() just re-armed.
+    // After selectImage, not before: its exitPreview(true) repaints from
+    // state.nodeId, which has to be the new node and not the old one.
+    setEffect(null);
     if (bankErr) {
       alert(
         "The effect was applied, but the selection could not be saved for reuse: " +
