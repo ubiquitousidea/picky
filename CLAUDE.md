@@ -244,6 +244,19 @@ one place silently breaks another.
   `nodeId` changes (their coords are in that node's pixel space), saved masks
   only when `imageId` does — which is what lets you stack masked effects on one
   object.
+- **One armed picker, and `selPicker.armed.owner` is the button holding it.**
+  Two controls arm it — selecting an object and bokeh's Focus pick — so "press
+  the lit button to cancel" has to mean the *lit* one, or taking the picker from
+  the other control would cost two presses. Anything that arms it wears
+  `.sel-pick`, which is what `disarmPick()` sweeps, so exactly one can be lit.
+  A pick armed from inside `#effect-params` must re-query its input when the
+  click finally lands (`buildDepthPick`): the panel is rebuilt on every
+  selection change, which is precisely the window it was waiting through.
+- **A param spec's `pick` is presentation, like the Method dropdown.** It says a
+  number can be read off the image instead of dialled in; the param stays a
+  float, `validate_params` never sees the key, and the slider stays the only
+  thing Apply reads. It is off in the edit modal (`allowPick: false`) for the
+  reason the selection's pick is: `showModal()` makes the image inert.
 - **Param controls are built and read in one place** (`buildParamControls()` /
   `readParams()`), shared by the Apply panel and the edit modal, so ranges,
   defaults and coercion cannot drift between create and edit. The Method dropdown

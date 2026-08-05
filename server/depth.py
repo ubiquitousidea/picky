@@ -203,3 +203,29 @@ def depth_map(img: np.ndarray) -> np.ndarray:
     while len(_cache) > _CACHE_MAX:
         _cache.popitem(last=False)
     return depth
+
+
+# A click is aimed at an object, not at a pixel, and the pixel it actually lands
+# on may be an edge — where a depth model interpolates between the near thing
+# and the far thing behind it, and reports a plane nothing is on. A median over
+# a small window answers the question that was asked.
+_SAMPLE_FRACTION = 0.01
+
+
+def depth_at(img: np.ndarray, x: int, y: int) -> float:
+    """Normalized depth under one pixel of `img`, on `depth_map`'s scale.
+
+    The scale is the whole point: this exists to fill in bokeh's `focus`, so it
+    has to be the same normalization the render will use, which is why it goes
+    through `depth_map` rather than inferring anything smaller. Coordinates are
+    in the image's own pixel space and are clamped, so a click on the last row
+    is a click on the last row rather than an error.
+    """
+    d = depth_map(img)
+    dh, dw = d.shape
+    h, w = img.shape[:2]
+    cx = min(dw - 1, max(0, round(x * dw / w)))
+    cy = min(dh - 1, max(0, round(y * dh / h)))
+    r = max(1, round(_SAMPLE_FRACTION * max(dh, dw)))
+    patch = d[max(0, cy - r) : cy + r + 1, max(0, cx - r) : cx + r + 1]
+    return round(float(np.median(patch)), 4)

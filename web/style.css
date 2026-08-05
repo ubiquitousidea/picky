@@ -393,6 +393,10 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   font-size: 0.8rem;
   cursor: pointer;
 }
+/* A pick button that sits under a slider is the width of the control it fills
+   in — its own shape rather than the bar's layout, so unlike the rules further
+   down this one is not scoped to #effect-params: the edit modal wants it too. */
+.param-row .sel-pick { width: 100%; margin-top: 0.3rem; }
 .sel-pick:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
 .sel-pick.armed { background: var(--rb-teal); color: var(--bg); }
 .sel-pick.busy { opacity: 0.7; }

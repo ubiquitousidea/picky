@@ -1068,7 +1068,9 @@ function buildCurveEditor(p, current, sourceNodeId) {
 // `sourceNodeId` is the node whose pixels the effect will be applied to — the
 // same node the preview composes on — and is what the curve editor draws its
 // histogram from.
-function buildParamControls(container, effectName, values = {}, sourceNodeId = null) {
+function buildParamControls(
+  container, effectName, values = {}, sourceNodeId = null, { allowPick = true } = {}
+) {
   const effect = state.effects.find((e) => e.name === effectName);
   container.innerHTML = "";
   for (const p of effect.params) {
@@ -1107,10 +1109,81 @@ function buildParamControls(container, effectName, values = {}, sourceNodeId = n
       input.dataset.param = p.name;
       input.oninput = () => (valSpan.textContent = input.value);
       row.append(label, input);
+      if (p.pick === "depth") {
+        row.appendChild(buildDepthPick(container, p, sourceNodeId, allowPick));
+      }
     }
     container.appendChild(row);
   }
   return effect;
+}
+
+// A slider whose number nobody can read off a photo — bokeh's focal plane is a
+// position in one frame's normalized depth — gets a second way in: click the
+// thing you want sharp. The button carries `.sel-pick` deliberately, not just
+// for the styling: that class is what disarmPick() sweeps, so arming this and
+// arming click-to-segment cannot both look lit, and either one disarms the
+// other for free. The slider stays the only thing Apply reads.
+function buildDepthPick(container, p, sourceNodeId, allowPick) {
+  const btn = document.createElement("button");
+  btn.type = "button"; // inside no form, but readParams() walks past it either way
+  btn.className = "sel-pick";
+  const idle = "Focus on a click";
+  btn.textContent = idle;
+  // Disabled rather than absent in the edit modal, exactly as the selection's
+  // own pick is and for the same reason: showModal() makes the image inert, so
+  // there is nothing to click. The slider still works there.
+  btn.disabled = !allowPick || sourceNodeId === null;
+  btn.title = btn.disabled
+    ? "Focusing by click needs the image — use the Bokeh button to make a new node"
+    : "Click the subject in the image to focus on it";
+
+  btn.onclick = () => {
+    if (selPicker.armed?.owner === btn) return disarmPick(); // a second press cancels
+    disarmPick(); // and a first press takes the slot off whoever else held it
+    selPicker.armed = {
+      owner: btn,
+      pick: async (x, y) => {
+        disarmPick();
+        // The panel is torn down and rebuilt whenever the selection changes,
+        // which is exactly the window this pick was waiting through — so the
+        // slider is looked up again rather than captured, and a rebuild that
+        // dropped it (a switch away from bokeh, say) lands on nothing.
+        const live = document.getElementById(container.id);
+        const input = live?.querySelector(`[data-param="${p.name}"]`);
+        const button = live?.querySelector(".sel-pick.depth-pick");
+        if (!input) return;
+        if (button) button.textContent = "Reading depth…";
+        try {
+          const { depth } = await api(
+            `/api/nodes/${sourceNodeId}/depth-at?x=${x}&y=${y}`
+          );
+          // The slider quantizes this to its own step, which is the point:
+          // what gets rendered and stored is a plain focus value someone can
+          // then nudge, not a hidden reading the number merely reports.
+          input.value = depth;
+          // one dispatch does both jobs: the input's own handler repaints the
+          // number beside the label, and the bubble reaches the delegated
+          // listener that schedules the preview
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          if (button) button.textContent = idle;
+        } catch (err) {
+          if (button) {
+            button.textContent = "Could not read depth";
+            button.title = err.message;
+          }
+        }
+      },
+    };
+    btn.classList.add("armed");
+    btn.textContent = "Click the subject";
+    $("preview-wrap").classList.add("picking");
+  };
+  // disarmPick() only removes `.armed`, so the label is put back here — the
+  // one place that knows what it said before.
+  btn.addEventListener("pickdisarmed", () => (btn.textContent = idle));
+  btn.classList.add("depth-pick");
+  return btn;
 }
 
 // Blend's second input is not a registry param (it names a node), so it gets
@@ -1888,6 +1961,9 @@ async function saveCrop() {
 
 // One overlay, one armed picker — the same single-slot model as `preview`:
 // whichever controls instance (Apply panel or edit modal) last drove it owns it.
+// `armed.owner` is the button that lit itself, so "press the lit button to
+// cancel" means the lit one: two different controls arm this slot (selecting an
+// object, and bokeh's focus pick) and each must be able to take it in one press.
 // `cache` maps an overlay's identity to its blob URL and owns every URL's
 // lifetime, so nothing here revokes on replacement — only on a cache clear.
 const selPicker = { armed: null, seq: 0, cache: new Map() };
@@ -1895,7 +1971,14 @@ const selPicker = { armed: null, seq: 0, cache: new Map() };
 function disarmPick() {
   selPicker.armed = null;
   $("preview-wrap").classList.remove("picking");
-  document.querySelectorAll(".sel-pick").forEach((b) => b.classList.remove("armed"));
+  document.querySelectorAll(".sel-pick").forEach((b) => {
+    b.classList.remove("armed");
+    // A button that rewrote its own label to say it was armed puts it back;
+    // the selection's own does not need this, since render(sel) sets its text
+    // from the store every time. Dispatched to every pick button rather than
+    // handled here, so this stays ignorant of what any of them say.
+    b.dispatchEvent(new Event("pickdisarmed"));
+  });
 }
 
 // What an overlay depends on. Saved masks are frozen pixels, so their PNG is a
@@ -2163,13 +2246,18 @@ function appendSelectionControls(
 
   if (allowPick) {
     pick.onclick = () => {
-      if (selPicker.armed) {
+      // pressing the *lit* button cancels; pressing a different one takes the
+      // slot over, so arming this never costs two presses because something
+      // else (the Focus pick) was waiting on a click
+      if (selPicker.armed?.owner === pick) {
         disarmPick();
         return;
       }
+      disarmPick();
       // single-shot: the click handler in initZoom does not disarm, so the
       // closure does it before committing
       selPicker.armed = {
+        owner: pick,
         pick: (x, y) => {
           disarmPick();
           commit({ points: [{ x, y, level: level.value }], invert: invert.checked });
@@ -2566,7 +2654,10 @@ function openEdit(node) {
   $("edit-title").textContent = `#${node.id} ${nodeLabel(node)}`;
   // the node's *parent* — editing re-applies the effect to the node's input,
   // which is both what the preview shows and what the histogram describes
-  buildParamControls($("edit-params"), node.effect, node.params || {}, node.parent_id);
+  // allowPick is off for the same inertness reason the selection's is, below
+  buildParamControls($("edit-params"), node.effect, node.params || {}, node.parent_id, {
+    allowPick: false,
+  });
   if (node.effect === "blend") {
     appendBlendTarget($("edit-params"), {
       text: "Blend with",

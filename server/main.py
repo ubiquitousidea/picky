@@ -759,6 +759,29 @@ def get_histogram(node_id: int):
     return rendering.histogram(node_id)
 
 
+@app.get("/api/nodes/{node_id}/depth-at")
+def get_depth_at(node_id: int, x: int, y: int):
+    """The depth under one pixel of a node's render, as bokeh's `focus` param.
+
+    Click-to-focus: `focus` is a number in the *normalized* depth of one
+    particular frame, which is not something anyone can read off a photo, so the
+    frontend turns a click into one. It stays a plain float param and this stays
+    a plain read — nothing is stored, and the slider remains the single source
+    of truth for what gets rendered.
+
+    Deliberately goes through `depth.depth_map` rather than sampling anything
+    cheaper: the value is only useful if it is on the same scale as the map that
+    will drive the radius, and that scale comes from percentiles over the whole
+    frame. The shared in-process cache means the click usually costs a decode
+    and a hash rather than the model.
+    """
+    if db.get_node(node_id) is None:
+        raise HTTPException(404, "node not found")
+    _check_effect_ready("bokeh")
+    img = np.asarray(Image.open(rendering.render_node(node_id)).convert("RGB"))
+    return {"depth": depth.depth_at(img, x, y)}
+
+
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: int):
     node = db.get_node(node_id)

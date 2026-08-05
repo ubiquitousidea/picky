@@ -520,7 +520,12 @@ EFFECTS = {
         "apply": bokeh,
         "params": [
             {"name": "amount", "label": "Amount (% of frame)", "type": "float", "min": 0.1, "max": 6.0, "step": 0.1, "default": 1.5},
-            {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0},
+            # `pick` says this float can be read off the image instead of dialled
+            # in — the frontend grows a button that arms the same picker
+            # click-to-segment uses and fills the slider from the depth under
+            # the click. Presentation only: the param is still a float, and
+            # `validate_params` never sees the key.
+            {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0, "pick": "depth"},
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
             {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
