@@ -80,6 +80,27 @@ one place silently breaks another.
 - **Every registry effect maps an array to an array of the same size**, so every
   node of an image shares the original's dimensions. Much of the app leans on
   this — see crop, below.
+- **Bokeh is the one effect with a model behind it**, and it stays a plain
+  registry entry: `apply(img, params)` carries no node id, so its depth map is
+  cached in-process on a hash of the pixels (`depth.depth_map`) rather than on
+  disk beside `<node_id>.embedding.npy`. That is the trade — a cache keyed by
+  node would cost the registry's "a new effect is one entry and nothing else".
+  Two things live outside the effect because of it: `main._check_effect_ready`
+  409s every render path by effect *name* until the weights are on disk, and
+  `setEffect()` is what triggers the download.
+- **Bokeh blurs at a bounded working resolution and recombines the original at
+  full size.** Both caps (`_BOKEH_WORK_PX`, `_BOKEH_WORK_R`) are what keep a
+  40 MP render to seconds and megabytes, and they are only safe because the
+  pixels taken from that canvas are, by construction, the blurred ones — the
+  crossover is placed where the upsample's lost detail is already smaller than
+  the blur. Its layers are composited far-to-near with premultiplied alpha, not
+  lerped between two globally blurred frames; the cheap version smears the
+  subject outward as a halo, which is the same artifact as the hard-edged
+  masked blur bokeh exists to replace.
+- **`_disk_blur` and `_disk_mean` are deliberately not one function** — uint8
+  and exactly-int32 for the shipped Blur, float32 and N channels for bokeh's
+  premultiplied layers. Generalizing the first would change what every existing
+  disk-blur node re-renders to. Only the geometry is shared, as `_disk_runs`.
 - **The tone curve's LUT is implemented twice on purpose** —
   `effects._curve_lut` and `curveLut()` in `web/app.js`, line for line — so the
   editor draws exactly the transfer function the server will apply. Change one,
@@ -176,12 +197,22 @@ one place silently breaks another.
   most sessions never type in the box, so `text_job.py` is triggered by the
   search box alone — never by opening the map — and `/api/embedding-map/search`
   409s instead of fetching a quarter-gigabyte inside a GET.
-- **`server/embed_job.py` is only ever an optimization; `server/text_job.py` is
-  not.** `GET /api/embedding-map` still embeds whatever it finds missing, so the
-  map is correct if nobody prepared, if the job died, or if both run at once —
-  keep it that way, a prepare the map *required* would be a second source of
-  truth. Search has no such fallback by choice (see above), which is exactly why
-  the two jobs are separate modules rather than two phases of one.
+- **Three ONNX models, three different normalizations.** SAM's constants are
+  applied to 0-255 pixels, CLIP's to 0-1 floats, and `depth.py`'s are plain
+  ImageNet over 0-1 floats. Crossing them yields output that still looks like
+  output — a plausible depth map, a well-spread vector — and nothing downstream
+  can detect it. `sam.py` owns `MODELS_DIR` and `download_model`; `embed.py`
+  and `depth.py` both borrow them rather than re-deriving the pinned-revision
+  and atomic-write contract.
+- **`server/embed_job.py` is only ever an optimization; `server/text_job.py`
+  and `server/depth_job.py` are not.** `GET /api/embedding-map` still embeds
+  whatever it finds missing, so the map is correct if nobody prepared, if the
+  job died, or if both run at once — keep it that way, a prepare the map
+  *required* would be a second source of truth. Search and bokeh have no such
+  fallback by choice (see above), which is exactly why the three are separate
+  modules rather than phases of one: each is triggered by the one gesture that
+  needs it — opening the map, typing a query, lighting the Bokeh button — so
+  nobody pays for a model they never use.
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
   ALTER TABLE). User databases contain real work; never require a wipe.
 

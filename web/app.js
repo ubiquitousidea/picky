@@ -604,6 +604,23 @@ function iconCurves() {
   return svg;
 }
 
+// out-of-focus highlights: the overlapping discs a fast lens turns points into,
+// growing and fading as they recede. One stays crisp — that is the subject
+function iconBokeh() {
+  const svg = iconSvg();
+  const discs = [
+    [17, 7.5, 5.2, 0.22], [7.5, 9, 4, 0.35], [15.5, 17, 4.6, 0.28], [6, 18, 2.8, 0.45],
+  ];
+  for (const [cx, cy, r, opacity] of discs) {
+    svg.appendChild(svgEl("circle", {
+      cx, cy, r, fill: "currentColor", "fill-opacity": opacity,
+      stroke: "currentColor", "stroke-width": 0.9, "stroke-opacity": opacity + 0.3,
+    }));
+  }
+  svg.appendChild(svgEl("circle", { cx: 11, cy: 12, r: 2.2, fill: "currentColor" }));
+  return svg;
+}
+
 // two nodes merging into one, drawn with the same curve the DAG rail uses
 function iconBlend() {
   const svg = iconSvg();
@@ -626,6 +643,7 @@ function iconBlend() {
 // treat each pair as two separate effects.
 const EFFECT_BUTTONS = [
   { key: "blur", label: "Blur", icon: iconBlur, effects: ["blur"] },
+  { key: "bokeh", label: "Bokeh", icon: iconBokeh, effects: ["bokeh"] },
   { key: "edges", label: "Sobel edges", icon: iconEdges, effects: ["edges"] },
   {
     key: "posterize",
@@ -691,8 +709,76 @@ function setEffect(name) {
   renderEffectControls();
   // turning the effect off restores the node's own render — that *is* "show me
   // the original", so there is no separate control for it
-  if (state.effect) enterApplyPreview();
-  else exitPreview(true);
+  if (!state.effect) return exitPreview(true);
+  // Bokeh is the one effect with a model behind it, and the server 409s rather
+  // than fetching 99 MB inside a render. So the button is what triggers the
+  // download, the way the search box triggers the text tower, and the preview
+  // waits for it — a live preview that 409'd on every slider drag would be a
+  // worse way to learn the same thing.
+  if (state.effect === "bokeh" && !depthReady) prepareDepthModel();
+  else enterApplyPreview();
+}
+
+// Latched, so the round trip happens once a session rather than on every visit
+// to the button. The server answers `done` synchronously when the file is
+// already there, so even the first visit is one request and no poll.
+let depthReady = false;
+let depthSeq = 0;
+// The markup's own "rendering…", captured the first time anything is about to
+// overwrite it rather than spelled out a second time here.
+let previewStatusText = null;
+
+async function prepareDepthModel() {
+  const seq = ++depthSeq;
+  const status = $("preview-status");
+  if (previewStatusText === null) previewStatusText = status.textContent;
+  const say = (text) => {
+    status.textContent = text;
+    status.classList.add("busy"); // it is `visibility: hidden` otherwise
+  };
+  // Switching effects mid-download abandons the poll — including the enter into
+  // preview at the end, which would otherwise fire against whatever is lit now.
+  // Abandoning puts the line back as it goes, so a half-written progress
+  // message cannot survive to be shown as the next effect's "rendering…".
+  const stale = () => {
+    if (seq === depthSeq && state.effect === "bokeh") return false;
+    status.textContent = previewStatusText;
+    status.classList.remove("busy");
+    return true;
+  };
+  try {
+    let job = await api("/api/depth-model/prepare", { method: "POST" });
+    while (job.state === "running") {
+      if (stale()) return;
+      say(depthJobText(job));
+      await new Promise((done) => setTimeout(done, EMBED_POLL_MS));
+      if (stale()) return;
+      job = await api("/api/depth-model/progress");
+    }
+    if (stale()) return;
+    if (!job.ready) throw new Error(job.error || "not available");
+  } catch (err) {
+    if (stale()) return;
+    // Reported and not retried, for runEmbedSearch()'s reason: falling through
+    // would repeat the whole download to reach the same error.
+    say(`Could not load the depth model: ${err.message}`);
+    return;
+  }
+  depthReady = true;
+  status.textContent = previewStatusText; // back to what refreshPreview() shows
+  status.classList.remove("busy");
+  enterApplyPreview();
+}
+
+// One phase and one unit, like textJobText() — and separate from it for the
+// same reason, that naming the model is most of what the sentence is for.
+function depthJobText(job) {
+  if (job.phase === "download") {
+    const mb = (bytes) => Math.round(bytes / 1e6);
+    const of = job.total ? ` of ${mb(job.total)}` : ""; // no Content-Length
+    return `Downloading the depth model — ${mb(job.done)}${of} MB (first use only)`;
+  }
+  return "Loading the depth model…";
 }
 
 // A grouped button picks its effect here rather than in buildParamControls(),
