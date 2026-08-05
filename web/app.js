@@ -2740,6 +2740,12 @@ const embedMap = {
   // its screen offset from the canvas centre. The cloud's own centre until you
   // grab somewhere else.
   pivot: { x: 0, y: 0, z: 0 },
+  // Whether the pivot follows the pick instead of the grab (see
+  // pivotOnSelection). Outlives an open, like spriteScale and matchZ — it is a
+  // taste for how turning the cloud should work, not part of where you are
+  // looking. It does nothing until something is picked, and `selected` *is*
+  // cleared on every open, so a reopened map still turns about the grab.
+  orbit: false,
   spin: true,
   raf: null,
   selected: null,
@@ -2823,6 +2829,10 @@ function setClusterSlider(count) {
 // reaching any of them restores all three. Resetting the pivot is not optional:
 // leave it on some grab point and pan 0 would centre *that*, not the cloud.
 // This is also what saves the map a reset button it has no room for.
+//
+// Orbit is deliberately not honoured here: at 1x the whole cloud is framed and
+// its own centre is the only sensible pivot, so the tick takes effect again at
+// the next pick or grab rather than fighting the reframing.
 function resetEmbedView() {
   embedMap.zoom = 1;
   embedMap.panX = 0;
@@ -2859,6 +2869,25 @@ function setEmbedPivot(screenX, screenY) {
   // pivot projects exactly where it was clicked, so nothing on screen moves.
   embedMap.panX = screenX - w / 2;
   embedMap.panY = screenY - h / 2;
+}
+
+// With Orbit ticked, rotation turns about the picked image instead of about the
+// grab — which is the thing you want once you have found something and only the
+// view around it is still wrong. It buys the same invisibility setEmbedPivot()
+// does, and gets it without any of the trig: a pivot placed *on* a point
+// projects to the pan anchor by construction, and the draw loop has already
+// cached where that point currently is (p.sx/p.sy, refreshed every frame).
+//
+// Returns whether it could — the caller falls back to the grab when it could
+// not, so "orbit on, nothing picked" is not a special case anywhere else.
+function pivotOnSelection() {
+  const p = embedMap.selected;
+  if (!p || !Number.isFinite(p.sx)) return false; // never drawn: nothing to hold still
+  const { w, h } = embedCamera();
+  embedMap.pivot = { x: p.x, y: p.y, z: p.z };
+  embedMap.panX = p.sx - w / 2;
+  embedMap.panY = p.sy - h / 2;
+  return true;
 }
 
 async function openEmbedMap() {
@@ -3430,6 +3459,9 @@ function selectEmbedPoint(point) {
   $("embed-card-name").textContent = point.name;
   $("embed-card-name").title = point.name;
   card.hidden = false;
+  // Picking moves the rotation centre at once rather than waiting for a drag,
+  // so the auto-spin starts orbiting the new pick too. Nothing on screen moves.
+  if (embedMap.orbit) pivotOnSelection();
 }
 
 function initEmbedMap() {
@@ -3447,9 +3479,11 @@ function initEmbedMap() {
     dragging = true;
     panning = e.button !== 0;
     // A rotate drag turns the cloud about wherever it was grabbed, so the pivot
-    // is chosen here, before the first move. A pan drag keeps the pivot it has:
-    // panning slides the whole cloud, pivot included.
-    if (!panning) {
+    // is chosen here, before the first move — unless Orbit has nailed it to the
+    // pick, which is why pivotOnSelection() is asked first and the grab is the
+    // fallback. A pan drag keeps the pivot it has either way: panning slides the
+    // whole cloud, pivot included.
+    if (!panning && !(embedMap.orbit && pivotOnSelection())) {
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       setEmbedPivot((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr);
@@ -3551,6 +3585,13 @@ function initEmbedMap() {
     embedMap.matchZ = Number(e.target.value);
     $("embed-match-num").textContent = embedMap.matchZ.toFixed(1);
     applyEmbedFilter();
+  };
+  // Costs nothing but the pivot, like Size and unlike Groups — and re-pivoting
+  // on the tick is what makes the box read as an answer rather than a promise:
+  // the auto-spin swings onto the pick immediately, without moving it.
+  $("embed-orbit").onchange = (e) => {
+    embedMap.orbit = e.target.checked;
+    if (embedMap.orbit) pivotOnSelection();
   };
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;
