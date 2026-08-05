@@ -61,6 +61,19 @@ BLUR_KERNELS = ["gaussian", "disk"]
 _DISK_BAND_ROWS = 1024
 
 
+def _disk_runs(r: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """A flat disk of radius `r` as horizontal runs: the row offsets, each row's
+    half-width, and the total pixel area.
+
+    Extracted because `_disk_blur` and `_disk_mean` both need exactly this and
+    a disk that disagreed with itself between them would be very hard to see —
+    two blurs that are each internally consistent and slightly different sizes.
+    """
+    dys = np.arange(-r, r + 1)
+    half = np.floor(np.sqrt(r * r - dys * dys)).astype(np.int64)
+    return dys, half, int((2 * half + 1).sum())
+
+
 def _disk_blur(img: np.ndarray, r: int) -> np.ndarray:
     """Convolution with a flat disk of radius `r` — defocus, not soft focus.
 
@@ -78,9 +91,7 @@ def _disk_blur(img: np.ndarray, r: int) -> np.ndarray:
     accumulator at pi*r^2*255 (~8.0e6), both far inside 2^31.
     """
     h, w = img.shape[:2]
-    dys = np.arange(-r, r + 1)
-    half = np.floor(np.sqrt(r * r - dys * dys)).astype(np.int64)
-    area = int((2 * half + 1).sum())
+    dys, half, area = _disk_runs(r)
 
     out = np.empty_like(img)
     for y0 in range(0, h, _DISK_BAND_ROWS):
@@ -115,6 +126,184 @@ def gaussian_blur(img: np.ndarray, params: dict) -> np.ndarray:
         return _disk_blur(img, max(1, int(round(radius))))
     out = Image.fromarray(img).filter(ImageFilter.GaussianBlur(radius))
     return np.asarray(out)
+
+
+# ---------- Bokeh: defocus that follows depth ----------
+#
+# The alternative this replaces is: segment the subject, invert, disk-blur. That
+# blurs every background pixel by the same radius right up against a
+# pixel-perfect silhouette, and the hard edge is what gives it away. A lens
+# instead grows its circle of confusion with distance from the focal plane, so
+# this drives the radius from a monocular depth estimate and no selection is
+# involved at all.
+
+SHOW_MODES = ["bokeh", "depth"]
+
+# Everything blurred is computed on a canvas no larger than this on the long
+# side. Blurred pixels have no high-frequency content by definition, so nothing
+# visible survives the round trip — and the pixels that *are* sharp never come
+# from this canvas at all (see the recombine at the end). It is what keeps the
+# whole effect inside tens of megabytes: a 40 MP frame as one 4-channel float32
+# layer would be 640 MB, and there are two of them live at once.
+_BOKEH_WORK_PX = 2048
+# A second, independent cap on the same scale: past this radius a bigger canvas
+# only makes the blur slower, never better. Together the two make an extreme
+# `amount` cost about what a moderate one does.
+_BOKEH_WORK_R = 96
+# Layer count from the radius — a 3 px blur has no use for 12 distinct radii.
+_BOKEH_MIN_LAYERS, _BOKEH_MAX_LAYERS = 4, 12
+
+
+def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
+    """Mean over a flat disk of radius `r`, for float32 arrays of any depth.
+
+    `_disk_blur`'s algorithm — see that docstring for why a disk is summed as
+    horizontal runs rather than convolved — over float32 and C channels instead
+    of uint8 and exactly 3. The two are deliberately not one function: the
+    uint8 path's promise that "int32 holds every intermediate exactly" is
+    load-bearing for a shipped effect, and generalizing it would quietly change
+    what every existing disk-blur node re-renders to. Only the disk geometry is
+    shared, via `_disk_runs`.
+
+    No banding, unlike its sibling: callers work at `_BOKEH_WORK_PX`, where a
+    full-frame float32 running sum is tens of megabytes rather than hundreds.
+    """
+    if r < 1:
+        return arr
+    h, w, c = arr.shape
+    dys, half, area = _disk_runs(r)
+    src = np.pad(arr, ((r, r), (r, r), (0, 0)), mode="edge")
+    # leading zero column, so a run sum is C[hi] - C[lo] with no case at x=0
+    sums = np.zeros((src.shape[0], src.shape[1] + 1, c), dtype=np.float32)
+    np.cumsum(src, axis=1, dtype=np.float32, out=sums[:, 1:])
+
+    acc = np.zeros((h, w, c), dtype=np.float32)
+    for dy, hw in zip(dys, half):
+        k = int(dy) + r  # padded row holding source row (y + dy)
+        lo, hi = r - int(hw), r + int(hw) + 1
+        acc += sums[k : k + h, hi : hi + w] - sums[k : k + h, lo : lo + w]
+    return acc / area
+
+
+def _bokeh_layers(src: np.ndarray, d: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Composite `src` as depth-ordered layers, each blurred by its own radius.
+
+    `d` is normalized depth (1 = nearest) and `radii[k]` is the blur radius for
+    band k, whose centre is at depth k/(L-1). Each pixel is split between its
+    two neighbouring bands by linear interpolation, so the partition is smooth
+    and there is no banding where a band boundary crosses a surface.
+
+    The bands are then composited far to near with premultiplied alpha. This is
+    the step that earns the design, and the tempting simplification — blur the
+    whole frame at each radius and lerp between the two nearest results — is
+    what it exists to avoid: a globally blurred layer has averaged the subject
+    into itself, so the subject's colour smears outward as a halo. That is the
+    same artifact as the hard-edged mask blur this effect replaces, wearing a
+    softer hat. Carrying coverage as alpha instead gets the occlusion right:
+    the sharp subject covers the blurred background, and the background's blur
+    never reaches into the subject.
+    """
+    layers = len(radii)
+    pos = d * (layers - 1)
+    lower = np.floor(pos).clip(0, layers - 2)
+    frac = (pos - lower).astype(np.float32)
+    lower = lower.astype(np.int32)
+
+    out = np.zeros(src.shape, dtype=np.float32)
+    coverage = np.zeros(src.shape[:2] + (1,), dtype=np.float32)
+    layer = np.empty(src.shape[:2] + (4,), dtype=np.float32)
+    for k in range(layers):
+        # a pixel lands in band k as the lower of its pair (weight 1-frac) or as
+        # the upper (weight frac), never both
+        weight = np.where(lower == k, 1.0 - frac, 0.0)
+        weight += np.where(lower + 1 == k, frac, 0.0)
+        if not weight.any():
+            continue  # nothing at this depth: real scenes leave bands empty
+        layer[..., :3] = src * weight[..., None]  # premultiplied
+        layer[..., 3] = weight
+        blurred = _disk_mean(layer, int(round(radii[k])))
+        # `over`, with the new band in front of everything accumulated so far —
+        # which holds because k ascends with depth toward the viewer
+        behind = 1.0 - blurred[..., 3:4]
+        out = blurred[..., :3] + behind * out
+        coverage = blurred[..., 3:4] + behind * coverage
+    # Coverage falls short of 1 wherever the blurs spread a band's weight
+    # outward faster than its neighbours filled in behind it; un-premultiplying
+    # by what actually arrived is what keeps those places from darkening.
+    return out / np.maximum(coverage, 1e-6)
+
+
+def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
+    # Imported here rather than at module scope for two reasons, the first
+    # fatal: db.py imports this module, and depth -> sam -> db closes the
+    # circle. The second is _fit_kmeans's — nothing unrelated to bokeh should
+    # stop working because an onnxruntime wheel is broken on this platform.
+    from . import depth
+
+    h, w = img.shape[:2]
+    d_small = depth.depth_map(img)  # float32 0-1 at the model's resolution
+
+    if params["show"] == "depth":
+        # What the model saw, so `focus` can be aimed at something. Bilinear up
+        # from ~0.4 MP: this is a view of the depth map, not a smoothing of it.
+        grey = Image.fromarray((d_small * 255).astype(np.uint8))
+        return np.asarray(grey.resize((w, h), Image.Resampling.BILINEAR).convert("RGB"))
+
+    focus = float(params["focus"])
+    falloff = float(params["falloff"])
+    # `amount` is a percentage of the long side, where blur's `radius` is in
+    # pixels: a depth-of-field setting has to mean the same thing on the 800x600
+    # and the 40 MP frames in one library, and the blur that reads as "portrait
+    # lens" is a fraction of the frame, not a count of pixels.
+    r_full = float(params["amount"]) / 100.0 * max(h, w)
+
+    scale = min(1.0, _BOKEH_WORK_PX / max(h, w), _BOKEH_WORK_R / max(r_full, 1e-6))
+    ww, wh = max(1, round(w * scale)), max(1, round(h * scale))
+    r_work = r_full * scale
+    if r_work < 1.0:
+        return img.copy()  # sub-pixel everywhere; there is no blur to apply
+
+    # BOX going down is an area average — a subsample would alias the very
+    # detail the blur is meant to dissolve.
+    src_im = Image.fromarray(img).resize((ww, wh), Image.Resampling.BOX)
+    src = np.asarray(src_im, dtype=np.float32)
+    d = np.asarray(
+        Image.fromarray(d_small).resize((ww, wh), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+
+    layers = int(np.clip(round(r_work / 3), _BOKEH_MIN_LAYERS, _BOKEH_MAX_LAYERS))
+    # Distance from the focal plane, normalized so the far end of the scene
+    # reaches exactly `amount`. Linear (falloff 1) is not a stand-in for
+    # something better: a real circle of confusion is proportional to
+    # |1/z_focus - 1/z|, and the model's output *is* inverse depth, so a
+    # straight ramp on it is what the optics do. See server/depth.py.
+    span = max(focus, 1.0 - focus)
+    band_t = np.abs(np.linspace(0.0, 1.0, layers) - focus) / span
+    work = _bokeh_layers(src, d, r_work * band_t**falloff)
+
+    # Recombine at full resolution. Everything sharp comes from the original —
+    # the whole point of the working canvas is that it is only ever asked for
+    # pixels that are blurred — and the crossover is placed where the detail the
+    # upsample threw away (about 1/scale pixels) is already smaller than the
+    # blur being applied, so there is nothing to see at either end of it.
+    soft = 1.0 / scale
+    lo, hi = max(2.0, 1.5 * soft), max(6.0, 4.0 * soft)
+    pixel_t = np.abs(d - focus) / span
+    mix = np.clip((r_full * pixel_t**falloff - lo) / (hi - lo), 0.0, 1.0)
+    mix = mix * mix * (3.0 - 2.0 * mix)  # smoothstep: no seam at either end
+
+    blurred = Image.fromarray(work.clip(0, 255).astype(np.uint8))
+    mask = Image.fromarray((mix * 255).astype(np.uint8), mode="L")
+    # Image.composite rather than a numpy lerp: at 40 MP the float temporaries
+    # would be half a gigabyte, and this is the same arithmetic in C.
+    return np.asarray(
+        Image.composite(
+            blurred.resize((w, h), Image.Resampling.BICUBIC),
+            Image.fromarray(img),
+            mask.resize((w, h), Image.Resampling.BILINEAR),
+        )
+    )
 
 
 def sobel_edges(img: np.ndarray, params: dict) -> np.ndarray:
@@ -324,6 +513,16 @@ EFFECTS = {
         "params": [
             {"name": "radius", "label": "Radius", "type": "int", "min": 1, "max": 100, "default": 4},
             {"name": "kernel", "label": "Kernel", "type": "choice", "options": BLUR_KERNELS, "default": "gaussian"},
+        ],
+    },
+    "bokeh": {
+        "label": "Bokeh",
+        "apply": bokeh,
+        "params": [
+            {"name": "amount", "label": "Amount (% of frame)", "type": "float", "min": 0.1, "max": 6.0, "step": 0.1, "default": 1.5},
+            {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0},
+            {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
+            {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
     },
     "edges": {
