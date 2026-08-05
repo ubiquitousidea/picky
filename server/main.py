@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import db, embed_job, labels, rendering
+from . import db, embed_job, labels, rendering, text_embed, text_job
 from .effects import (
     EFFECTS,
     crop_geometry,
@@ -270,6 +270,26 @@ def _collect_embeddings(images: list[dict]):
     return vectors, points
 
 
+def _library_vectors(images: list[dict]):
+    """`_collect_embeddings`, guaranteed rectangular.
+
+    Every vector must be the model's output width for the stack to be a matrix.
+    A mixed cache means the ONNX export changed under it (a 512-d projection
+    head vs a 768-d pooled output), so re-embed the library once rather than 500
+    — the map is a view, and a stale cache is not a reason to refuse to draw it.
+
+    Shared by the map and by search so the two cannot disagree about the
+    library: search reaches this with everything cached, but if it ever did not,
+    silently recovering in one place beats a `np.vstack` ValueError in the other.
+    """
+    vectors, points = _collect_embeddings(images)
+    if len({v.shape[0] for v in vectors}) > 1:
+        for image in images:
+            db.clear_embedding(image["id"])
+        vectors, points = _collect_embeddings(images)
+    return np.vstack(vectors).astype(np.float32), points
+
+
 @app.get("/api/embedding-map")
 def embedding_map(method: str = "pca", clusters: int = 0):
     """Every image as a point in 3D — the Image map's data.
@@ -305,18 +325,7 @@ def embedding_map(method: str = "pca", clusters: int = 0):
     if not images:
         return {"method": method, "points": [], "clusters": []}
 
-    vectors, points = _collect_embeddings(images)
-    # Every vector must be the model's output width for the stack to be
-    # rectangular. A mixed cache means the ONNX export changed under it (a 512-d
-    # projection head vs a 768-d pooled output), so re-embed the library once
-    # rather than 500 — the map is a view, and a stale cache is not a reason to
-    # refuse to draw it.
-    if len({v.shape[0] for v in vectors}) > 1:
-        for image in images:
-            db.clear_embedding(image["id"])
-        vectors, points = _collect_embeddings(images)
-
-    stacked = np.vstack(vectors).astype(np.float32)
+    stacked, points = _library_vectors(images)
     coords = _project(stacked, method)
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
@@ -351,6 +360,100 @@ def embedding_map(method: str = "pca", clusters: int = 0):
     for point, index in zip(points, assignments):
         point["cluster"] = int(index)
     return {"method": method, "points": points, "clusters": groups}
+
+
+@app.get("/api/embedding-map/search")
+def search_embedding_map(q: str):
+    """Score every image against a typed phrase — the Image map's search box.
+
+    The same trick `labels.py` names clusters with, run the other way. CLIP put
+    captions and the photos they describe in one 512-d space, so one dot product
+    between a query vector and the library's cached image vectors is the whole
+    search: no index, no per-image model run, sub-millisecond over a few hundred
+    images.
+
+    **Scores come back as z-scores, and that is the point.** A raw CLIP
+    image-text cosine sits in a narrow band around 0.2 whose *position* moves
+    with how the query was phrased, so "keep everything above 0.28" means
+    something different for every query and nothing at all to a user. Measured
+    in standard deviations above this query's own mean over this library, one
+    slider position means roughly one strictness whatever you type. The raw
+    cosine rides along anyway, because it is what makes the endpoint legible
+    from curl.
+
+    Unlike `embedding_map`, this refuses rather than doing the slow thing
+    itself: that endpoint embeds whatever it finds missing, but the equivalent
+    here would be downloading 254 MB inside a GET. So a library that has never
+    searched gets a 409 and the frontend runs `text_job` — see that module.
+    """
+    query = q.strip()
+    if not query:
+        raise HTTPException(400, "q must not be empty")
+    if not text_embed.ready():
+        # 409, not 503: the state is wrong rather than the server unwell, and it
+        # is the caller's `POST /api/text-model/prepare` that fixes it.
+        raise HTTPException(409, "the text model is not downloaded yet")
+
+    images = db.list_images()
+    if not images:
+        return {"query": query, "mean": 0.0, "std": 0.0, "scores": {}}
+
+    # `_library_vectors` rather than a query of its own: it is all cache hits in
+    # practice, since search is only reachable from an already-open map, but
+    # reusing it is what stops search and the map disagreeing about which images
+    # exist or what their vectors are.
+    stacked, points = _library_vectors(images)
+
+    try:
+        vec = text_embed.encode_query(query)
+    except Exception as exc:
+        raise HTTPException(500, f"could not encode the query: {exc}")
+
+    if stacked.shape[1] != vec.shape[0]:
+        # Not the joint space — `labels.py`'s docstring explains the whole trap,
+        # and this is the same answer: say nothing rather than something wrong.
+        print(
+            f"picky: query is {vec.shape[0]}-d but embeddings are "
+            f"{stacked.shape[1]}-d; skipping search"
+        )
+        return {"query": query, "mean": 0.0, "std": 0.0, "scores": {}}
+
+    # Both sides are unit length, so the dot product is the cosine.
+    scores = stacked @ vec
+    mean = float(scores.mean())
+    std = float(scores.std())
+    # A library of one image, or of identical ones, has no spread to measure
+    # against; every z of 0 filters to "everything", which is the honest answer.
+    zs = (scores - mean) / std if std > 0 else np.zeros_like(scores)
+    return {
+        "query": query,
+        "mean": mean,
+        "std": std,
+        "scores": {
+            str(point["image_id"]): {"score": round(float(s), 4), "z": round(float(z), 3)}
+            for point, s, z in zip(points, scores, zs)
+        },
+    }
+
+
+@app.post("/api/text-model/prepare")
+def prepare_text_model():
+    """Start fetching CLIP's text tower, and report where it already is.
+
+    Search's counterpart to `/api/embedding-map/prepare`, and called at a
+    deliberately different moment: the map's prepare runs on every open, this
+    one only when the search box is first used. The tower is 254 MB and most
+    sessions never search, so nothing but a keystroke may trigger it.
+    """
+    return text_job.start()
+
+
+@app.get("/api/text-model/progress")
+def text_model_progress():
+    """Where the fetch from `prepare` got to. Safe to call at any time; a server
+    nobody has searched on this run reports `idle` with `ready` already true if
+    an earlier run downloaded the files."""
+    return text_job.snapshot()
 
 
 @app.post("/api/embedding-map/prepare")

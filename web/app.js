@@ -2731,6 +2731,24 @@ const embedMap = {
   // across opens: a baked sprite is immutable for its key, so a reopened map
   // should be instant rather than re-fetching a library it already has.
   sprites: new Map(),
+  // The semantic search. `scores` is image_id -> z, or null for "no search
+  // running", which is the whole off state: null means every point draws, so
+  // there is no second flag anywhere saying whether filtering is on.
+  //
+  // These reset on every open, unlike yaw/pitch/spriteScale and like the
+  // framing — a query is a thing you were looking for once, not a reading
+  // preference for a library of a given density.
+  query: "",
+  scores: null,
+  // How strong a match to keep, in standard deviations above the query's own
+  // mean over the library. Not a raw cosine: CLIP's image-text cosines sit in a
+  // narrow band whose position moves with the phrasing, so an absolute
+  // threshold means something different for every query (see main.py's
+  // search_embedding_map). Outlives an open, like spriteScale — it is a taste
+  // for how strict searching should feel.
+  matchZ: 1.2,
+  searchTimer: null,
+  searchSeq: 0,
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
@@ -2749,6 +2767,10 @@ const EMBED_SPRITE_WORLD = 0.26;
 // which is the whole cost of drawing a library sixty times a second. Sprites
 // only reach this size past ~8x zoom, and are merely soft beyond it.
 const EMBED_SPRITE_PX = 256;
+// Long enough that typing a phrase is one request rather than one per letter,
+// short enough that pausing mid-thought still shows you something. The server
+// caches by phrase, so a backspace-and-retype is free anyway.
+const EMBED_SEARCH_MS = 250;
 
 // One hue per cluster, spun by the golden angle so that however many groups
 // there are, adjacent ids land far apart on the wheel and no two of a dozen
@@ -2812,6 +2834,11 @@ async function openEmbedMap() {
   // yaw/pitch persist across opens on purpose, but the framing does not: a map
   // reopened still parked at 16x on some corner reads as a broken map.
   resetEmbedView();
+  // A query is part of the framing, not part of the viewpoint: reopening the
+  // map still filtered to a search you finished last time hides most of the
+  // library for no visible reason.
+  $("embed-search").value = "";
+  clearEmbedSearch();
   $("embed-card").hidden = true;
   $("embed-status").textContent = "Preparing…";
   $("embed-modal").showModal();
@@ -2895,15 +2922,109 @@ async function loadEmbedMap() {
     if (!embedMap.clusterCount && data.clusters.length) {
       setClusterSlider(data.clusters.length);
     }
-    $("embed-status").textContent = data.points.length
-      ? `${data.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to pause`
-      : "No images yet.";
+    $("embed-status").textContent = embedIdleStatus();
+    // These are fresh point objects, so their `hidden` flags start clear. A
+    // search survives the refetch anyway: `scores` is keyed by image_id, which
+    // is what re-projecting or re-clustering the same library cannot change.
+    applyEmbedFilter();
     startEmbedLoop();
   } catch (err) {
     if (seq !== embedMap.seq || !embedMap.open) return;
     embedMap.points = [];
     $("embed-status").textContent = `Could not build the map: ${err.message}`;
   }
+}
+
+// The status line the map wears when nothing is filtered. Shared by the two
+// places that restore it, so the legend cannot drift between them.
+function embedIdleStatus() {
+  return embedMap.points.length
+    ? `${embedMap.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to pause`
+    : "No images yet.";
+}
+
+// Score the library against the box's current contents.
+//
+// Two requests deep on a cold machine: the text tower is 254 MB and is fetched
+// only now — not when the map opens — because most sessions never search, and
+// nobody should pay for a model they will not use. That is also why the server
+// 409s instead of downloading inside the GET, and why this polls a job for it
+// exactly as prepareEmbedMap() does for the vision model.
+async function runEmbedSearch() {
+  const query = $("embed-search").value.trim();
+  embedMap.query = query;
+  if (!query) return clearEmbedSearch();
+
+  const seq = ++embedMap.searchSeq;
+  const stale = () => seq !== embedMap.searchSeq || !embedMap.open;
+  try {
+    let job = await api("/api/text-model/prepare", { method: "POST" });
+    while (job.state === "running") {
+      if (stale()) return;
+      $("embed-status").textContent = textJobText(job);
+      await new Promise((done) => setTimeout(done, EMBED_POLL_MS));
+      if (stale()) return;
+      job = await api("/api/text-model/progress");
+    }
+    if (stale()) return;
+    if (!job.ready) {
+      // Reported rather than retried, for prepareEmbedMap()'s reason: falling
+      // through to the search would repeat the whole download to reach the
+      // same error.
+      $("embed-status").textContent =
+        `Could not load the text model: ${job.error || "not available"}`;
+      return;
+    }
+    const data = await api(`/api/embedding-map/search?q=${encodeURIComponent(query)}`);
+    if (stale()) return;
+    embedMap.scores = data.scores;
+    applyEmbedFilter();
+  } catch (err) {
+    if (stale()) return;
+    $("embed-status").textContent = `Could not search: ${err.message}`;
+  }
+}
+
+// text_job has one phase and one unit, so this is embedJobText() minus the
+// half that changes units — kept separate rather than sharing, because the two
+// jobs name different models and the sentence is the whole value.
+function textJobText(job) {
+  if (job.phase === "download") {
+    const mb = (bytes) => Math.round(bytes / 1e6);
+    const of = job.total ? ` of ${mb(job.total)}` : ""; // no Content-Length
+    return `Downloading the CLIP text model — ${mb(job.done)}${of} MB (first search only)`;
+  }
+  return "Loading the text model…";
+}
+
+// Turn the cached scores into per-point visibility. Purely local: the threshold
+// slider re-runs this and nothing else, so dragging Match is instant the way
+// Size is, where a new query costs a request the way Groups does.
+function applyEmbedFilter() {
+  $("embed-match-row").hidden = !embedMap.scores;
+  if (!embedMap.scores) return;
+  let kept = 0;
+  for (const p of embedMap.points) {
+    const entry = embedMap.scores[p.image_id];
+    p.hidden = !entry || entry.z < embedMap.matchZ;
+    if (!p.hidden) kept++;
+  }
+  // A pick that just went invisible would otherwise leave the card floating
+  // over a point nobody can see, with Open still wired to it.
+  if (embedMap.selected && embedMap.selected.hidden) selectEmbedPoint(null);
+  $("embed-status").textContent =
+    `${kept} of ${embedMap.points.length} match “${embedMap.query}” · ` +
+    `drag Match to widen · clear the box to show all`;
+}
+
+function clearEmbedSearch() {
+  embedMap.query = "";
+  embedMap.scores = null;
+  embedMap.searchSeq++; // abandon an in-flight search, download poll included
+  clearTimeout(embedMap.searchTimer);
+  for (const p of embedMap.points) p.hidden = false;
+  $("embed-match-row").hidden = true;
+  $("embed-status").textContent = embedIdleStatus();
 }
 
 function closeEmbedMap() {
@@ -2913,7 +3034,9 @@ function closeEmbedMap() {
   // the dialog's `close` event too.
   stopEmbedLoop();
   embedMap.seq++; // abandon any in-flight fetch
+  embedMap.searchSeq++; // including a search, and any model download it was polling
   clearTimeout(embedMap.clusterTimer); // and any re-fetch a drag left pending
+  clearTimeout(embedMap.searchTimer);
   $("embed-modal").close();
 }
 
@@ -3075,7 +3198,11 @@ function drawEmbedMap() {
   const fade = (z) =>
     zMax > zMin ? 0.5 * ((zMax - z) / (zMax - zMin)) : 0;
 
-  for (const p of [...embedMap.points].sort((a, b) => a.sz - b.sz)) {
+  // Filtered points are dropped here and nowhere else — this is the single
+  // place a point becomes visible. Note they were still projected above, and
+  // still count towards zMin/zMax: the depth wash is a property of how deep the
+  // *cloud* is, so a search must not make the survivors re-shade themselves.
+  for (const p of embedMap.points.filter((p) => !p.hidden).sort((a, b) => a.sz - b.sz)) {
     const selected = p === embedMap.selected;
     const sprite = embedSprite(p);
     const dim = selected ? 0 : fade(p.sz); // the pick never dims
@@ -3148,16 +3275,33 @@ function drawEmbedLabels(ctx, project, dpr, fade) {
   const padY = 5 * dpr;
   const lineHeight = font + padY * 2;
 
+  // While a search is on, count what each group still has showing. The groups
+  // themselves are deliberately not refetched — they describe the library, and
+  // recomputing k-means per keystroke would make the labels dance — but a bare
+  // count beside a filtered cloud claims pictures that are not there.
+  const shown = embedMap.scores
+    ? embedMap.points.reduce((counts, p) => {
+        if (!p.hidden && p.cluster != null) counts[p.cluster] = (counts[p.cluster] || 0) + 1;
+        return counts;
+      }, {})
+    : null;
+
   // Nearest last, so that where two labels genuinely cannot both be placed the
   // one in front is the one on top — the same rule the sprites follow.
+  //
+  // A group with nothing left showing drops out entirely rather than reading
+  // "0/44": the filter exists to reduce the cloud to what matched, and a dozen
+  // pills labelling empty space is most of what there would be left to look at.
   const ordered = embedMap.clusters
-    .filter((c) => c.label)
+    .filter((c) => c.label && (!shown || shown[c.id]))
     .map((c) => ({ ...c, p: project(c.x, c.y, c.z) }))
     .sort((a, b) => a.p[2] - b.p[2]);
 
   const placed = [];
   for (const cluster of ordered) {
-    const suffix = ` · ${cluster.count}`;
+    const suffix = shown
+      ? ` · ${shown[cluster.id] || 0}/${cluster.count}`
+      : ` · ${cluster.count}`;
     const textW = ctx.measureText(cluster.label).width;
     const w = textW + ctx.measureText(suffix).width + padX * 2;
     const h = lineHeight;
@@ -3213,6 +3357,11 @@ function drawEmbedLabels(ctx, project, dpr, fade) {
 function embedPointAt(x, y) {
   let best = null;
   for (const p of embedMap.points) {
+    // Filtered out, so not drawn — and `hw` is only ever written *inside* the
+    // draw loop, which means a point that stops being drawn keeps last frame's
+    // extents and would otherwise stay clickable. This guard is what keeps this
+    // function's contract with the pixels, not defensiveness.
+    if (p.hidden) continue;
     if (p.sx === undefined || !p.hw) continue;
     if (Math.abs(p.sx - x) > p.hw || Math.abs(p.sy - y) > p.hh) continue;
     // overlapping sprites go to the one nearest the camera — the one on top,
@@ -3224,6 +3373,7 @@ function embedPointAt(x, y) {
   // and keep the radial tolerance they have always had.
   let bestD = EMBED_HIT_PX * (window.devicePixelRatio || 1);
   for (const p of embedMap.points) {
+    if (p.hidden) continue;
     if (p.sx === undefined || p.hw) continue;
     const d = Math.hypot(p.sx - x, p.sy - y);
     if (d < bestD || (d === bestD && best && p.sz > best.sz)) {
@@ -3346,6 +3496,29 @@ function initEmbedMap() {
     setClusterSlider(embedMap.clusterCount);
     clearTimeout(embedMap.clusterTimer);
     embedMap.clusterTimer = setTimeout(loadEmbedMap, 150);
+  };
+  // Debounced, like the cluster slider and for the same reason — but note what
+  // is *not* debounced: emptying the box restores the whole library at once,
+  // since waiting a beat to undo a filter reads as a stuck UI.
+  $("embed-search").oninput = (e) => {
+    clearTimeout(embedMap.searchTimer);
+    if (!e.target.value.trim()) return clearEmbedSearch();
+    embedMap.searchTimer = setTimeout(runEmbedSearch, EMBED_SEARCH_MS);
+  };
+  $("embed-search").addEventListener("keydown", (e) => {
+    // Enter means "I have finished typing", so it pre-empts the debounce. It
+    // must also not reach the dialog, where it would submit and close it.
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    clearTimeout(embedMap.searchTimer);
+    runEmbedSearch();
+  });
+  // Costs nothing but a redraw: the scores are already here, and the threshold
+  // is applied against them locally. Like Size, unlike Groups.
+  $("embed-match").oninput = (e) => {
+    embedMap.matchZ = Number(e.target.value);
+    $("embed-match-num").textContent = embedMap.matchZ.toFixed(1);
+    applyEmbedFilter();
   };
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;

@@ -4,11 +4,18 @@ CLIP was trained to put a caption and the photo it describes in the *same* 512-d
 space, so the nearest label to a group of photos is a description of what they
 have in common. That is the whole trick — no captioning model, one dot product.
 
-The text vectors are precomputed. `tools/build_label_vectors.py` encodes a fixed
-vocabulary of ~850 scenes and subjects offline and writes `label_vectors.npz`
-next to this file; the server never encodes text and never loads a text model.
-Adding a word means editing `tools/label_words.txt` and re-running that script —
-nothing here reads it.
+The text vectors are precomputed, and this module still never encodes anything.
+`tools/build_label_vectors.py` encodes a fixed vocabulary of ~850 scenes and
+subjects offline and writes `label_vectors.npz` next to this file; adding a word
+means editing `tools/label_words.txt` and re-running that script — nothing here
+reads it, and nothing here loads a model.
+
+The tower that script runs is `text_embed.py`, which the Image map's search box
+made a runtime concern: a typed query is not drawn from any fixed vocabulary, so
+it has to be encoded on the spot. That does not change the bargain here. The
+vocabulary is fixed and comparing 850 rows is a matrix product, so labelling
+stays a table lookup and stays correct on a machine that has never downloaded
+the text model at all.
 
 **The joint space is a precondition, not a given.** `embed.py` deliberately
 accepts either CLIP export: a projection export's 512-d `image_embeds`, which is

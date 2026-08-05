@@ -753,16 +753,21 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
    — without this the closed dialog covers the whole app. The base `dialog` rule
    never had to care because it sets no `display` at all. */
 #embed-modal:not([open]) { display: none; }
+/* Wraps, rather than scrolling or overflowing: this row now carries a title, a
+   search box, three sliders, a picker and Close, and none of them may be the one
+   that goes off the edge on a narrow window. The stage below is `flex: 1`, so a
+   second header line costs it a little height and nothing else. */
 #embed-header {
   display: flex;
   align-items: center;
   gap: 0.6rem;
+  flex-wrap: wrap;
 }
 /* pushes the method picker and Close together on the right */
 #embed-header h2 { margin-right: auto; }
 /* Close sits in the header rather than its own row, so it needs the chip look
    #embed-method has instead of the `.modal-actions button` it left behind. */
-#embed-method, #embed-close-btn {
+#embed-search, #embed-method, #embed-close-btn {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -771,9 +776,13 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   font-size: 0.75rem;
 }
 #embed-close-btn { padding: 0.2rem 0.7rem; cursor: pointer; }
+/* Wide enough for a phrase, not just a word — the whole point of the runtime
+   text tower is that "sunset over water" is a legal query. */
+#embed-search { width: 11rem; }
+#embed-search::placeholder { color: var(--muted); }
 /* The sprite size slider, sitting with the other header chips. Green like the
    map's own heading, where a param slider would be orange. */
-#embed-size-row, #embed-cluster-row {
+#embed-size-row, #embed-cluster-row, #embed-match-row {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -782,10 +791,16 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 }
 #embed-size { width: 6rem; accent-color: var(--rb-green); }
 #embed-clusters { width: 5rem; accent-color: var(--rb-green); }
+#embed-match { width: 5rem; accent-color: var(--rb-green); }
 /* Fixed width and tabular digits: the readout sits left of the method picker,
    and letting 2 -> 20 shove it along makes the whole header twitch on a drag. */
 #embed-cluster-count {
   width: 1.2rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+#embed-match-num {
+  width: 1.6rem; /* "0.5" to "3.0" — one decimal always shown */
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
