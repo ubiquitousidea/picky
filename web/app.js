@@ -166,6 +166,33 @@ function resetZoom() {
   applyViewTransform();
 }
 
+// Wheel deltas are not comparable across devices: a mouse notch arrives as one
+// event carrying ~100px, where a trackpad's two-finger scroll arrives as a
+// stream of events a few pixels each — plus a tail of momentum after the fingers
+// lift. Stepping by a fixed factor per *event* is what made the trackpad
+// unusable, since a flick is sixty of them; zoom is therefore exponential in the
+// distance scrolled, with ZOOM_WHEEL_PX chosen so one mouse notch is still
+// exactly the 1.15x it has always been. Shared by the preview panel and the
+// Image map, which zoom the same way and must keep feeling the same.
+const ZOOM_WHEEL_STEP = 1.15;
+const ZOOM_WHEEL_PX = 100; // Chrome/macOS pixel-mode delta for one notch
+const WHEEL_LINE_PX = 33; // DOM_DELTA_LINE: Firefox sends 3 lines per notch
+const WHEEL_PAGE_PX = 400; // DOM_DELTA_PAGE, rare
+// A trackpad pinch reaches the page as a ctrlKey wheel carrying much smaller
+// deltas, so it needs its own gain to read as a pinch rather than a nudge. Both
+// callers preventDefault(), which is also what stops it zooming the browser.
+const ZOOM_PINCH_GAIN = 6;
+
+function wheelZoomFactor(e) {
+  const unit =
+    e.deltaMode === 1 ? WHEEL_LINE_PX : e.deltaMode === 2 ? WHEEL_PAGE_PX : 1;
+  let px = e.deltaY * unit * (e.ctrlKey ? ZOOM_PINCH_GAIN : 1);
+  // one event must never do more than about a notch and a half, however hard
+  // the gesture was flung
+  px = Math.max(-150, Math.min(150, px));
+  return ZOOM_WHEEL_STEP ** (-px / ZOOM_WHEEL_PX);
+}
+
 function initZoom() {
   const panel = $("preview-panel");
   const wrap = $("preview-wrap");
@@ -180,8 +207,7 @@ function initZoom() {
     (e) => {
       if (state.imageId === null) return;
       e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      const next = Math.min(16, Math.max(1, view.zoom * factor));
+      const next = Math.min(16, Math.max(1, view.zoom * wheelZoomFactor(e)));
       // keep the point under the cursor fixed while zooming
       const rect = panel.getBoundingClientRect();
       const cx = e.clientX - rect.left - rect.width / 2;
@@ -3474,8 +3500,7 @@ function initEmbedMap() {
     "wheel",
     (e) => {
       e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      const next = Math.min(16, Math.max(1, embedMap.zoom * factor));
+      const next = Math.min(16, Math.max(1, embedMap.zoom * wheelZoomFactor(e)));
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       const cx = (e.clientX - rect.left) * dpr - canvas.width / 2;
