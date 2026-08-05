@@ -449,6 +449,12 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
    invert checkbox gets laid out on top of the next control */
 #select-controls .sel-level { flex: none; width: 11rem; }
 #select-controls .sel-save-mask { flex: none; width: auto; margin-top: 0; }
+/* Nothing on this line may shrink: every item is `flex: none` so the row wraps
+   when it runs out of room rather than compressing a control into its
+   neighbour. The invert label was the one box still on the initial
+   `flex: 0 1 auto`, which is the shape a squeezed label needs to paint its text
+   past its own border. */
+#select-controls .sel-invert { flex: none; white-space: nowrap; }
 /* the strip takes a line of its own once the picker's controls have had theirs,
    which is what puts it parallel to the work tree's row below */
 #select-controls .sel-mask-list {

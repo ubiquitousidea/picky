@@ -2690,7 +2690,7 @@ const embedMap = {
   spin: true,
   raf: null,
   selected: null,
-  // Multiplies the sprite size, 0.5 to 1. Not folded into `zoom`: zoom moves
+  // Multiplies the sprite size, 0.1 to 1. Not folded into `zoom`: zoom moves
   // the camera and this resizes the things in front of it, so shrinking the
   // sprites opens gaps between them where zooming out only makes the same
   // collage smaller. Deliberately outlives an open, like yaw/pitch and unlike
