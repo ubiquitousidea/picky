@@ -122,8 +122,37 @@ def image_dict(row: sqlite3.Row) -> dict:
     return d
 
 
-def create_image(name: str) -> dict:
+def create_image(name: str) -> tuple[dict, bool]:
+    """Import an image under `name`, or hand back the one already using it.
+
+    Returns `(image, created)`. A filename already in the library is the whole
+    duplicate test — there is no pixel hashing — so `created is False` means the
+    caller must leave the returned image's original bytes alone (see
+    `main.upload_image`).
+
+    The lookup is inside the transaction rather than a separate helper the caller
+    calls first, so two uploads of one name cannot both miss it. There is
+    deliberately no UNIQUE index backing it: user databases predate this check
+    and may already hold duplicate names, which such an index could not be built
+    over. `ORDER BY i.id` picks the oldest of them, deterministically.
+
+    Matching is `COLLATE NOCASE` because the filesystems these files are dragged
+    from are, so `Sunset.JPG` re-importing beside `sunset.jpg` would read as a
+    bug rather than a distinction.
+    """
     with connect() as conn:
+        # the root-node subselect is `list_images`', not `get_image`': callers
+        # navigate to what comes back, and `get_image` omits root_node_id.
+        row = conn.execute(
+            """SELECT i.id, i.name, i.created_at, i.crop,
+                      (SELECT id FROM nodes n WHERE n.image_id = i.id
+                       AND n.parent_id IS NULL) AS root_node_id
+               FROM images i WHERE i.name = ? COLLATE NOCASE
+               ORDER BY i.id LIMIT 1""",
+            (name,),
+        ).fetchone()
+        if row:
+            return image_dict(row), False
         now = _now()
         cur = conn.execute(
             "INSERT INTO images (name, created_at) VALUES (?, ?)", (name, now)
@@ -141,7 +170,7 @@ def create_image(name: str) -> dict:
         "created_at": now,
         "crop": None,
         "root_node_id": root_id,
-    }
+    }, True
 
 
 def list_images() -> list[dict]:

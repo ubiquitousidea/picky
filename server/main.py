@@ -142,9 +142,18 @@ async def upload_image(file: UploadFile):
     if im.format != "JPEG":
         raise HTTPException(400, f"only JPEG images are supported (got {im.format})")
 
-    image = db.create_image(file.filename or "untitled.jpg")
-    rendering.original_path(image["id"]).write_bytes(data)
-    return image
+    # A filename already in the library is a re-import: `create_image` hands back
+    # the existing row and nothing is written. Skipping the write is the point,
+    # not an optimization — `original_path` is keyed by image id, so writing here
+    # would replace *that* image's original while its renders, thumbs and
+    # `.out.jpg` stayed on disk, and file existence is the entire render cache
+    # key. Those stale pixels would then be served as a valid cache hit forever.
+    # The 200 (rather than a 409) is what keeps a skip out of the caller's
+    # failure path: it is the feature working, and the image it names is real.
+    image, created = db.create_image(file.filename or "untitled.jpg")
+    if created:
+        rendering.original_path(image["id"]).write_bytes(data)
+    return {**image, "duplicate": not created}
 
 
 @app.get("/api/images")

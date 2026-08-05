@@ -144,6 +144,15 @@ one place silently breaks another.
   into node space with no trigonometry.
 - **The mask *outline* is framed for display; the mask composited in `_apply`
   never is.** Do not confuse the two.
+- **A filename is an image's identity at import**, so `db.create_image` returns
+  `(image, created)` and re-importing a name already in the library yields the
+  *existing* row with `created False` (match is `COLLATE NOCASE`; there is no
+  UNIQUE index, since databases predate the check). What `main.upload_image`
+  must never do on that branch is write the bytes: `rendering.original_path` is
+  keyed by image id, so it would replace that image's original while its whole
+  render closure stayed cached — and file existence is the entire cache key. The
+  skip is a 200 carrying `duplicate: true`, not a 409, which is what keeps
+  `uploadFiles()` reporting it in the label instead of the failure alert.
 - **`images.embedding` is a column, not a file.** Image ids are rowids SQLite
   reuses, so an `<image_id>.npy` would outlive its image and be read back as its
   successor's position in the cloud. It embeds the *thumbnail*, so re-framing

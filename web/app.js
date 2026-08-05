@@ -3552,11 +3552,22 @@ function initEmbedMap() {
 // images in the order they were picked. One bad file does not stop the batch —
 // the good ones are already saved by then, so failures are collected and
 // reported once at the end, naming the files that did not make it.
+// A file whose name is already in the library comes back `duplicate: true` with
+// the *existing* image, not an error — re-dropping a folder you already imported
+// is the case this exists for. Skips are reported in the label rather than the
+// failure alert below, since nothing went wrong; `last` is assigned either way,
+// so an all-duplicates batch still lands on an image instead of nowhere.
+let uploadLabelTimer = null;
+
 async function uploadFiles(files) {
   const label = $("upload-label");
   const input = $("file-input");
   const failed = [];
+  const skipped = [];
   let last = null;
+  // a summary still counting down from an earlier batch would otherwise wipe
+  // this one's progress partway through
+  clearTimeout(uploadLabelTimer);
   input.disabled = true;
   try {
     for (const [i, file] of files.entries()) {
@@ -3566,12 +3577,25 @@ async function uploadFiles(files) {
       form.append("file", file);
       try {
         last = await api("/api/images", { method: "POST", body: form });
+        if (last.duplicate) skipped.push(file.name);
       } catch (err) {
         failed.push(`${file.name}: ${err.message}`);
       }
     }
   } finally {
-    label.textContent = "+ Add JPG";
+    if (skipped.length) {
+      const added = files.length - skipped.length - failed.length;
+      const dupes =
+        skipped.length === 1
+          ? `${skipped[0]} already in library`
+          : `${skipped.length} already in library`;
+      label.textContent = added ? `${added} added, ${dupes}` : dupes;
+      uploadLabelTimer = setTimeout(() => {
+        label.textContent = "+ Add JPG";
+      }, 4000);
+    } else {
+      label.textContent = "+ Add JPG";
+    }
     input.disabled = false;
   }
   // one refresh for the whole batch, then land on the last image that made it
