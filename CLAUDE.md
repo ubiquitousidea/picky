@@ -100,7 +100,29 @@ one place silently breaks another.
 - **`_disk_blur` and `_disk_mean` are deliberately not one function** — uint8
   and exactly-int32 for the shipped Blur, float32 and N channels for bokeh's
   premultiplied layers. Generalizing the first would change what every existing
-  disk-blur node re-renders to. Only the geometry is shared, as `_disk_runs`.
+  disk-blur node re-renders to. Only the geometry is shared, and only as the
+  run generators: `_disk_runs` for both of those, `_lens_runs` for `_swirl_mean`
+  — which is the third convolution here and, at aspect 1, returns `_disk_runs`
+  run for run, so the swirl slider has no step at the bottom.
+- **Swirl's kernel varies per pixel, and the prefix sum is what makes that
+  affordable.** The run trick looks incompatible with a kernel that changes
+  across the frame — the bounds stop being sliceable constants — but the
+  cumulative sum does not depend on the kernel at all. `_swirl_mean` builds one
+  for the whole frame and each `_SWIRL_TILE` square reads its own offsets out of
+  it, so a tile costs no halo and no extra data. `_SWIRL_TILE` is the dial
+  between seams and speed; the kernel steps at tile edges, and the step is
+  self-limiting because anisotropy grows with distance from the centre exactly
+  as fast as the angle between neighbouring tiles shrinks.
+- **The cat's eye and the corner darkening are two readings of one aperture**,
+  so `_swirl_aspect` is shared by `_swirl_mean` and `_vignette` rather than
+  written twice — apart, each still looks right and together they describe the
+  wrong lens. The dimming cannot live in the kernel's normalizer, which is the
+  obvious place for it: coverage rides through the same kernel, and
+  `_bokeh_layers` composites with `1 - alpha` and then un-premultiplies by
+  accumulated coverage, so a scaled normalizer would corrupt the occlusion and
+  then divide itself back out. `_vignette` therefore runs last, in `bokeh()`, on
+  sharp and blurred pixels alike — a lens vignettes both, and dimming only what
+  was blurred would put a step along the recombine crossover.
 - **The tone curve's LUT is implemented twice on purpose** —
   `effects._curve_lut` and `curveLut()` in `web/app.js`, line for line — so the
   editor draws exactly the transfer function the server will apply. Change one,
@@ -159,6 +181,13 @@ one place silently breaks another.
   outside the tree is what keeps the same-dimensions invariant true, and means
   **no saved mask is ever warped**. `.out.jpg` must be excluded by name in
   `storage_stats` and swept in `delete_render_files`.
+- **Bokeh's optical axis is the centre of the node's own pixels**, which the
+  crop then moves. Both `_swirl_mean` and `_vignette` measure from there, so
+  re-framing slides the swirl's centre and the vignette's centre off-centre in
+  what you actually see — the one thing about a node's appearance that changes
+  without its params changing. That is what cropping does to a real frame, so it
+  is left alone; the thing not to do is "fix" it by reaching for `images.crop`
+  from inside an effect, which would put the output stage back inside the tree.
 - **`effects.crop_geometry()` is the only place PIL's rotate-expand rounding is
   known** — it reproduces PIL's arithmetic rather than deriving a formula for it.
   Its `inverse` is what lets the frontend map a click on the framed preview back

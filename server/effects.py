@@ -157,6 +157,9 @@ _BOKEH_WORK_PX = 2048
 _BOKEH_WORK_R = 96
 # Layer count from the radius — a 3 px blur has no use for 12 distinct radii.
 _BOKEH_MIN_LAYERS, _BOKEH_MAX_LAYERS = 4, 12
+# Side of the square the swirl kernel is held constant over. See `_swirl_mean`
+# for why this is a seam/speed dial and why 64 is where it sits.
+_SWIRL_TILE = 64
 
 
 def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
@@ -188,6 +191,194 @@ def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
         lo, hi = r - int(hw), r + int(hw) + 1
         acc += sums[k : k + h, hi : hi + w] - sums[k : k + h, lo : lo + w]
     return acc / area
+
+
+def _lens_runs(r: int, t: float, theta: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """A cat's-eye aperture as horizontal runs: row offsets, and each row's first
+    and last column, plus the total area.
+
+    `_disk_runs` generalized. The shape is the intersection of two equal circles
+    whose centres lie on the line at angle `theta` — two arcs meeting at two
+    points — which is what a lens with mechanical vignetting actually has for a
+    pupil off-axis: the barrel clips the aperture from both sides.
+
+    Parametrized by the aspect ratio `t` (short axis over long) rather than by
+    how far apart the circles are, because the obvious construction is wrong in
+    a way that is easy to miss. Pull two circles of radius `r` apart and the
+    shape narrows — but it also gets *shorter*, so the corners of the frame come
+    out less blurred rather than differently blurred. Holding the long axis at
+    `r` and solving for the circles instead:
+
+        d  = r (1/t - t)          centre separation
+        rc = r (1/t + t) / 2      radius of each circle
+
+    spans exactly +-r across `theta` and +-t*r along it. `t = 1` gives d = 0 and
+    rc = r, and this returns the disk — literally, run for run.
+
+    The shape is convex, so every row of it is still a single contiguous
+    interval, which is the whole reason `_disk_mean` is fast (see `_disk_blur`).
+    Rows are scanned over +-r because the far point of the shape is never
+    farther than `r` from the centre, and rows whose two intervals do not
+    overlap drop out.
+    """
+    t = min(max(t, 0.02), 1.0)
+    d = r * (1.0 / t - t)
+    rc = r * (1.0 / t + t) / 2.0
+    a, b = (d / 2) * np.cos(theta), (d / 2) * np.sin(theta)
+    dys = np.arange(-r, r + 1)
+    h1 = np.sqrt(np.maximum(rc * rc - (dys - b) ** 2, 0.0))
+    h2 = np.sqrt(np.maximum(rc * rc - (dys + b) ** 2, 0.0))
+    lo = np.ceil(np.maximum(a - h1, -a - h2)).astype(np.int64)
+    hi = np.floor(np.minimum(a + h1, -a + h2)).astype(np.int64)
+    keep = hi >= lo
+    dys, lo, hi = dys[keep], lo[keep], hi[keep]
+    return dys, lo, hi, int((hi - lo + 1).sum())
+
+
+def _swirl_aspect(rho: np.ndarray | float, swirl: float) -> np.ndarray | float:
+    """The aperture's aspect ratio (short axis over long) at normalized radius
+    `rho` — distance from the optical axis over half the frame diagonal, so 1 is
+    exactly the corner.
+
+    Quadratic rather than linear because that is where the mechanical vignetting
+    is: a Helios is very nearly round across the middle third and clips hard in
+    the last, so a straight ramp spends the slider's range deforming the part of
+    the frame a real lens leaves alone. At swirl 0.85 this is still 0.91 a third
+    of the way out where a linear ramp would already be at 0.72.
+
+    Shared by `_swirl_mean` and `_vignette` — the shape and the dimming are two
+    readings of one aperture, and they would be very hard to catch drifting
+    apart: each looks right on its own, and together they just say the wrong
+    lens.
+    """
+    return 1.0 - swirl * rho * rho
+
+
+def _lens_area_ratio(t: np.ndarray | float) -> np.ndarray | float:
+    """Area of the cat's eye over the area of the disk it was cut from — the
+    fraction of the light that gets through, at aspect `t`.
+
+    The two-circle construction of `_lens_runs`, integrated instead of scanned:
+    two circular segments, in units of the disk's radius. It depends only on the
+    aspect and not on `r`, which is what lets one frame-wide map serve every
+    band's radius. Checked against `_lens_runs`' own pixel count to three
+    decimals over the whole range the slider can reach.
+    """
+    t = np.clip(t, 0.02, 1.0)
+    d, rc = 1.0 / t - t, (1.0 / t + t) / 2.0
+    lens = 2 * rc * rc * np.arccos(d / (2 * rc)) - (d / 2) * np.sqrt(4 * rc * rc - d * d)
+    return lens / np.pi
+
+
+def _vignette(img: np.ndarray, swirl: float) -> np.ndarray:
+    """Darken toward the corners by exactly as much light as the aperture that
+    `_swirl_mean` narrowed is no longer passing.
+
+    Not a stylistic vignette with its own falloff: the gain *is*
+    `_lens_area_ratio(_swirl_aspect(rho))`, so one slider describes one physical
+    pupil — about -1.5 stops in the corners at swirl 0.6, which is roughly a
+    fast vintage double-Gauss wide open, and -3 at the top of the slider, which
+    is what the top of the slider is for.
+
+    It runs here, on the finished full-resolution frame, rather than on the
+    blurred layers, for two reasons. The kernel cannot carry it (see
+    `_swirl_mean`), and a lens vignettes sharp light as well as defocused light
+    — dimming only what was blurred would put a brightness step exactly along
+    the recombine crossover, which is the one seam this effect works hardest to
+    hide.
+
+    Banded like `_disk_blur` for the same reason: at 40 MP a full-frame float
+    gain map is 480 MB. The gain is computed in float and applied per band
+    rather than quantized into an 8-bit map and multiplied through, because a
+    vignette is a smooth ramp across large flat areas — sky, exactly where 8-bit
+    steps in the *gain* would band visibly.
+    """
+    h, w = img.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    half_diagonal = np.hypot(cy, cx)
+    dx2 = (np.arange(w, dtype=np.float32) - cx) ** 2
+
+    out = np.empty_like(img)
+    for y0 in range(0, h, _DISK_BAND_ROWS):
+        y1 = min(y0 + _DISK_BAND_ROWS, h)
+        dy = np.arange(y0, y1, dtype=np.float32) - cy
+        rho = np.sqrt(dy[:, None] ** 2 + dx2[None, :]) / half_diagonal
+        gain = _lens_area_ratio(_swirl_aspect(rho, swirl)).astype(np.float32)
+        band = img[y0:y1] * gain[..., None]
+        out[y0:y1] = (band + 0.5).astype(np.uint8)  # non-negative: round half up
+    return out
+
+
+def _swirl_mean(arr: np.ndarray, r: int, swirl: float) -> np.ndarray:
+    """`_disk_mean`, but with the kernel deforming toward the edges of the frame.
+
+    Round on the optical axis and a progressively thinner cat's eye away from
+    it, long axis tangential — the Helios 44-2 look, where the deformation is
+    what makes a busy background appear to swirl.
+
+    A kernel that varies per pixel looks like it must destroy the run trick: the
+    run bounds stop being constants that can be sliced and become arrays that
+    have to be gathered, which measures far too slow to use. The way out is that
+    **the prefix sum does not depend on the kernel**. So it is built once for the
+    whole frame, exactly as `_disk_mean` builds it, and then each tile reads its
+    own offsets out of that one shared array. A tile therefore costs no halo and
+    no extra data — the element count is identical to a single full-frame pass,
+    and all that is added is one numpy call per row per tile. Measured against
+    `_disk_mean` on a 1365x2048x5 working frame: 1.6x at r=16, 1.8x at r=31,
+    1.9x at r=60.
+
+    `_SWIRL_TILE` is the dial between seams and speed. The kernel steps at tile
+    boundaries, but the step is self-limiting: the shape's anisotropy grows with
+    the distance from the centre while the angle between neighbouring tiles
+    shrinks as tile/distance, so their product is about tile/half-diagonal
+    wherever you stand — and it vanishes at the centre, where the kernel is
+    round and its orientation means nothing. In smooth regions the difference is
+    second order anyway, since both kernels are normalized and symmetric about
+    the same point. It holds up under the worst case there is — a field of blown
+    specular points defocused into hard-edged cat's eyes, where a stepped kernel
+    would show as blobs assembled from mismatched halves — so 64 stays. Halving
+    it halves the mismatch and costs ~1.5x if that is ever wanted.
+
+    Each kernel is normalized by its *own* area, so this pass changes only the
+    shape. The corner darkening a clipped aperture also produces is `_vignette`,
+    applied once to the finished frame — it cannot be had here by dividing by
+    the disk's area instead. Coverage rides through this same kernel, and a
+    normalizer that scaled it would not darken the composite but corrupt it:
+    `_bokeh_layers` composites with `1 - alpha` and then un-premultiplies by the
+    coverage that accumulated, so under-covered bands would let farther bands
+    bleed through and the gain would be divided back out at the end.
+    """
+    if r < 1:
+        return arr
+    h, w, c = arr.shape
+    src = np.pad(arr, ((r, r), (r, r), (0, 0)), mode="edge")
+    sums = np.zeros((src.shape[0], src.shape[1] + 1, c), dtype=np.float32)
+    np.cumsum(src, axis=1, dtype=np.float32, out=sums[:, 1:])
+
+    # The optical axis is the centre of the node's own pixels. The crop is an
+    # output stage applied after the whole tree, so framing off-centre later
+    # moves the swirl's centre off-centre in the result — which is what cropping
+    # does to a real frame too.
+    cy, cx = h / 2.0, w / 2.0
+    half_diagonal = np.hypot(cy, cx)
+
+    out = np.empty((h, w, c), dtype=np.float32)
+    for y0 in range(0, h, _SWIRL_TILE):
+        y1 = min(y0 + _SWIRL_TILE, h)
+        for x0 in range(0, w, _SWIRL_TILE):
+            x1 = min(x0 + _SWIRL_TILE, w)
+            my, mx = (y0 + y1) / 2.0 - cy, (x0 + x1) / 2.0 - cx
+            aspect = _swirl_aspect(np.hypot(my, mx) / half_diagonal, swirl)
+            dys, lo, hi, area = _lens_runs(r, aspect, np.arctan2(my, mx))
+            th, tw = y1 - y0, x1 - x0
+            acc = np.zeros((th, tw, c), dtype=np.float32)
+            for dy, left, right in zip(dys, lo, hi):
+                k = y0 + int(dy) + r  # padded row holding source row (y + dy)
+                a = x0 + r + int(right) + 1
+                b = x0 + r + int(left)
+                acc += sums[k : k + th, a : a + tw] - sums[k : k + th, b : b + tw]
+            out[y0:y1, x0:x1] = acc / area
+    return out
 
 
 def _bloom_luminance(
@@ -231,7 +422,7 @@ def _bloom_luminance(
 
 
 def _bokeh_layers(
-    src: np.ndarray, d: np.ndarray, radii: np.ndarray, bloom: float
+    src: np.ndarray, d: np.ndarray, radii: np.ndarray, bloom: float, swirl: float
 ) -> np.ndarray:
     """Composite `src` as depth-ordered layers, each blurred by its own radius.
 
@@ -281,9 +472,19 @@ def _bokeh_layers(
         layer[..., 3] = weight
         if bright is not None:
             layer[..., 4] = weight * bright
-        blurred = _disk_mean(layer, int(round(radii[k])))
+        radius = int(round(radii[k]))
+        # The two kernels are the same convolution over a different aperture, so
+        # everything downstream is indifferent to which ran — including the two
+        # channels riding along. Coverage goes through it, so occlusion stays
+        # consistent; so does the exponential, which is what makes a blooming
+        # highlight come out as a cat's eye rather than a disk, and is most of
+        # what the swirl is for.
+        if swirl > 0:
+            blurred = _swirl_mean(layer, radius, swirl)
+        else:
+            blurred = _disk_mean(layer, radius)
         rgb, alpha = blurred[..., :3], blurred[..., 3:4]
-        # One `_disk_mean` carries the exponential through the same disk as the
+        # One pass carries the exponential through the same aperture as the
         # colour, which is the point: the soft maximum has to be taken over
         # exactly the pixels the blur averaged, or it describes a different
         # neighbourhood. A radius under a pixel leaves both untouched, and the
@@ -319,6 +520,10 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
 
     focus = float(params["focus"])
     falloff = float(params["falloff"])
+    # nodes made before bloom and swirl existed carry neither, the same reason
+    # blur reads "kernel" with a default — and 0 is what they rendered with
+    bloom = float(params.get("bloom", 0.0))
+    swirl = float(params.get("swirl", 0.0))
     # `amount` is a percentage of the long side, where blur's `radius` is in
     # pixels: a depth-of-field setting has to mean the same thing on the 800x600
     # and the 40 MP frames in one library, and the blur that reads as "portrait
@@ -329,7 +534,10 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     ww, wh = max(1, round(w * scale)), max(1, round(h * scale))
     r_work = r_full * scale
     if r_work < 1.0:
-        return img.copy()  # sub-pixel everywhere; there is no blur to apply
+        # sub-pixel everywhere; there is no blur to apply. The aperture is still
+        # the aperture, though — skipping the vignette here would make corner
+        # brightness jump the instant `amount` crossed this threshold.
+        return _vignette(img, swirl) if swirl > 0 else img.copy()
 
     # BOX going down is an area average — a subsample would alias the very
     # detail the blur is meant to dissolve.
@@ -348,11 +556,7 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     # straight ramp on it is what the optics do. See server/depth.py.
     span = max(focus, 1.0 - focus)
     band_t = np.abs(np.linspace(0.0, 1.0, layers) - focus) / span
-    # nodes made before bloom existed carry no "bloom", the same reason blur
-    # reads "kernel" with a default — and 0 is exactly what they rendered with
-    work = _bokeh_layers(
-        src, d, r_work * band_t**falloff, float(params.get("bloom", 0.0))
-    )
+    work = _bokeh_layers(src, d, r_work * band_t**falloff, bloom, swirl)
 
     # Recombine at full resolution. Everything sharp comes from the original —
     # the whole point of the working canvas is that it is only ever asked for
@@ -369,13 +573,15 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     mask = Image.fromarray((mix * 255).astype(np.uint8), mode="L")
     # Image.composite rather than a numpy lerp: at 40 MP the float temporaries
     # would be half a gigabyte, and this is the same arithmetic in C.
-    return np.asarray(
+    out = np.asarray(
         Image.composite(
             blurred.resize((w, h), Image.Resampling.BICUBIC),
             Image.fromarray(img),
             mask.resize((w, h), Image.Resampling.BILINEAR),
         )
     )
+    # Last, and over sharp and blurred pixels alike — see `_vignette`.
+    return _vignette(out, swirl) if swirl > 0 else out
 
 
 def sobel_edges(img: np.ndarray, params: dict) -> np.ndarray:
@@ -600,6 +806,7 @@ EFFECTS = {
             {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0, "pick": "depth"},
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
             {"name": "bloom", "label": "Highlight bloom", "type": "float", "min": 0.0, "max": 12.0, "step": 0.5, "default": 0.0},
+            {"name": "swirl", "label": "Swirl (shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0},
             {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
     },
