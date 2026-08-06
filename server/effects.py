@@ -128,6 +128,11 @@ def gaussian_blur(img: np.ndarray, params: dict) -> np.ndarray:
     return np.asarray(out)
 
 
+# Rec. 601 luma. Shared by bokeh's bloom and `sobel_edges`, which need to agree
+# on what "bright" means no more than they need to disagree.
+_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
 # ---------- Bokeh: defocus that follows depth ----------
 #
 # The alternative this replaces is: segment the subject, invert, disk-blur. That
@@ -185,7 +190,49 @@ def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
     return acc / area
 
 
-def _bokeh_layers(src: np.ndarray, d: np.ndarray, radii: np.ndarray) -> np.ndarray:
+def _bloom_luminance(
+    rgb: np.ndarray, alpha: np.ndarray, bright: np.ndarray, bloom: float
+) -> np.ndarray:
+    """Replace a blurred band's luminance with the *soft maximum* over the disk,
+    keeping the colour the plain blur produced.
+
+    A flat average is what makes a rendered defocus look computed rather than
+    photographed. A lens spreads a highlight's energy across the whole disk, so
+    a pinpoint of sun in a dark hedge becomes a *disk as bright as the sun was*;
+    an average divides that same energy by the disk's area and returns something
+    barely lighter than the hedge.
+
+    The fix is the standard three steps, in luminance only:
+
+        exponentiate -> convolve -> log        L' = 1 + ln(mean(e^(k(L-1)))) / k
+
+    which is a soft maximum: at k -> 0 it *is* the mean (expand the exponential
+    and the k cancels), at large k it approaches max(L), and in between one
+    bright pixel pulls the whole disk up without erasing what else is there.
+    Shifting by 1 inside the exponential is what keeps every intermediate in
+    (0, 1] rather than overflowing at k=12; it cancels out in the log.
+
+    Only luminance goes through it. Running each channel separately would drag
+    hues toward whichever primary happened to be brightest, so the chroma stays
+    the linear blur's and this rescales it: output luminance is exactly L', and
+    the ratios between channels are untouched. That also means k -> 0 returns
+    the plain blur *continuously*, so the slider has no step at the bottom.
+
+    `rgb` is premultiplied and stays that way — scaling a premultiplied colour
+    by a gain is scaling the colour, so there is nothing to undo and redo.
+    """
+    safe = np.maximum(alpha, 1e-6)  # a band contributes nothing where it is 0
+    soft = 1.0 + np.log(np.maximum(bright / safe, 1e-30)) / bloom
+    soft = np.clip(soft, 0.0, 1.0)  # guaranteed by the algebra; float32 is not
+    linear = (rgb @ _LUMA)[..., None] / (255.0 * safe)
+    # The floor caps the gain where there is no luminance to scale up. Black
+    # stays black without it — soft vanishes with linear — but not divided by 0.
+    return rgb * (soft / np.maximum(linear, 1e-4))
+
+
+def _bokeh_layers(
+    src: np.ndarray, d: np.ndarray, radii: np.ndarray, bloom: float
+) -> np.ndarray:
     """Composite `src` as depth-ordered layers, each blurred by its own radius.
 
     `d` is normalized depth (1 = nearest) and `radii[k]` is the blur radius for
@@ -209,9 +256,20 @@ def _bokeh_layers(src: np.ndarray, d: np.ndarray, radii: np.ndarray) -> np.ndarr
     frac = (pos - lower).astype(np.float32)
     lower = lower.astype(np.int32)
 
+    # The bloom weight is built from the working-resolution pixels, like
+    # everything else here. It is the one place that costs something real: a
+    # highlight smaller than a working pixel has already been averaged down by
+    # the downsample before its exponential is taken, so a pinpoint glint on a
+    # 40 MP frame blooms less than it should. Raising `bloom` compensates, and
+    # anything a few pixels across on the original arrives intact.
+    bright = None
+    if bloom > 0:
+        lum = (src @ _LUMA) / 255.0
+        bright = np.exp(bloom * (lum - 1.0))
+
     out = np.zeros(src.shape, dtype=np.float32)
     coverage = np.zeros(src.shape[:2] + (1,), dtype=np.float32)
-    layer = np.empty(src.shape[:2] + (4,), dtype=np.float32)
+    layer = np.empty(src.shape[:2] + (4 if bright is None else 5,), dtype=np.float32)
     for k in range(layers):
         # a pixel lands in band k as the lower of its pair (weight 1-frac) or as
         # the upper (weight frac), never both
@@ -221,12 +279,22 @@ def _bokeh_layers(src: np.ndarray, d: np.ndarray, radii: np.ndarray) -> np.ndarr
             continue  # nothing at this depth: real scenes leave bands empty
         layer[..., :3] = src * weight[..., None]  # premultiplied
         layer[..., 3] = weight
+        if bright is not None:
+            layer[..., 4] = weight * bright
         blurred = _disk_mean(layer, int(round(radii[k])))
+        rgb, alpha = blurred[..., :3], blurred[..., 3:4]
+        # One `_disk_mean` carries the exponential through the same disk as the
+        # colour, which is the point: the soft maximum has to be taken over
+        # exactly the pixels the blur averaged, or it describes a different
+        # neighbourhood. A radius under a pixel leaves both untouched, and the
+        # algebra then returns L unchanged — sharp bands do not bloom.
+        if bright is not None:
+            rgb = _bloom_luminance(rgb, alpha, blurred[..., 4:5], bloom)
         # `over`, with the new band in front of everything accumulated so far —
         # which holds because k ascends with depth toward the viewer
-        behind = 1.0 - blurred[..., 3:4]
-        out = blurred[..., :3] + behind * out
-        coverage = blurred[..., 3:4] + behind * coverage
+        behind = 1.0 - alpha
+        out = rgb + behind * out
+        coverage = alpha + behind * coverage
     # Coverage falls short of 1 wherever the blurs spread a band's weight
     # outward faster than its neighbours filled in behind it; un-premultiplying
     # by what actually arrived is what keeps those places from darkening.
@@ -280,7 +348,11 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     # straight ramp on it is what the optics do. See server/depth.py.
     span = max(focus, 1.0 - focus)
     band_t = np.abs(np.linspace(0.0, 1.0, layers) - focus) / span
-    work = _bokeh_layers(src, d, r_work * band_t**falloff)
+    # nodes made before bloom existed carry no "bloom", the same reason blur
+    # reads "kernel" with a default — and 0 is exactly what they rendered with
+    work = _bokeh_layers(
+        src, d, r_work * band_t**falloff, float(params.get("bloom", 0.0))
+    )
 
     # Recombine at full resolution. Everything sharp comes from the original —
     # the whole point of the working canvas is that it is only ever asked for
@@ -308,7 +380,7 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
 
 def sobel_edges(img: np.ndarray, params: dict) -> np.ndarray:
     threshold = int(params["threshold"])
-    gray = img.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    gray = img.astype(np.float32) @ _LUMA
     padded = np.pad(gray, 1, mode="edge")
     # 3x3 neighborhoods via shifted views of the padded image
     tl, tc, tr = padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:]
@@ -527,6 +599,7 @@ EFFECTS = {
             # `validate_params` never sees the key.
             {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0, "pick": "depth"},
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
+            {"name": "bloom", "label": "Highlight bloom", "type": "float", "min": 0.0, "max": 12.0, "step": 0.5, "default": 0.0},
             {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
     },
