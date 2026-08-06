@@ -142,7 +142,13 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 # this drives the radius from a monocular depth estimate and no selection is
 # involved at all.
 
-SHOW_MODES = ["bokeh", "depth"]
+SHOW_MODES = ["bokeh", "depth", "kernels"]
+
+# The kernel chart's grid, in columns across the long side; the short side gets
+# however many rows keep the cells square. Enough to read the shape's drift from
+# centre to corner, few enough that the discs are drawn at true size without the
+# frame becoming solid overlap at a large `amount`.
+_KERNEL_COLS = 9
 
 # Everything blurred is computed on a canvas no larger than this on the long
 # side. Blurred pixels have no high-frequency content by definition, so nothing
@@ -381,6 +387,85 @@ def _swirl_mean(arr: np.ndarray, r: int, swirl: float) -> np.ndarray:
     return out
 
 
+def _kernel_chart(
+    img: np.ndarray,
+    d_small: np.ndarray,
+    focus: float,
+    falloff: float,
+    span: float,
+    r_full: float,
+    swirl: float,
+) -> np.ndarray:
+    """The apertures themselves, drawn at true size on a grid over the frame.
+
+    A diagram of what `show: "bokeh"` is doing, for aiming the other four
+    sliders: every disc is the actual footprint `_lens_runs` hands the blur, at
+    the actual radius the depth under it earns, so its size reads `amount`,
+    `focus` and `falloff` and its shape reads `swirl`. Nothing here recomputes
+    that geometry — a chart that drew its own idea of the kernel could agree
+    with the render today and drift from it silently, which is the one way a
+    diagnostic view is worse than none.
+
+    Drawn at the *full-resolution* radius rather than the working canvas's,
+    because that is the blur you see in the output; `_BOKEH_WORK_R` is an
+    internal economy, not something to explain to someone aiming a slider.
+
+    Two deliberate omissions. The discs are not dimmed by `_vignette`, though
+    the render's are: the corner kernels are the ones worth looking at, and
+    dimming them by the three stops the aperture actually costs would hide the
+    shape this view exists to show — their area already tells that story. And
+    they are composited with a maximum rather than a sum, so where a large
+    `amount` makes neighbours overlap the outlines stay legible instead of
+    saturating to a white sheet.
+    """
+    h, w = img.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    half_diagonal = np.hypot(cy, cx)
+    dh, dw = d_small.shape[:2]
+
+    cols = _KERNEL_COLS if w >= h else max(3, round(_KERNEL_COLS * w / h))
+    rows = max(3, round(cols * h / w)) if w >= h else _KERNEL_COLS
+    step_y, step_x = h / rows, w / cols
+
+    # The backdrop is the frame itself, dark enough that a white disc reads
+    # against a blown highlight but still legible as the photo — the discs mean
+    # much more when you can see which of them landed on the subject.
+    out = (img * 0.3).astype(np.uint8)
+    ink = np.zeros((h, w), dtype=np.uint8)
+
+    for row in range(rows):
+        for col in range(cols):
+            gy, gx = (row + 0.5) * step_y, (col + 0.5) * step_x
+            # nearest depth sample; the map is ~0.4 MP and this wants one number
+            dy_i = min(dh - 1, max(0, int(gy / h * dh)))
+            dx_i = min(dw - 1, max(0, int(gx / w * dw)))
+            pixel_t = abs(float(d_small[dy_i, dx_i]) - focus) / span
+            r = int(round(r_full * pixel_t**falloff))
+            gy_i, gx_i = int(gy), int(gx)
+
+            if r < 1:
+                # In focus: no disc to draw, and an empty cell would read as a
+                # bug rather than as the focal plane. A dot marks the sample.
+                ink[max(0, gy_i - 1) : gy_i + 2, max(0, gx_i - 1) : gx_i + 2] = 255
+                continue
+
+            rho = np.hypot(gy - cy, gx - cx) / half_diagonal
+            dys, lo, hi, _ = _lens_runs(
+                r, _swirl_aspect(rho, swirl), np.arctan2(gy - cy, gx - cx)
+            )
+            for dy, left, right in zip(dys, lo, hi):
+                y = gy_i + int(dy)
+                if 0 <= y < h:
+                    x0 = min(max(gx_i + int(left), 0), w)
+                    x1 = min(max(gx_i + int(right) + 1, 0), w)
+                    if x1 > x0:
+                        ink[y, x0:x1] = 255
+
+    mask = ink > 0
+    out[mask] = (out[mask] * 0.25 + 0.75 * 255).astype(np.uint8)
+    return out
+
+
 def _bloom_luminance(
     rgb: np.ndarray, alpha: np.ndarray, bright: np.ndarray, bloom: float
 ) -> np.ndarray:
@@ -529,6 +614,14 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     # and the 40 MP frames in one library, and the blur that reads as "portrait
     # lens" is a fraction of the frame, not a count of pixels.
     r_full = float(params["amount"]) / 100.0 * max(h, w)
+    # Distance from the focal plane, normalized so the far end of the scene
+    # reaches exactly `amount`.
+    span = max(focus, 1.0 - focus)
+
+    if params["show"] == "kernels":
+        # Before the working canvas is sized: the chart is about the blur you
+        # get, and `scale` is only ever about how cheaply it is computed.
+        return _kernel_chart(img, d_small, focus, falloff, span, r_full, swirl)
 
     scale = min(1.0, _BOKEH_WORK_PX / max(h, w), _BOKEH_WORK_R / max(r_full, 1e-6))
     ww, wh = max(1, round(w * scale)), max(1, round(h * scale))
@@ -549,12 +642,10 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     )
 
     layers = int(np.clip(round(r_work / 3), _BOKEH_MIN_LAYERS, _BOKEH_MAX_LAYERS))
-    # Distance from the focal plane, normalized so the far end of the scene
-    # reaches exactly `amount`. Linear (falloff 1) is not a stand-in for
-    # something better: a real circle of confusion is proportional to
-    # |1/z_focus - 1/z|, and the model's output *is* inverse depth, so a
-    # straight ramp on it is what the optics do. See server/depth.py.
-    span = max(focus, 1.0 - focus)
+    # Linear (falloff 1) is not a stand-in for something better: a real circle
+    # of confusion is proportional to |1/z_focus - 1/z|, and the model's output
+    # *is* inverse depth, so a straight ramp on it is what the optics do. See
+    # server/depth.py.
     band_t = np.abs(np.linspace(0.0, 1.0, layers) - focus) / span
     work = _bokeh_layers(src, d, r_work * band_t**falloff, bloom, swirl)
 
