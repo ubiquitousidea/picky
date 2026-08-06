@@ -2905,7 +2905,9 @@ function initClusterPlot() {
 // fitted space, and it owns the whole viewport rather than a small dialog.
 const embedMap = {
   points: [],
-  method: "pca",
+  // t-SNE rather than PCA: the clumps are what the map is opened to read, and
+  // the fit is seeded (see main._project), so reopening shows the same layout.
+  method: "tsne",
   yaw: 0.8,
   pitch: -0.45,
   // zoom multiplies the derived world→screen scale, pan offsets the projected
@@ -2920,9 +2922,11 @@ const embedMap = {
   // Whether the pivot follows the pick instead of the grab (see
   // pivotOnSelection). Outlives an open, like spriteScale and matchZ — it is a
   // taste for how turning the cloud should work, not part of where you are
-  // looking. It does nothing until something is picked, and `selected` *is*
-  // cleared on every open, so a reopened map still turns about the grab.
-  orbit: false,
+  // looking. On by default because the map now opens with the image you were
+  // working on picked and centred (see loadEmbedMap), so there is something to
+  // turn about from the first frame; before that there never was until you
+  // clicked, and the tick did nothing.
+  orbit: true,
   spin: true,
   raf: null,
   selected: null,
@@ -2965,6 +2969,13 @@ const embedMap = {
   matchZ: 1.2,
   searchTimer: null,
   searchSeq: 0,
+  // The Near filter's slider position, 0..1 — an exponent, not a radius (see
+  // embedNearRadius), and 1 is the whole travel's worth of "off". Resets on
+  // every open, like the query and unlike matchZ: hiding all but a
+  // neighbourhood is something you did once, and a map that reopens showing
+  // three images reads as broken. It is anchored on `selected`, so it also does
+  // nothing at all until something is picked.
+  nearT: 1,
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
@@ -2987,6 +2998,21 @@ const EMBED_SPRITE_PX = 256;
 // short enough that pausing mid-thought still shows you something. The server
 // caches by phrase, so a backspace-and-retype is free anyway.
 const EMBED_SEARCH_MS = 250;
+// The Near slider's travel, as a radius in the same unit cube the points live
+// in. Its position is an exponent rather than the radius itself: what you are
+// looking for when you drag it is a neighbourhood, and at cube scale those are
+// all in the bottom fifth of the range, which a linear slider crosses in one
+// step. The two ends are clipped rather than extrapolated, so the two answers
+// people actually want — "only this one" and "all of them" — are the ends of
+// the travel instead of somewhere near them.
+const EMBED_NEAR_MIN = 0.02; // radius one step up from the bottom
+const EMBED_NEAR_MAX = 2 * Math.sqrt(3); // the cube's diagonal: everything
+
+function embedNearRadius(t) {
+  if (t <= 0) return 0; // only the pick itself, which is at distance 0
+  if (t >= 1) return Infinity; // off
+  return EMBED_NEAR_MIN * Math.pow(EMBED_NEAR_MAX / EMBED_NEAR_MIN, t);
+}
 
 // One hue per cluster, spun by the golden angle so that however many groups
 // there are, adjacent ids land far apart on the wheel and no two of a dozen
@@ -2999,6 +3025,18 @@ function clusterColor(index, alpha = 1) {
 function setClusterSlider(count) {
   $("embed-clusters").value = count;
   $("embed-cluster-count").textContent = count;
+}
+
+// The readout says the radius, not the slider position — the position is an
+// exponent and means nothing on its own. The ends say what they do instead of
+// the numbers they would round to, since "0.02" and "3.46" are not the claims
+// those ends make.
+function setNearSlider(t) {
+  embedMap.nearT = t;
+  $("embed-near").value = t;
+  const radius = embedNearRadius(t);
+  $("embed-near-num").textContent =
+    radius === 0 ? "0" : radius === Infinity ? "∞" : radius.toFixed(2);
 }
 
 // Zoomed all the way out there is only one sensible framing — the whole cloud,
@@ -3067,6 +3105,37 @@ function pivotOnSelection() {
   return true;
 }
 
+// Put the pick in the middle of the canvas: pivot on it and drop the pan, which
+// centres it by construction — the projection places the pivot at
+// `w/2 + panX, h/2 + panY`.
+//
+// The counterpart to pivotOnSelection(), and the opposite of it: that one buys
+// invisibility by re-anchoring the pan so the pick stays exactly where it
+// already was, which is what you want when the view is already framed on
+// something. This is for the moments where the view is not framed on anything
+// yet — opening the map, or re-projecting, where the coordinates just changed
+// under it. It needs no cached p.sx for the same reason, so it can run before
+// the first frame has been drawn.
+//
+// Zoom is left alone: at 1x the whole cloud is framed, so this only slides that
+// framing over to the pick.
+function centerOnSelection() {
+  const p = embedMap.selected;
+  if (!p) return;
+  embedMap.pivot = { x: p.x, y: p.y, z: p.z };
+  embedMap.panX = 0;
+  embedMap.panY = 0;
+}
+
+// Picking, as a gesture: the pick is also what the Near filter measures from,
+// so choosing one re-filters the cloud. applyEmbedFilter()'s own
+// `selectEmbedPoint(null)` deliberately does *not* go through here — that is
+// what keeps the two from recursing.
+function pickEmbedPoint(point) {
+  selectEmbedPoint(point);
+  applyEmbedFilter();
+}
+
 async function openEmbedMap() {
   embedMap.open = true;
   embedMap.selected = null;
@@ -3078,12 +3147,17 @@ async function openEmbedMap() {
   // library for no visible reason.
   $("embed-search").value = "";
   clearEmbedSearch();
+  // Part of the framing too, and for a stronger version of the same reason: a
+  // map reopened still hiding everything but one neighbourhood is a map with
+  // most of the library missing and nothing on screen saying why.
+  setNearSlider(1);
   $("embed-card").hidden = true;
   $("embed-status").textContent = "Preparing…";
   $("embed-modal").showModal();
   // sized only now: a closed <dialog> has a zero-size bounding rect
   sizeEmbedCanvas();
-  if (await prepareEmbedMap()) await loadEmbedMap();
+  // centred on the image you are working on — see loadEmbedMap
+  if (await prepareEmbedMap()) await loadEmbedMap(true);
 }
 
 // The embedding pass runs on a thread of the server's, and this polls it so the
@@ -3146,7 +3220,11 @@ function sizeEmbedCanvas() {
   canvas.height = Math.round(rect.height * dpr);
 }
 
-async function loadEmbedMap() {
+// `center` says the coordinates the view is framed on have just changed — the
+// map is opening, or the projection was swapped — so the framing has to be
+// rebuilt around the pick. A re-fetch that leaves the layout alone (the cluster
+// slider) passes false, or a drag would yank the view out from under itself.
+async function loadEmbedMap(center = false) {
   const seq = ++embedMap.seq;
   try {
     const data = await api(
@@ -3161,11 +3239,22 @@ async function loadEmbedMap() {
     if (!embedMap.clusterCount && data.clusters.length) {
       setClusterSlider(data.clusters.length);
     }
-    $("embed-status").textContent = embedIdleStatus();
-    // These are fresh point objects, so their `hidden` flags start clear. A
-    // search survives the refetch anyway: `scores` is keyed by image_id, which
-    // is what re-projecting or re-clustering the same library cannot change.
-    applyEmbedFilter();
+    // The pick survives a re-fetch by image id, never by identity: these are
+    // fresh objects, so the old one is no longer in `points` and the draw
+    // loop's `p === embedMap.selected` would never match again. On open there
+    // is no pick yet, and the image you are working on is where to start.
+    const keepId = embedMap.selected
+      ? embedMap.selected.image_id
+      : center
+        ? state.imageId
+        : null;
+    // Also the point applyEmbedFilter() measures Near from, so it is picked
+    // rather than merely selected — and it writes the status line, which is why
+    // nothing sets it here. These are fresh objects, so their `hidden` flags
+    // start clear; a search survives the re-fetch anyway, since `scores` is
+    // keyed by image_id, which re-projecting the same library cannot change.
+    pickEmbedPoint(embedMap.points.find((p) => p.image_id === keepId) || null);
+    if (center) centerOnSelection();
     startEmbedLoop();
   } catch (err) {
     if (seq !== embedMap.seq || !embedMap.open) return;
@@ -3236,24 +3325,54 @@ function textJobText(job) {
   return "Loading the text model…";
 }
 
-// Turn the cached scores into per-point visibility. Purely local: the threshold
-// slider re-runs this and nothing else, so dragging Match is instant the way
-// Size is, where a new query costs a request the way Groups does.
+// Every filter the map has, resolved into per-point visibility — the one writer
+// of `p.hidden` and of the status line, so the two can neither drift nor
+// disagree about what is on screen. Purely local: the two sliders re-run this
+// and nothing else, so dragging Match or Near is instant the way Size is, where
+// a new query costs a request the way Groups does.
+//
+// The two filters compose, and are not symmetric. The search asks a question of
+// each image on its own; Near asks one *about the pick*, so it is applied
+// second, over the survivors, and turns itself off when there is no pick to
+// measure from.
 function applyEmbedFilter() {
   $("embed-match-row").hidden = !embedMap.scores;
-  if (!embedMap.scores) return;
-  let kept = 0;
   for (const p of embedMap.points) {
-    const entry = embedMap.scores[p.image_id];
-    p.hidden = !entry || entry.z < embedMap.matchZ;
-    if (!p.hidden) kept++;
+    const entry = embedMap.scores && embedMap.scores[p.image_id];
+    p.hidden = !!embedMap.scores && (!entry || entry.z < embedMap.matchZ);
   }
   // A pick that just went invisible would otherwise leave the card floating
-  // over a point nobody can see, with Open still wired to it.
+  // over a point nobody can see, with Open still wired to it. It has to happen
+  // between the passes: it is also what the distance below is measured from.
+  // Cleared directly rather than through pickEmbedPoint(), which would call
+  // this again from inside itself.
   if (embedMap.selected && embedMap.selected.hidden) selectEmbedPoint(null);
-  $("embed-status").textContent =
-    `${kept} of ${embedMap.points.length} match “${embedMap.query}” · ` +
-    `drag Match to widen · clear the box to show all`;
+
+  const anchor = embedMap.selected;
+  const radius = embedNearRadius(embedMap.nearT);
+  // The pick is at distance 0 from itself, so it survives even a radius of 0 —
+  // which is what makes the bottom of the travel "only this one" rather than
+  // "nothing".
+  const near = anchor && radius !== Infinity;
+  if (near) {
+    for (const p of embedMap.points) {
+      if (p.hidden) continue;
+      p.hidden =
+        Math.hypot(p.x - anchor.x, p.y - anchor.y, p.z - anchor.z) > radius;
+    }
+  }
+
+  if (!embedMap.scores && !near) {
+    $("embed-status").textContent = embedIdleStatus();
+    return;
+  }
+  let kept = 0;
+  for (const p of embedMap.points) if (!p.hidden) kept++;
+  const of = `${kept} of ${embedMap.points.length}`;
+  $("embed-status").textContent = embedMap.scores
+    ? `${of} match “${embedMap.query}”${near ? ` and are near ${anchor.name}` : ""} · ` +
+      `drag Match to widen · clear the box to show all`
+    : `${of} are near ${anchor.name} · drag Near to widen · pick another image to move the circle`;
 }
 
 function clearEmbedSearch() {
@@ -3261,9 +3380,10 @@ function clearEmbedSearch() {
   embedMap.scores = null;
   embedMap.searchSeq++; // abandon an in-flight search, download poll included
   clearTimeout(embedMap.searchTimer);
-  for (const p of embedMap.points) p.hidden = false;
-  $("embed-match-row").hidden = true;
-  $("embed-status").textContent = embedIdleStatus();
+  // Not a loop clearing `p.hidden` here: Near may still be filtering, and
+  // revealing the whole library because a *query* ended would show images the
+  // other filter says are out. applyEmbedFilter() owns that flag.
+  applyEmbedFilter();
 }
 
 function closeEmbedMap() {
@@ -3700,7 +3820,7 @@ function initEmbedMap() {
       e.clientY < rect.top || e.clientY > rect.bottom
     ) return;
     const dpr = window.devicePixelRatio || 1;
-    selectEmbedPoint(
+    pickEmbedPoint(
       embedPointAt((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr)
     );
   });
@@ -3763,6 +3883,13 @@ function initEmbedMap() {
     $("embed-match-num").textContent = embedMap.matchZ.toFixed(1);
     applyEmbedFilter();
   };
+  // Costs nothing but a redraw too — the coordinates are already here and the
+  // radius is measured against them locally, so this is Match's twin and not
+  // Groups'.
+  $("embed-near").oninput = (e) => {
+    setNearSlider(Number(e.target.value));
+    applyEmbedFilter();
+  };
   // Costs nothing but the pivot, like Size and unlike Groups — and re-pivoting
   // on the tick is what makes the box read as an answer rather than a promise:
   // the auto-spin swings onto the pick immediately, without moving it.
@@ -3772,10 +3899,12 @@ function initEmbedMap() {
   };
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;
-    // keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint
-    selectEmbedPoint(null);
+    // Keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint —
+    // and keep the pick, which is the same image wherever the new fit puts it.
+    // The framing cannot be kept: pivot and pan are in the old space, so
+    // loadEmbedMap re-centres on the pick.
     $("embed-status").textContent = "Projecting…";
-    loadEmbedMap();
+    loadEmbedMap(true);
   };
   $("embed-open-btn").onclick = async () => {
     const point = embedMap.selected;

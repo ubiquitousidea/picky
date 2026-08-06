@@ -322,6 +322,23 @@ one place silently breaks another.
   Scores are keyed by `image_id`, which is what lets a filter survive a
   re-projection; the threshold is applied locally, so dragging Match costs a
   redraw where typing a query costs a request.
+- **Both of the map's filters are resolved in `applyEmbedFilter()`, the one
+  writer of `p.hidden` and of the status line.** Match asks its question of each
+  image alone; Near asks one *about the pick* — a radius in the projected cube,
+  exponential in the slider with the ends clipped to 0 and Infinity — so it runs
+  second, over Match's survivors, and turns itself off when there is no pick.
+  That order is why the pick is dropped *between* the passes rather than after
+  them, and why `clearEmbedSearch()` delegates here instead of clearing
+  `hidden` itself: ending a query must not reveal what the other filter says is
+  out.
+- **The map opens on the image you are working on** (`state.imageId`), picked
+  and centred by `centerOnSelection()` — which is `pivotOnSelection()`'s
+  opposite, and needs no drawn frame behind it. That is what makes Orbit worth
+  defaulting on, and what a re-projection re-runs: pivot and pan are in the
+  *old* space, so swapping the method has to reframe. The pick itself survives
+  any re-fetch by `image_id`, never by identity — `loadEmbedMap()` replaces
+  every point object, so the draw loop's `p === embedMap.selected` would never
+  match again.
 - **The page is one column**: a header of dialog-openers, the image at full width,
   and a `#control-bar` of horizontal rows along the bottom — effect + params +
   Apply, then the selection's controls with its saved masks as a strip, then the

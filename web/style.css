@@ -786,7 +786,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-search::placeholder { color: var(--muted); }
 /* The sprite size slider, sitting with the other header chips. Green like the
    map's own heading, where a param slider would be orange. */
-#embed-size-row, #embed-cluster-row, #embed-match-row, #embed-orbit-row {
+#embed-size-row, #embed-cluster-row, #embed-match-row, #embed-near-row, #embed-orbit-row {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -799,6 +799,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-size { width: 6rem; accent-color: var(--rb-green); }
 #embed-clusters { width: 5rem; accent-color: var(--rb-green); }
 #embed-match { width: 5rem; accent-color: var(--rb-green); }
+#embed-near { width: 5rem; accent-color: var(--rb-green); }
 /* the one checkbox in the map; green like the sliders it sits beside */
 #embed-orbit-row { cursor: pointer; }
 #embed-orbit { accent-color: var(--rb-green); margin: 0; cursor: pointer; }
@@ -811,6 +812,11 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 }
 #embed-match-num {
   width: 1.6rem; /* "0.5" to "3.0" — one decimal always shown */
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+#embed-near-num {
+  width: 2rem; /* "0" and "∞" at the ends, "0.02" to "3.46" between them */
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }

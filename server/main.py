@@ -182,10 +182,13 @@ EMBED_METHODS = ("pca", "tsne")
 def _project(vectors, method: str):
     """Project unit-length CLIP vectors down to 3 dimensions for display.
 
-    PCA is the default because it is *stable*: adding an image nudges the map
-    instead of reshuffling it, and the axes stay real directions of variation.
-    t-SNE draws tighter, more obvious clumps, but its layout is not comparable
-    across library changes and between-cluster distances mean nothing.
+    t-SNE is the default: the map is opened to see what groups with what, and
+    tighter, more obvious clumps are what answers that. Its layout is not
+    comparable across library changes and its between-cluster distances mean
+    nothing, which is what PCA is still here for — that one is *stable* (adding
+    an image nudges the map instead of reshuffling it) and its axes are real
+    directions of variation. Within one library t-SNE is stable too, since the
+    fit below is seeded, so reopening the map does not reshuffle it.
 
     Both are guarded for tiny libraries, where the defaults raise: PCA cannot
     ask for more components than it has samples, and t-SNE's perplexity must be
@@ -315,7 +318,7 @@ def _library_vectors(images: list[dict]):
 
 
 @app.get("/api/embedding-map")
-def embedding_map(method: str = "pca", clusters: int = 0):
+def embedding_map(method: str = "tsne", clusters: int = 0):
     """Every image as a point in 3D — the Image map's data.
 
     Library-scoped, unlike every other endpoint here, and necessarily so: the
