@@ -75,6 +75,27 @@ def _disk_runs(r: int) -> tuple[np.ndarray, np.ndarray, int]:
     return dys, half, int((2 * half + 1).sum())
 
 
+def _hole_radius(r: int, hole: float) -> int:
+    """Radius of the shadow a mirror lens's secondary casts in an aperture of
+    radius `r`, for an obstruction of `hole` times the diameter.
+
+    One line, and shared by `_disk_mean` and `_aperture_stamp` for exactly the
+    reason `_disk_runs` is shared: the rounding is the whole content, and two
+    copies of it that disagreed by a pixel would put a ring in the kernel chart
+    that is not the ring the blur used — which is the one failure the chart
+    exists to rule out.
+
+    Clamped to `r - 1`, so the ring is never narrower than the pixel it is drawn
+    in and the normalizer can never reach 0. That also makes the donut collapse
+    to a plain disk as the radius approaches the focal plane, which is what a
+    real one does: the hole is a fixed fraction of a circle of confusion that is
+    itself going to zero, and there is nothing left to see through.
+    """
+    if hole <= 0:
+        return 0
+    return min(r - 1, int(round(r * min(hole, 1.0))))
+
+
 def _disk_blur(img: np.ndarray, r: int) -> np.ndarray:
     """Convolution with a flat disk of radius `r` — defocus, not soft focus.
 
@@ -145,6 +166,25 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 SHOW_MODES = ["bokeh", "depth", "kernels"]
 
+# The two pupils this effect can have: a photographic lens's, round on the axis
+# and clipped to a cat's eye off it by `swirl`, and a reflecting telephoto's,
+# which is an annulus because the secondary mirror sits on the axis and shadows
+# the middle of it — the source of the ring-shaped highlights those lenses are
+# known for.
+#
+# A mode rather than two sliders that mix, and the exclusivity is the whole
+# design. Physically the two clips are independent: a barrel vignettes the
+# pupil from the sides while the secondary keeps its size, so an off-axis
+# mirror kernel is a cat's eye with a round bite out of the middle, pinched
+# into two disconnected lobes wherever the aperture gets narrower than the
+# obstruction. That shape is drawable, but it costs `_vignette` the closed form
+# it runs on: the light a pinched aperture passes is a lens-minus-disc area
+# with no elementary solution, and approximating it would put a wrong ramp
+# across every sky. Catadioptrics do not swirl and double-Gausses have no
+# secondary, so the combination was never a lens anyway. `bokeh` resolves this
+# to `swirl` and `hole` once, and nothing downstream sees the mode.
+APERTURE_MODES = ["lens", "mirror"]
+
 # Where the kernel chart's `density` slider starts, in columns across the long
 # side; the short side gets however many rows keep the cells square. Enough to
 # read the shape's drift from centre to corner without the lattice itself
@@ -170,8 +210,9 @@ _BOKEH_MIN_LAYERS, _BOKEH_MAX_LAYERS = 4, 12
 _SWIRL_TILE = 64
 
 
-def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
-    """Mean over a flat disk of radius `r`, for float32 arrays of any depth.
+def _disk_mean(arr: np.ndarray, r: int, hole: float = 0.0) -> np.ndarray:
+    """Mean over a flat disk of radius `r`, for float32 arrays of any depth —
+    or over the annulus a mirror lens's secondary leaves of it, at `hole`.
 
     `_disk_blur`'s algorithm — see that docstring for why a disk is summed as
     horizontal runs rather than convolved — over float32 and C channels instead
@@ -180,6 +221,19 @@ def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
     load-bearing for a shipped effect, and generalizing it would quietly change
     what every existing disk-blur node re-renders to. Only the disk geometry is
     shared, via `_disk_runs`.
+
+    The annulus is the disk minus the disk the secondary casts, summed straight
+    out of the prefix sum already built rather than through a run generator of
+    its own. A generator would have to hand back two runs for every row that
+    crosses the hole, where subtraction reuses `_disk_runs` unchanged and gets
+    the outer boundary *identical* to the plain kernel's by construction — the
+    same property sharing `_disk_runs` with `_disk_blur` buys. The inner rows
+    and columns are inside the `r`-padding by construction, so they index the
+    same `sums`, and the cost is one extra accumulate per inner row: about 1.4x
+    a plain disk at a typical obstruction, with no extra arrays.
+
+    `hole = 0` skips the second pass entirely, so the plain path is not merely
+    equivalent but bit-identical to what it was before mirror apertures existed.
 
     No banding, unlike its sibling: callers work at `_BOKEH_WORK_PX`, where a
     full-frame float32 running sum is tens of megabytes rather than hundreds.
@@ -198,6 +252,15 @@ def _disk_mean(arr: np.ndarray, r: int) -> np.ndarray:
         k = int(dy) + r  # padded row holding source row (y + dy)
         lo, hi = r - int(hw), r + int(hw) + 1
         acc += sums[k : k + h, hi : hi + w] - sums[k : k + h, lo : lo + w]
+
+    r_hole = _hole_radius(r, hole)
+    if r_hole:
+        dys_h, half_h, area_h = _disk_runs(r_hole)
+        for dy, hw in zip(dys_h, half_h):
+            k = int(dy) + r  # still offset by the *outer* pad
+            lo, hi = r - int(hw), r + int(hw) + 1
+            acc -= sums[k : k + h, hi : hi + w] - sums[k : k + h, lo : lo + w]
+        area -= area_h
     return acc / area
 
 
@@ -244,13 +307,21 @@ def _lens_runs(r: int, t: float, theta: float) -> tuple[np.ndarray, np.ndarray, 
 
 
 @functools.lru_cache(maxsize=48)
-def _aperture_stamp(r: int, t: float, theta: float, thickness: int) -> np.ndarray:
+def _aperture_stamp(r: int, t: float, theta: float, thickness: int, hole: float) -> np.ndarray:
     """The aperture's outline as a `(2r+1, 2r+1)` bool tile, centred.
 
     The kernel chart's mark: the aperture `_lens_runs` gives, rasterized solid
     and then hollowed out by its own erosion. It is not a circle this function
     derives for itself, so the outline is by construction the exact footprint
     the blur gets — the property the chart exists to have.
+
+    A mirror aperture's hole is cleared out of the solid shape *before* the
+    erosion, so the ring around it costs nothing extra: every boundary pixel of
+    a set survives `filled & ~erode(filled)`, and the hole's rim is boundary.
+    It is cleared with `_lens_runs` rather than `_disk_runs` only to keep one
+    code path — the chart passes `t = 1.0` in mirror mode, where the two return
+    the same runs — and its radius comes from the shared `_hole_radius`, which
+    is what stops the drawn ring and the summed one landing a pixel apart.
 
     Erosion rather than the obvious "draw it again a few pixels smaller and
     subtract", which is wrong in a way that only shows up on the elongated
@@ -267,9 +338,10 @@ def _aperture_stamp(r: int, t: float, theta: float, thickness: int) -> np.ndarra
     where it can be exact. At `swirl = 0` the aspect is 1.0, `_lens_runs` puts
     its two circles at d = 0, and the shape stops depending on `theta` at all;
     the caller passes 0.0 for it there, so every cell sharing a radius shares
-    one stamp and the whole chart costs a handful of rasterizations. With swirl
-    on, each cell has its own angle and mostly misses — which is the right way
-    round. Rounding `theta` into buckets would buy that back by drawing a
+    one stamp and the whole chart costs a handful of rasterizations. A mirror
+    chart is that case always — the modes are exclusive, so its aspect is 1.0
+    everywhere — and caches just as well. With swirl on, each cell has its own
+    angle and mostly misses — which is the right way round. Rounding `theta` into buckets would buy that back by drawing a
     kernel rotated a few degrees from the one the render uses, and a chart that
     quietly disagrees with the render is the failure this whole view is built
     to avoid.
@@ -285,6 +357,11 @@ def _aperture_stamp(r: int, t: float, theta: float, thickness: int) -> np.ndarra
     dys, lo, hi, _ = _lens_runs(r, t, theta)
     for dy, left, right in zip(dys, lo, hi):
         filled[int(dy) + r, int(left) + r : int(right) + r + 1] = True
+    r_hole = _hole_radius(r, hole)
+    if r_hole:
+        dys_h, lo_h, hi_h, _ = _lens_runs(r_hole, t, theta)
+        for dy, left, right in zip(dys_h, lo_h, hi_h):
+            filled[int(dy) + r, int(left) + r : int(right) + r + 1] = False
     if r <= thickness:
         # A ring as thick as the kernel is wide is not a ring. Below that the
         # mark is the aperture solid, which is what the chart drew at every size
@@ -488,14 +565,16 @@ def _kernel_chart(
     span: float,
     r_full: float,
     swirl: float,
+    hole: float,
     density: int,
 ) -> np.ndarray:
     """The apertures themselves, outlined at true size on a grid over the frame.
 
-    A diagram of what `show: "bokeh"` is doing, for aiming the other four
-    sliders: every ring is the actual footprint `_lens_runs` hands the blur, at
-    the actual radius the depth under it earns, so its size reads `amount`,
-    `focus` and `falloff` and its shape reads `swirl`. Nothing here recomputes
+    A diagram of what `show: "bokeh"` is doing, for aiming the other sliders:
+    every ring is the actual footprint `_lens_runs` hands the blur, at the
+    actual radius the depth under it earns, so its size reads `amount`, `focus`
+    and `falloff` and its shape reads the aperture — the cat's eye `swirl`
+    clips, or the annulus a mirror's `hole` leaves. Nothing here recomputes
     that geometry — a chart that drew its own idea of the kernel could agree
     with the render today and drift from it silently, which is the one way a
     diagnostic view is worse than none.
@@ -570,7 +649,7 @@ def _kernel_chart(
             # is what collapses a whole swirl-free chart onto one stamp per
             # radius — a cache hit, not an approximation.
             theta = 0.0 if aspect >= 1.0 else float(np.arctan2(gy - cy, gx - cx))
-            stamp = _aperture_stamp(r, float(aspect), theta, min(thickness, max(1, r // 3)))
+            stamp = _aperture_stamp(r, float(aspect), theta, min(thickness, max(1, r // 3)), hole)
 
             top, left = gy_i - r, gx_i - r
             y0, y1 = max(0, top), min(h, top + stamp.shape[0])
@@ -623,7 +702,7 @@ def _bloom_luminance(
 
 
 def _bokeh_layers(
-    src: np.ndarray, d: np.ndarray, radii: np.ndarray, bloom: float, swirl: float
+    src: np.ndarray, d: np.ndarray, radii: np.ndarray, bloom: float, swirl: float, hole: float
 ) -> np.ndarray:
     """Composite `src` as depth-ordered layers, each blurred by its own radius.
 
@@ -674,16 +753,22 @@ def _bokeh_layers(
         if bright is not None:
             layer[..., 4] = weight * bright
         radius = int(round(radii[k]))
-        # The two kernels are the same convolution over a different aperture, so
-        # everything downstream is indifferent to which ran — including the two
-        # channels riding along. Coverage goes through it, so occlusion stays
-        # consistent; so does the exponential, which is what makes a blooming
-        # highlight come out as a cat's eye rather than a disk, and is most of
-        # what the swirl is for.
+        # All three kernels are the same convolution over a different aperture,
+        # so everything downstream is indifferent to which ran — including the
+        # two channels riding along. Coverage goes through it, so occlusion
+        # stays consistent; so does the exponential, which is what makes a
+        # blooming highlight come out as a cat's eye or a ring rather than a
+        # disk, and is most of what either aperture is for.
+        #
+        # Two arms, not three, because `bokeh` has already resolved the mode:
+        # `swirl` and `hole` are never both non-zero, so a mirror aperture is
+        # the untiled path with a hole in its kernel — which is right on its own
+        # terms, since a mirror's pupil is the same at every point of the frame
+        # and has nothing for `_swirl_mean`'s per-tile geometry to do.
         if swirl > 0:
             blurred = _swirl_mean(layer, radius, swirl)
         else:
-            blurred = _disk_mean(layer, radius)
+            blurred = _disk_mean(layer, radius, hole)
         rgb, alpha = blurred[..., :3], blurred[..., 3:4]
         # One pass carries the exponential through the same aperture as the
         # colour, which is the point: the soft maximum has to be taken over
@@ -721,10 +806,20 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
 
     focus = float(params["focus"])
     falloff = float(params["falloff"])
-    # nodes made before bloom and swirl existed carry neither, the same reason
-    # blur reads "kernel" with a default — and 0 is what they rendered with
+    # nodes made before bloom and the apertures existed carry none of them, the
+    # same reason blur reads "kernel" with a default — and "lens" at swirl 0 is
+    # what they rendered with
     bloom = float(params.get("bloom", 0.0))
-    swirl = float(params.get("swirl", 0.0))
+    # The aperture mode is resolved here and nowhere else: past this point there
+    # is no mode, only a `swirl` and a `hole` of which at most one is non-zero.
+    # That is what keeps the exclusivity from having to be re-stated by every
+    # kernel, and what leaves `_vignette` untouched — see `APERTURE_MODES`. A
+    # mirror aperture therefore does not vignette at all, which is not an
+    # omission: the corner darkening belongs to the barrel that clips a
+    # photographic pupil, and a catadioptric's is famously flat by comparison.
+    mirror = params.get("aperture", "lens") == "mirror"
+    swirl = 0.0 if mirror else float(params.get("swirl", 0.0))
+    hole = float(params.get("obstruction", 0.0)) if mirror else 0.0
     # `amount` is a percentage of the long side, where blur's `radius` is in
     # pixels: a depth-of-field setting has to mean the same thing on the 800x600
     # and the 40 MP frames in one library, and the blur that reads as "portrait
@@ -738,7 +833,7 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
         # Before the working canvas is sized: the chart is about the blur you
         # get, and `scale` is only ever about how cheaply it is computed.
         density = int(params.get("density", _KERNEL_COLS))
-        return _kernel_chart(img, d_small, focus, falloff, span, r_full, swirl, density)
+        return _kernel_chart(img, d_small, focus, falloff, span, r_full, swirl, hole, density)
 
     scale = min(1.0, _BOKEH_WORK_PX / max(h, w), _BOKEH_WORK_R / max(r_full, 1e-6))
     ww, wh = max(1, round(w * scale)), max(1, round(h * scale))
@@ -746,7 +841,9 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     if r_work < 1.0:
         # sub-pixel everywhere; there is no blur to apply. The aperture is still
         # the aperture, though — skipping the vignette here would make corner
-        # brightness jump the instant `amount` crossed this threshold.
+        # brightness jump the instant `amount` crossed this threshold. A mirror
+        # aperture has nothing to preserve: it does not vignette, and a hole in
+        # a sub-pixel kernel is a hole in nothing.
         return _vignette(img, swirl) if swirl > 0 else img.copy()
 
     # BOX going down is an area average — a subsample would alias the very
@@ -764,7 +861,7 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     # *is* inverse depth, so a straight ramp on it is what the optics do. See
     # server/depth.py.
     band_t = np.abs(np.linspace(0.0, 1.0, layers) - focus) / span
-    work = _bokeh_layers(src, d, r_work * band_t**falloff, bloom, swirl)
+    work = _bokeh_layers(src, d, r_work * band_t**falloff, bloom, swirl, hole)
 
     # Recombine at full resolution. Everything sharp comes from the original —
     # the whole point of the working canvas is that it is only ever asked for
@@ -1014,7 +1111,18 @@ EFFECTS = {
             {"name": "focus", "label": "Focus (1 = nearest)", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0, "pick": "depth"},
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
             {"name": "bloom", "label": "Highlight bloom", "type": "float", "min": 0.0, "max": 12.0, "step": 0.5, "default": 0.0},
-            {"name": "swirl", "label": "Swirl (shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0},
+            # The dropdown sits immediately above the two sliders it switches
+            # between, since only one of them applies at a time and nothing in
+            # the panel can hide the other — `density`'s precedent. "lens" is
+            # the default because it is what every node already on disk
+            # rendered as, no `aperture` key having existed when it was saved.
+            {"name": "aperture", "label": "Aperture", "type": "choice", "options": APERTURE_MODES, "default": "lens"},
+            {"name": "swirl", "label": "Swirl (lens: shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0},
+            # Hole diameter over aperture diameter. Defaults to a real
+            # catadioptric's ~0.4 rather than to 0, unlike every other param
+            # here, because it is gated behind the dropdown: a 0 default would
+            # make choosing "mirror" do nothing at all and read as broken.
+            {"name": "obstruction", "label": "Hole Ø (mirror)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.4},
             # Read by the "kernels" view alone, and sitting next to `show` for
             # that reason. The panel has no way to show a param conditionally,
             # and a diagnostic knob is not worth growing a mode system in

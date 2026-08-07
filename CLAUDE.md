@@ -103,7 +103,11 @@ one place silently breaks another.
   disk-blur node re-renders to. Only the geometry is shared, and only as the
   run generators: `_disk_runs` for both of those, `_lens_runs` for `_swirl_mean`
   — which is the third convolution here and, at aspect 1, returns `_disk_runs`
-  run for run, so the swirl slider has no step at the bottom.
+  run for run, so the swirl slider has no step at the bottom. `_disk_mean` is
+  also where the mirror aperture's hole lives, as a second `_disk_runs`
+  subtracted out of the prefix sum it already built rather than as a run
+  generator of its own: that keeps the outer boundary identical to the plain
+  kernel's, and `hole = 0` skips the pass, so the shipped path stays bit-identical.
 - **Swirl's kernel varies per pixel, and the prefix sum is what makes that
   affordable.** The run trick looks incompatible with a kernel that changes
   across the frame — the bounds stop being sliceable constants — but the
@@ -123,6 +127,19 @@ one place silently breaks another.
   then divide itself back out. `_vignette` therefore runs last, in `bokeh()`, on
   sharp and blurred pixels alike — a lens vignettes both, and dimming only what
   was blurred would put a step along the recombine crossover.
+- **Bokeh's two apertures are a mode, and `bokeh()` is the only place that
+  knows it.** `APERTURE_MODES` picks a photographic pupil (round, clipped to a
+  cat's eye by `swirl`) or a reflecting telephoto's annulus (`obstruction`), and
+  the first thing `bokeh()` does is resolve that dropdown into a `swirl` and a
+  `hole` of which **at most one is ever non-zero**. Every kernel downstream
+  takes both and re-states nothing. That exclusivity is load-bearing, not
+  tidiness: an off-axis mirror kernel is a cat's eye with a round bite out of
+  it, pinched into two lobes wherever the aperture is narrower than the hole,
+  and the light it passes has no elementary closed form — so mixing them would
+  cost `_vignette` the `_lens_area_ratio` it runs on. It is also why the mirror
+  aperture does not vignette at all, and why `_aperture_stamp` and
+  `_hole_radius` are shared by the blur and the kernel chart: a ring drawn a
+  pixel off the ring summed is the one thing that view exists to rule out.
 - **The tone curve's LUT is implemented twice on purpose** —
   `effects._curve_lut` and `curveLut()` in `web/app.js`, line for line — so the
   editor draws exactly the transfer function the server will apply. Change one,
