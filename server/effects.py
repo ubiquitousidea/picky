@@ -347,18 +347,44 @@ def _vignette(img: np.ndarray, swirl: float) -> np.ndarray:
     """Darken toward the corners by exactly as much light as the aperture that
     `_swirl_mean` narrowed is no longer passing.
 
-    Not a stylistic vignette with its own falloff: the gain *is*
-    `_lens_area_ratio(_swirl_aspect(rho))`, so one slider describes one physical
-    pupil — about -1.5 stops in the corners at swirl 0.6, which is roughly a
-    fast vintage double-Gauss wide open, and -3 at the top of the slider, which
-    is what the top of the slider is for.
+    **The swirl does not already do this, though the optics say it should.** A
+    real clipped pupil vignettes *because* it is clipped — one aperture produces
+    the cat's eye and the corner darkening both, which is why one slider drives
+    them. But `_swirl_mean` divides by the cat's eye's own area, so it is a mean
+    and not an integral: narrowing the aperture changes which pixels get averaged
+    and never their level. A flat frame at the top of the slider comes back flat,
+    in the corners where the aperture passes 12.8% of the light exactly as much
+    as on the axis. The shape of the light loss is free; the magnitude has to be
+    put back by hand, and this is the hand — which is also why the param is
+    labelled "Swirl (shape + vignette)" rather than for the swirl alone.
 
-    It runs here, on the finished full-resolution frame, rather than on the
-    blurred layers, for two reasons. The kernel cannot carry it (see
-    `_swirl_mean`), and a lens vignettes sharp light as well as defocused light
-    — dimming only what was blurred would put a brightness step exactly along
-    the recombine crossover, which is the one seam this effect works hardest to
-    hide.
+    It runs here, on the finished full-resolution frame, rather than inside the
+    blur, for three reasons.
+
+    The kernel cannot carry it. Normalizing by the *disk's* area instead of the
+    cat's eye's is the obvious way to have the dimming for free, and it fails
+    twice over: coverage rides through that same kernel as alpha, so a scaled
+    normalizer would report a fully covering band as the area ratio instead of 1
+    and let far bands bleed through near ones — and `_bokeh_layers` then
+    un-premultiplies by the coverage that accumulated, which divides the very
+    gain back out. Corrupted occlusion, and still no vignette. See `_swirl_mean`.
+
+    A lens vignettes sharp light as well as defocused light. `bokeh` recombines
+    the original full-size pixels with the blurred working canvas, so dimming
+    only what was blurred would put a brightness step exactly along the
+    recombine crossover, which is the one seam this effect works hardest to hide.
+
+    And below some radius no kernel runs at all: `bokeh` takes its sub-pixel
+    early-out before `_bokeh_layers` is ever reached, and vignettes there too.
+    The aperture is the aperture whether or not it blurred anything, and corner
+    brightness must not jump the instant `amount` crosses that threshold.
+
+    Not a stylistic vignette with its own falloff, in any of those places: the
+    gain *is* `_lens_area_ratio(_swirl_aspect(rho))`, the same aspect the kernel
+    reads, integrated into an area fraction — so one slider describes one
+    physical pupil. About -1.5 stops in the corners at swirl 0.6, which is
+    roughly a fast vintage double-Gauss wide open, and -3 at the top of the
+    slider, which is what the top of the slider is for.
 
     Banded like `_disk_blur` for the same reason: at 40 MP a full-frame float
     gain map is 480 MB. The gain is computed in float and applied per band
