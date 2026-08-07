@@ -100,8 +100,9 @@ def _disk_blur(img: np.ndarray, r: int) -> np.ndarray:
     """Convolution with a flat disk of radius `r` — defocus, not soft focus.
 
     A Gaussian is separable, so Pillow blurs in O(w*h) whatever the radius. A
-    disk is not, and the textbook 2-D convolution is O(w*h*r^2): 31k taps per
-    pixel at r=100, ~106 s for a 40 MP frame. So this doesn't convolve.
+    disk is not, and summing the convolution tap by tap is O(w*h*r^2): 31k taps
+    per pixel at r=100, ~106 s for a 40 MP frame. So this gets the same
+    convolution a cheaper way.
 
     A disk is a stack of horizontal runs — row `dy` spans |dx| <= sqrt(r^2-dy^2)
     — and a cumulative sum along x reduces a run of *any* length to two lookups.
@@ -215,7 +216,7 @@ def _disk_mean(arr: np.ndarray, r: int, hole: float = 0.0) -> np.ndarray:
     or over the annulus a mirror lens's secondary leaves of it, at `hole`.
 
     `_disk_blur`'s algorithm — see that docstring for why a disk is summed as
-    horizontal runs rather than convolved — over float32 and C channels instead
+    horizontal runs rather than tap by tap — over float32 and C channels instead
     of uint8 and exactly 3. The two are deliberately not one function: the
     uint8 path's promise that "int32 holds every intermediate exactly" is
     load-bearing for a shipped effect, and generalizing it would quietly change
@@ -492,6 +493,18 @@ def _swirl_mean(arr: np.ndarray, r: int, swirl: float) -> np.ndarray:
     it, long axis tangential — the Helios 44-2 look, where the deformation is
     what makes a busy background appear to swirl.
 
+    This is the one kernel here that is *not* a convolution, and calling it one
+    is the mistake worth naming: a convolution has a single kernel, so the
+    moment the kernel depends on position the operator is only linear and
+    shift-*variant* — a superposition integral with a spatially varying PSF,
+    out(x) = sum over y of h(x; x-y) in(y), where `h` still answers to x after
+    the offset is taken. What is implemented is the blockwise approximation of
+    that: exactly shift-invariant inside a `_SWIRL_TILE` square, stepping between
+    them, which is the same statement as the seam analysis below. And it is a
+    *gather* either way — each output pixel averages the aperture centred on
+    itself, never a source pixel scattering into one; see `_bokeh_layers` for
+    what that costs and how the layering pays it back.
+
     A kernel that varies per pixel looks like it must destroy the run trick: the
     run bounds stop being constants that can be sliced and become arrays that
     have to be gathered, which measures far too slow to use. The way out is that
@@ -664,8 +677,8 @@ def _kernel_chart(
 def _bloom_luminance(
     rgb: np.ndarray, alpha: np.ndarray, bright: np.ndarray, bloom: float
 ) -> np.ndarray:
-    """Replace a blurred band's luminance with the *soft maximum* over the disk,
-    keeping the colour the plain blur produced.
+    """Replace a blurred band's luminance with the *soft maximum* over whichever
+    aperture blurred it, keeping the colour the plain blur produced.
 
     A flat average is what makes a rendered defocus look computed rather than
     photographed. A lens spreads a highlight's energy across the whole disk, so
@@ -675,7 +688,7 @@ def _bloom_luminance(
 
     The fix is the standard three steps, in luminance only:
 
-        exponentiate -> convolve -> log        L' = 1 + ln(mean(e^(k(L-1)))) / k
+        exponentiate -> average -> log         L' = 1 + ln(mean(e^(k(L-1)))) / k
 
     which is a soft maximum: at k -> 0 it *is* the mean (expand the exponential
     and the k cancels), at large k it approaches max(L), and in between one
@@ -711,15 +724,24 @@ def _bokeh_layers(
     two neighbouring bands by linear interpolation, so the partition is smooth
     and there is no banding where a band boundary crosses a surface.
 
-    The bands are then composited far to near with premultiplied alpha. This is
-    the step that earns the design, and the tempting simplification — blur the
-    whole frame at each radius and lerp between the two nearest results — is
-    what it exists to avoid: a globally blurred layer has averaged the subject
-    into itself, so the subject's colour smears outward as a halo. That is the
-    same artifact as the hard-edged mask blur this effect replaces, wearing a
-    softer hat. Carrying coverage as alpha instead gets the occlusion right:
-    the sharp subject covers the blurred background, and the background's blur
-    never reaches into the subject.
+    The bands are then composited far to near with premultiplied alpha. That
+    compositing is what stands in for the direction the filtering has wrong: a
+    real defocus *scatters*, every scene point spreading its own energy over its
+    own circle of confusion, while every kernel here gathers, each output pixel
+    averaging a neighbourhood of the input. A gather cannot know that the pixels
+    it is averaging belong to different surfaces. Splitting depth into bands and
+    carrying each band's coverage as alpha is what recovers that — the standard
+    way a scatter is approximated by a stack of gathers, and the whole reason
+    this function exists rather than one call to a blur.
+
+    The tempting simplification — blur the whole frame at each radius and lerp
+    between the two nearest results — is the gather without that repair, and it
+    shows: a globally blurred layer has averaged the subject into itself, so the
+    subject's colour smears outward as a halo. That is the same artifact as the
+    hard-edged mask blur this effect replaces, wearing a softer hat. Carrying
+    coverage as alpha instead gets the occlusion right: the sharp subject covers
+    the blurred background, and the background's blur never reaches into the
+    subject.
     """
     layers = len(radii)
     pos = d * (layers - 1)
@@ -753,12 +775,16 @@ def _bokeh_layers(
         if bright is not None:
             layer[..., 4] = weight * bright
         radius = int(round(radii[k]))
-        # All three kernels are the same convolution over a different aperture,
-        # so everything downstream is indifferent to which ran — including the
-        # two channels riding along. Coverage goes through it, so occlusion
-        # stays consistent; so does the exponential, which is what makes a
-        # blooming highlight come out as a cat's eye or a ring rather than a
-        # disk, and is most of what either aperture is for.
+        # All three kernels are the same normalized local average over a
+        # different aperture, so everything downstream is indifferent to which
+        # ran — including the two channels riding along. Coverage goes through
+        # it, so occlusion stays consistent; so does the exponential, which is
+        # what makes a blooming highlight come out as a cat's eye or a ring
+        # rather than a disk, and is most of what either aperture is for.
+        #
+        # "Convolution" is exact for the two untiled kernels and wrong for the
+        # tiled one: `_swirl_mean`'s kernel depends on position, which is the
+        # one thing a convolution cannot do. See its docstring.
         #
         # Two arms, not three, because `bokeh` has already resolved the mode:
         # `swirl` and `hole` are never both non-zero, so a mirror aperture is

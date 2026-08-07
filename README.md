@@ -36,6 +36,40 @@ restarts.
   - *Blur* — a **Gaussian** kernel for soft focus, or a flat **disk** for
     lens-style defocus, where a highlight blooms into a hard-edged circle
     rather than smearing.
+  - *Bokeh* — **depth-of-field, with no selection involved**. A
+    [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2)
+    model estimates distance for every pixel, and the blur grows with distance
+    from the focal plane the way a lens's circle of confusion does — so a
+    background falls away *continuously* instead of switching to blurred along a
+    traced silhouette, which is the giveaway of a masked blur. **Amount** sets
+    the maximum blur as a percentage of the frame (so it means the same thing on
+    an 800 × 600 and a 40 MP photo), and **Focus on a click** aims the focal
+    plane by clicking the thing you want sharp rather than by hunting with the
+    slider. **Falloff** is the artistic override: 1 is what the optics actually
+    do, higher holds more of the scene near-sharp and then drops it away at the
+    extremes, lower blurs everything off the focal plane at once.
+    **Highlight bloom** restores what an average destroys — a lens spreads a
+    pinpoint of sun across the whole aperture, so it comes out *as bright as the
+    highlight was* rather than as a faintly lighter smudge.
+
+    **Aperture** chooses which lens the out-of-focus shapes come from. A
+    photographic **lens** is round in the middle of the frame, and **Swirl**
+    clips it to a progressively thinner cat's eye toward the edges — the
+    Helios 44-2 look, where a busy background appears to rotate around the
+    subject — darkening the corners as it goes, because a narrowed aperture is
+    passing less light. A **mirror** lens is a reflecting telephoto, whose
+    secondary mirror shadows the middle of the aperture: **Hole Ø** sets how
+    much, and every highlight comes out as the doughnut those lenses are known
+    for. The two are alternatives, not a mix, for reasons of optics as much as
+    arithmetic — catadioptrics don't swirl.
+
+    **Show** switches the same node between three views: the finished *bokeh*,
+    the *depth* map the model saw (useful for aiming Focus), and *kernels* — the
+    apertures themselves outlined at true size on a grid over the photo, so you
+    can read the blur's size and shape across the frame before committing.
+    **Kernel grid** sets how many columns that grid has; wound up, it puts
+    several samples either side of a depth edge. Model weights (~99 MB) download
+    the first time you press the Bokeh button.
   - *Sobel edges*, *Floyd–Steinberg dither*
   - *Blend* — combine the selected node with any other node in the tree using
     average, additive, multiplicative, or subtractive blending. A **weight**
@@ -139,10 +173,14 @@ python3 -m venv .venv
 Then open <http://localhost:8000>. Uploaded originals, the SQLite database,
 and cached renders live in `data/` (gitignored).
 
-The segmentation models are fetched to `data/models/` the first time you use
-click-to-segment, from a revision-pinned Hugging Face URL. To supply your own
-ONNX exports instead, point `PICKY_SAM_ENCODER` and `PICKY_SAM_DECODER` at
-them; nothing else in the app requires the download.
+Model weights are fetched to `data/models/` from revision-pinned Hugging Face
+URLs, each on the first gesture that needs it and never before: segmentation
+(~45 MB) when you click to segment, depth (~99 MB) when you press **Bokeh**,
+CLIP's vision tower (~335 MB) when you open the Image map, and its text tower
+(254 MB) only if you search there. To supply your own ONNX exports instead,
+point the matching env var at an absolute path — `PICKY_SAM_ENCODER`,
+`PICKY_SAM_DECODER`, `PICKY_DEPTH_MODEL`, `PICKY_CLIP_MODEL`, or
+`PICKY_CLIP_TEXT_MODEL`. Nothing else in the app requires any of the downloads.
 
 ## Architecture
 
@@ -153,6 +191,7 @@ server/
   effects.py    effect registry: each effect maps an RGB numpy array -> array
   rendering.py  node render pipeline with per-node JPEG cache
   sam.py        MobileSAM via onnxruntime: click a point, get a mask
+  depth.py      Depth Anything V2 via onnxruntime: a photo in, relative depth out
 web/
   index.html, app.js, style.css   vanilla JS single-page frontend
 ```
@@ -182,6 +221,34 @@ everything there is a cache that invalidation is free to delete. Applying an
 effect to a fresh pick saves it that way first, so the object outlives the
 click — a click is only meaningful on the node it was made on, and applying an
 effect moves you off that node.
+
+Bokeh's variable blur is a **layered gather**. Depth is split into bands whose
+weights sum to 1 at every pixel; each band is filtered at its own radius and the
+bands are composited far to near with premultiplied alpha. The layering is not an
+optimization — it is what corrects the direction of the operation. A real defocus
+*scatters*, each scene point spreading its energy over its own circle of
+confusion, whereas a filter *gathers*, each output pixel averaging a
+neighbourhood that may straddle two surfaces. Blurring the whole frame at each
+radius and interpolating would let the subject average into the background and
+smear back out as a halo — the same tell as the masked blur this replaces.
+Carrying each band's coverage as alpha is what keeps the sharp subject in front
+of a blur that never reaches into it.
+
+The kernels themselves are flat apertures, normalized to average. Summing one tap
+by tap would be O(w·h·r²), so each is decomposed into horizontal runs and read
+out of a cumulative sum along x — two lookups per run, O(w·h·r) and exact. The
+round and annular apertures are the same kernel at every pixel and so are
+genuinely convolutions; the cat's eye is not, since its shape depends where in
+the frame it sits. That one is a linear *shift-variant* filter, held constant
+over 64 px tiles, and it stays affordable because the cumulative sum does not
+depend on the kernel at all: one is built for the whole frame and each tile reads
+its own offsets out of it, with no halo and no extra data. Everything blurred is
+computed on a canvas bounded in both size and radius and recombined with the
+full-resolution original wherever the blur already exceeds the detail the
+downsample threw away, which is what keeps a 40 MP render to seconds and tens of
+megabytes. The depth map is cached in-process against a hash of the pixels rather
+than beside the render, because an effect is a plain registry entry that never
+learns its node's id.
 
 The crop deliberately sits *outside* the work tree, as an output stage applied
 after every effect. Every registry effect maps an array to an array of the same

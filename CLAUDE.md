@@ -102,12 +102,23 @@ one place silently breaks another.
   premultiplied layers. Generalizing the first would change what every existing
   disk-blur node re-renders to. Only the geometry is shared, and only as the
   run generators: `_disk_runs` for both of those, `_lens_runs` for `_swirl_mean`
-  — which is the third convolution here and, at aspect 1, returns `_disk_runs`
+  — which is the third of these kernels and, at aspect 1, returns `_disk_runs`
   run for run, so the swirl slider has no step at the bottom. `_disk_mean` is
   also where the mirror aperture's hole lives, as a second `_disk_runs`
   subtracted out of the prefix sum it already built rather than as a run
   generator of its own: that keeps the outer boundary identical to the plain
   kernel's, and `hole = 0` skips the pass, so the shipped path stays bit-identical.
+- **Only two of bokeh's three kernels are convolutions**, so say *local average*
+  or *filter* when the sentence covers all three. `_disk_mean`'s round and
+  annular apertures are one kernel everywhere, and "convolution" is exact for
+  them (both are centrosymmetric, so correlation and convolution even coincide).
+  `_swirl_mean`'s depends on position, which is the one thing a convolution
+  cannot do: it is a linear *shift-variant* filter, blockwise shift-invariant per
+  `_SWIRL_TILE`. All three are also **gathers**, where a physical defocus is a
+  scatter — `_bokeh_layers`' depth bands and alpha are what stand in for the
+  difference. And `bokeh()` as a whole is not a linear operator at all: the radii
+  come from a depth map of its own input, `bloom` is a pointwise exponential, and
+  both the coverage divide and the recombine mask are image-dependent.
 - **Swirl's kernel varies per pixel, and the prefix sum is what makes that
   affordable.** The run trick looks incompatible with a kernel that changes
   across the frame — the bounds stop being sliceable constants — but the
