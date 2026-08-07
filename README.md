@@ -96,15 +96,20 @@ restarts.
   uploads on top of one another. Each image is embedded by the vision half of
   [CLIP](https://openai.com/research/clip), which was trained against captions
   and so groups by *subject*, not by palette — a red car does not land beside a
-  red sunset. Drag to rotate, double-click to pause the spin, and click a point
-  for that image's thumbnail and an **Open** button, which makes the map a way
-  to navigate a large library by eye. **PCA** is stable, so adding an image
-  nudges the map rather than reshuffling it; **t-SNE** draws tighter clumps but
-  its layout is not comparable between runs. Points are painted in each photo's
-  average color. Model weights (~335 MB) download on first use, and each image
-  is embedded once (~12 ms) and cached. That first run reports itself — the
-  status line counts the megabytes down and then the images — instead of leaving
-  the modal blank for a minute.
+  red sunset. Drag to rotate, tick **Spin** (or double-click the cloud) to let it
+  turn on its own, and click a point for that image's thumbnail and an **Open**
+  button, which makes the map a way to navigate a large library by eye. A row of
+  chips filters by *edit* rather than by subject — **Edited**, **Untouched**, and
+  one per kind of effect the library actually contains, each with its count;
+  lighting several widens the filter rather than narrowing it. **PCA** is stable,
+  so adding an image nudges the map rather than reshuffling it; **t-SNE** draws
+  tighter clumps but its layout is not comparable between runs. Points are
+  painted in each photo's average color. Model weights (~335 MB) download on
+  first use, and each image is embedded once (~12 ms) and cached. That first run
+  reports itself — the status line counts the megabytes down and then the
+  images — instead of leaving the modal blank for a minute. The fitted layout is
+  cached too, keyed by the vectors that produced it, so reopening the map is
+  instant until the library itself changes.
 - **Preview zoom** — scroll to zoom (cursor-anchored), drag to pan,
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
@@ -204,7 +209,7 @@ the preset is replayed against.
 |--------|------|---------|
 | GET    | `/api/effects` | effect registry with parameter specs |
 | POST   | `/api/images` | upload a JPG (multipart) |
-| GET    | `/api/images` | list images |
+| GET    | `/api/images` | list images, each with its `crop` and the set of `effects` its work tree carries |
 | GET    | `/api/images/{id}` | one image with its `crop` and the `geometry` that crop implies (output size, and the affine mapping a framed pixel back to the node's own space) |
 | PUT    | `/api/images/{id}/crop` | set the image's framing (`crop`: `{angle, rect}`, or `null` to clear); drops only the framed-output cache, never the effect renders |
 | POST   | `/api/images/{id}/crop-preview` | the rotated but *unframed* proxy the frame editor drags over (`node_id`, `angle`), rendered small; `X-Canvas-Width`/`-Height` report the full-size canvas it stands for, so the editor can name true output pixels |
@@ -216,6 +221,7 @@ the preset is replayed against.
 | POST   | `/api/nodes/{id}/mask` | outline PNG for a selection — `points` segmented on the fly, or `masks` (saved ids) read back, plus an optional `invert`; persists nothing but the node's cached embedding |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
+| GET    | `/api/nodes/{id}/depth-at` | the depth under one pixel (`x`, `y`) on bokeh's own normalized scale — what click-to-focus reads a `focus` value off; stores nothing |
 | DELETE | `/api/nodes/{id}` | delete a node and everything derived from it |
 | DELETE | `/api/images/{id}` | delete an image, its tree, and its files |
 | GET    | `/api/presets` | list saved presets with their steps |
@@ -227,4 +233,12 @@ the preset is replayed against.
 | GET    | `/api/masks/{id}/thumb` | the mask's silhouette as a small grayscale PNG — the icon in the mask grid; computed per request and served `immutable`, so cache-bust on the mask's `created_at` |
 | PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
 | DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
+| GET    | `/api/embedding-map` | the whole library as 3D points (`method`: `tsne`\|`pca`, `clusters`: 0 for an automatic count, else 2–20), plus named cluster centres. Embeds anything it finds missing, so it answers with or without a `prepare`; the fit itself is cached against the vectors that produced it |
+| GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine and a z-score over this query's own spread. 409s rather than downloading the text tower inside a GET |
+| POST   | `/api/embedding-map/prepare` | start the background embedding pass (~335 MB of weights on a fresh install, then one forward pass per image); answers `done` synchronously when nothing is missing |
+| GET    | `/api/embedding-map/progress` | where that pass got to — `state`, `phase`, `done`/`total` |
+| POST   | `/api/text-model/prepare` | start fetching CLIP's text tower (254 MB), which only searching needs |
+| GET    | `/api/text-model/progress` | where that download got to, including `ready` for a tower an earlier run already fetched |
+| POST   | `/api/depth-model/prepare` | start fetching the depth model (99 MB), which only Bokeh needs |
+| GET    | `/api/depth-model/progress` | where that download got to |
 | GET    | `/api/stats` | library counts and disk usage |

@@ -284,11 +284,18 @@ function toNodeSpace(ox, oy) {
 
 // ---------- Work tree ----------
 
+// How an effect is named wherever the name stands on its own — a tree row, a
+// stats line, a filter chip. Blend is special-cased away from its registry
+// label, which is "Blend with…": that is the wording of the *control* that asks
+// for a second parent, and it reads as an unfinished sentence anywhere else.
+function effectLabel(name) {
+  if (name === "blend") return "Blend";
+  const spec = state.effects.find((e) => e.name === name);
+  return spec ? spec.label : name;
+}
+
 function nodeLabel(node) {
-  if (!node.effect) return "Original";
-  if (node.effect === "blend") return "Blend";
-  const spec = state.effects.find((e) => e.name === node.effect);
-  return spec ? spec.label : node.effect;
+  return node.effect ? effectLabel(node.effect) : "Original";
 }
 
 function nodeParamsText(node) {
@@ -2570,9 +2577,7 @@ async function openStats() {
   statRow(body, "Masks", s.masks);
   for (const e of s.by_effect) {
     // nodeLabel() wants a node; here we only have the effect name
-    const spec = state.effects.find((x) => x.name === e.effect);
-    const label = e.effect === "blend" ? "Blend" : spec ? spec.label : e.effect;
-    statRow(body, label, e.count, true);
+    statRow(body, effectLabel(e.effect), e.count, true);
   }
 
   const st = s.storage;
@@ -2741,7 +2746,10 @@ const cluster = {
   centroids: [],
   yaw: 0.8,
   pitch: -0.45,
-  spin: true,
+  // Off, like the map's: a plot that is moving while you are reading it is
+  // harder to read, and the depth the spin conveys is one drag away. Double-click
+  // turns it on, and it stays on for the session.
+  spin: false,
   raf: null,
 };
 
@@ -2927,7 +2935,18 @@ const embedMap = {
   // turn about from the first frame; before that there never was until you
   // clicked, and the tick did nothing.
   orbit: true,
-  spin: true,
+  // Off by default, and the reason is the reverse of `orbit`'s: turning is worth
+  // defaulting on because it costs nothing to look at, where *moving* is a thing
+  // you have to wait out before you can read a label or aim at a point. It shows
+  // depth the flat projection cannot, so it stays one click (or double-click)
+  // away — and outlives an open once asked for, like the two fields above.
+  spin: false,
+  // Whether the next frame would differ from the one on screen. With spin on by
+  // default the loop could repaint unconditionally and nobody noticed; still by
+  // default, that is a full-viewport redraw of the whole library, sixty times a
+  // second, to produce the same picture. See startEmbedLoop.
+  dirty: true,
+  painted: 0,
   raf: null,
   selected: null,
   // Multiplies the sprite size, 0.1 to 1. Not folded into `zoom`: zoom moves
@@ -2976,6 +2995,13 @@ const embedMap = {
   // three images reads as broken. It is anchored on `selected`, so it also does
   // nothing at all until something is picked.
   nearT: 1,
+  // The edit filter: a Set of tokens, or null for off — the same single-sentinel
+  // shape `scores` uses, so there is still no second boolean anywhere saying
+  // whether filtering is on. Tokens are effect names plus "any" (the image
+  // carries at least one effect node) and "none" (it carries none), and they are
+  // OR'd: this is a filter you widen by lighting more chips. Resets on every
+  // open, like the query — it is a thing you were looking for once.
+  edits: null,
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
@@ -2983,6 +3009,7 @@ const embedMap = {
 };
 
 const EMBED_HIT_PX = 14; // click tolerance for a point still drawn as a dot
+const EMBED_IDLE_MS = 200; // longest a still map may go without a repaint
 const EMBED_DRAG_PX = 4; // beyond this a pointerdown/up pair was a drag, not a click
 const EMBED_POLL_MS = 400;
 // A sprite's long edge, as a fraction of the unit cube the cloud is normalized
@@ -3151,6 +3178,13 @@ async function openEmbedMap() {
   // map reopened still hiding everything but one neighbourhood is a map with
   // most of the library missing and nothing on screen saying why.
   setNearSlider(1);
+  // Same argument again for the edit chips, which hide even more than Near can.
+  embedMap.edits = null;
+  // The two checkboxes are the other direction: their flags outlive the open, so
+  // the markup has to be told what they are. Without this the box and the flag
+  // are two sources of truth that agree only until you toggle one.
+  $("embed-orbit").checked = embedMap.orbit;
+  $("embed-spin").checked = embedMap.spin;
   $("embed-card").hidden = true;
   $("embed-status").textContent = "Preparing…";
   $("embed-modal").showModal();
@@ -3218,6 +3252,9 @@ function sizeEmbedCanvas() {
   // and pointer coordinates are scaled into them on the way in.
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
+  // Assigning width/height also clears the backing store, so a still map would
+  // otherwise sit on a blank canvas until something else happened to it.
+  markEmbedDirty();
 }
 
 // `center` says the coordinates the view is framed on have just changed — the
@@ -3239,6 +3276,10 @@ async function loadEmbedMap(center = false) {
     if (!embedMap.clusterCount && data.clusters.length) {
       setClusterSlider(data.clusters.length);
     }
+    // Built from the points, so only kinds of edit the library actually holds
+    // get a chip. Before the pick below, which re-runs the filter the chips are
+    // read by.
+    renderEditChips();
     // The pick survives a re-fetch by image id, never by identity: these are
     // fresh objects, so the old one is no longer in `points` and the draw
     // loop's `p === embedMap.selected` would never match again. On open there
@@ -3255,10 +3296,12 @@ async function loadEmbedMap(center = false) {
     // keyed by image_id, which re-projecting the same library cannot change.
     pickEmbedPoint(embedMap.points.find((p) => p.image_id === keepId) || null);
     if (center) centerOnSelection();
+    markEmbedDirty();
     startEmbedLoop();
   } catch (err) {
     if (seq !== embedMap.seq || !embedMap.open) return;
     embedMap.points = [];
+    markEmbedDirty();
     $("embed-status").textContent = `Could not build the map: ${err.message}`;
   }
 }
@@ -3267,7 +3310,7 @@ async function loadEmbedMap(center = false) {
 // places that restore it, so the legend cannot drift between them.
 function embedIdleStatus() {
   return embedMap.points.length
-    ? `${embedMap.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to pause`
+    ? `${embedMap.points.length} images · drag to rotate · scroll to zoom · right-drag to pan · click a point · double-click to spin`
     : "No images yet.";
 }
 
@@ -3325,21 +3368,107 @@ function textJobText(job) {
   return "Loading the text model…";
 }
 
+// ---------- The edit filter (which kinds of edit an image carries) ----------
+
+// The two non-effect tokens. "any" and "none" are not effect names and never
+// collide with one, since every effect name is a key of the registry.
+const EDIT_CHIP_LABELS = { any: "Edited", none: "Untouched" };
+const EDIT_PHRASES = { any: "an edit", none: "no edits" };
+
+const editChipLabel = (token) => EDIT_CHIP_LABELS[token] || effectLabel(token);
+const editPhrase = (token) => EDIT_PHRASES[token] || effectLabel(token);
+
+// Build the chip row from the *library*, not from the effect registry: a chip
+// for an effect nothing has ever been run through is a filter whose only
+// possible answer is "nothing". Their order is the registry's, so the chips sit
+// in the order the app's own effect buttons do, and each carries its count —
+// which is most of what the row is for, since it says what there is to find
+// before you press anything.
+function renderEditChips() {
+  const row = $("embed-edit-row");
+  row.textContent = "";
+  const counts = new Map();
+  let edited = 0;
+  for (const p of embedMap.points) {
+    if (p.effects && p.effects.length) edited++;
+    for (const name of p.effects || []) counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  const chips = [];
+  // Both or neither: with nothing edited these say the same thing as each other,
+  // and with nothing untouched "Edited" is the whole library.
+  if (edited && edited < embedMap.points.length) {
+    chips.push(["any", edited], ["none", embedMap.points.length - edited]);
+  }
+  for (const spec of state.effects) {
+    if (counts.has(spec.name)) chips.push([spec.name, counts.get(spec.name)]);
+  }
+  row.hidden = !chips.length;
+  for (const [token, count] of chips) {
+    const btn = document.createElement("button");
+    // Explicitly not a submit button: this row lives inside a <dialog>, where
+    // the default type would close the map on the first chip pressed.
+    btn.type = "button";
+    btn.className = "embed-chip";
+    btn.classList.toggle("on", !!embedMap.edits && embedMap.edits.has(token));
+    btn.textContent = `${editChipLabel(token)} ${count}`;
+    btn.onclick = () => toggleEditToken(token);
+    row.append(btn);
+  }
+}
+
+function toggleEditToken(token) {
+  const set = new Set(embedMap.edits || []);
+  if (!set.delete(token)) set.add(token);
+  // Empty is off, not "an empty union matches nothing" — the alternative is a
+  // map that goes blank when you press the last lit chip a second time.
+  embedMap.edits = set.size ? set : null;
+  renderEditChips();
+  applyEmbedFilter();
+}
+
+// Whether anything is hiding points at all — the question the cluster pills and
+// the status line both used to ask as `embedMap.scores`, which was the same
+// question only while the search was the only filter that could empty a group.
+// Near's radius is not consulted here: it does nothing without a pick, which is
+// exactly the condition below.
+function embedFiltering() {
+  return !!(
+    embedMap.scores ||
+    embedMap.edits ||
+    (embedMap.selected && embedNearRadius(embedMap.nearT) !== Infinity)
+  );
+}
+
+// Whether one image answers the lit chips. OR, not AND: the chips are how you
+// widen a filter, and asking for the images carrying *both* bokeh and a dither
+// is a question about one recipe rather than about a library.
+function matchesEdits(p) {
+  const edited = !!(p.effects && p.effects.length);
+  for (const token of embedMap.edits) {
+    const hit =
+      token === "any" ? edited : token === "none" ? !edited : edited && p.effects.includes(token);
+    if (hit) return true;
+  }
+  return false;
+}
+
 // Every filter the map has, resolved into per-point visibility — the one writer
 // of `p.hidden` and of the status line, so the two can neither drift nor
-// disagree about what is on screen. Purely local: the two sliders re-run this
-// and nothing else, so dragging Match or Near is instant the way Size is, where
-// a new query costs a request the way Groups does.
+// disagree about what is on screen. Purely local: the sliders and the chips
+// re-run this and nothing else, so they are instant the way Size is, where a new
+// query costs a request the way Groups does.
 //
-// The two filters compose, and are not symmetric. The search asks a question of
-// each image on its own; Near asks one *about the pick*, so it is applied
-// second, over the survivors, and turns itself off when there is no pick to
-// measure from.
+// The three filters compose, and are not symmetric. The search and the edit
+// chips each ask a question of an image on its own, so they resolve together in
+// one pass; Near asks one *about the pick*, so it is applied second, over the
+// survivors, and turns itself off when there is no pick to measure from.
 function applyEmbedFilter() {
   $("embed-match-row").hidden = !embedMap.scores;
   for (const p of embedMap.points) {
     const entry = embedMap.scores && embedMap.scores[p.image_id];
-    p.hidden = !!embedMap.scores && (!entry || entry.z < embedMap.matchZ);
+    p.hidden =
+      (!!embedMap.scores && (!entry || entry.z < embedMap.matchZ)) ||
+      (!!embedMap.edits && !matchesEdits(p));
   }
   // A pick that just went invisible would otherwise leave the card floating
   // over a point nobody can see, with Open still wired to it. It has to happen
@@ -3361,18 +3490,37 @@ function applyEmbedFilter() {
         Math.hypot(p.x - anchor.x, p.y - anchor.y, p.z - anchor.z) > radius;
     }
   }
+  markEmbedDirty();
 
-  if (!embedMap.scores && !near) {
+  if (!embedMap.scores && !embedMap.edits && !near) {
     $("embed-status").textContent = embedIdleStatus();
     return;
   }
   let kept = 0;
   for (const p of embedMap.points) if (!p.hidden) kept++;
-  const of = `${kept} of ${embedMap.points.length}`;
-  $("embed-status").textContent = embedMap.scores
-    ? `${of} match “${embedMap.query}”${near ? ` and are near ${anchor.name}` : ""} · ` +
-      `drag Match to widen · clear the box to show all`
-    : `${of} are near ${anchor.name} · drag Near to widen · pick another image to move the circle`;
+  // One clause per active filter rather than a ternary over the combinations:
+  // with two filters that was two branches, with three it is seven, and the
+  // branch for "edits, no query, no pick" is one that reads `anchor.name` off a
+  // null pick. The trailing hint is by precedence instead — whichever filter is
+  // hardest to notice you left on is the one worth telling you how to clear.
+  const clauses = [];
+  if (embedMap.scores) clauses.push(`match “${embedMap.query}”`);
+  if (embedMap.edits) clauses.push(`have ${[...embedMap.edits].map(editPhrase).join(" or ")}`);
+  if (near) clauses.push(`are near ${anchor.name}`);
+  const hint = embedMap.scores
+    ? "drag Match to widen · clear the box to show all"
+    : embedMap.edits
+      ? "press a lit chip to clear it"
+      : "drag Near to widen · pick another image to move the circle";
+  // Two clauses read "a and b", three "a, b and c" — the second spelling is only
+  // reachable now that there are three filters, and "a and b and c" was the
+  // sentence that made it obvious a list had grown out of a ternary.
+  const list =
+    clauses.length > 2
+      ? `${clauses.slice(0, -1).join(", ")} and ${clauses[clauses.length - 1]}`
+      : clauses.join(" and ");
+  $("embed-status").textContent =
+    `${kept} of ${embedMap.points.length} ${list} · ${hint}`;
 }
 
 function clearEmbedSearch() {
@@ -3399,11 +3547,42 @@ function closeEmbedMap() {
   $("embed-modal").close();
 }
 
+// Anything that changes what the next frame should look like says so here. Its
+// callers are every gesture, every filter, and the sprite loads that arrive
+// after the frame that asked for them.
+function markEmbedDirty() {
+  embedMap.dirty = true;
+}
+
+// The single write path for the spin, because there are two ways to ask for it —
+// the checkbox and the canvas's double-click — and a flag written by one of them
+// leaves the other showing the opposite of what is happening.
+function setEmbedSpin(on) {
+  embedMap.spin = on;
+  $("embed-spin").checked = on;
+  markEmbedDirty();
+}
+
+// The loop still runs whenever the map is open, but only *paints* when the
+// picture would differ. With the spin on by default that distinction cost
+// nothing to skip; still by default, painting anyway means compositing the whole
+// library sixty times a second to produce the frame already on screen.
+//
+// EMBED_IDLE_MS is the safety net, not the mechanism: a dirty flag's failure
+// mode is a frozen canvas the moment one mutation forgets to mark itself, and a
+// frame that can be at most a fifth of a second stale is a far better worst case
+// than a map that stops responding. It is also what covers the one input nothing
+// can mark — an image the browser decoded between frames.
 function startEmbedLoop() {
   if (embedMap.raf) return;
   const tick = () => {
     if (embedMap.spin) embedMap.yaw += 0.003;
-    drawEmbedMap();
+    const now = performance.now();
+    if (embedMap.spin || embedMap.dirty || now - embedMap.painted > EMBED_IDLE_MS) {
+      embedMap.dirty = false;
+      embedMap.painted = now;
+      drawEmbedMap();
+    }
     embedMap.raf = requestAnimationFrame(tick);
   };
   embedMap.raf = requestAnimationFrame(tick);
@@ -3459,8 +3638,13 @@ function embedSprite(point) {
     entry = { canvas: null };
     embedMap.sprites.set(url, entry);
     const img = new Image();
-    // no redraw on load: the rAF loop is running for as long as the map is open
-    img.onload = () => (entry.canvas = bakeEmbedSprite(img));
+    // The one input no gesture can mark: the frame that asked for this sprite
+    // has long since been painted, so the loop has to be told there is more to
+    // draw. (Covered by EMBED_IDLE_MS either way — this only saves the wait.)
+    img.onload = () => {
+      entry.canvas = bakeEmbedSprite(img);
+      markEmbedDirty();
+    };
     img.src = url;
   }
   return entry.canvas;
@@ -3634,11 +3818,11 @@ function drawEmbedLabels(ctx, project, dpr, fade) {
   const padY = 5 * dpr;
   const lineHeight = font + padY * 2;
 
-  // While a search is on, count what each group still has showing. The groups
-  // themselves are deliberately not refetched — they describe the library, and
-  // recomputing k-means per keystroke would make the labels dance — but a bare
-  // count beside a filtered cloud claims pictures that are not there.
-  const shown = embedMap.scores
+  // While anything is filtering, count what each group still has showing. The
+  // groups themselves are deliberately not refetched — they describe the
+  // library, and recomputing k-means per keystroke would make the labels dance —
+  // but a bare count beside a filtered cloud claims pictures that are not there.
+  const shown = embedFiltering()
     ? embedMap.points.reduce((counts, p) => {
         if (!p.hidden && p.cluster != null) counts[p.cluster] = (counts[p.cluster] || 0) + 1;
         return counts;
@@ -3745,6 +3929,7 @@ function embedPointAt(x, y) {
 
 function selectEmbedPoint(point) {
   embedMap.selected = point;
+  markEmbedDirty(); // the pick is drawn: its ring, and the card's leader line
   const card = $("embed-card");
   if (!point) {
     card.hidden = true;
@@ -3757,7 +3942,8 @@ function selectEmbedPoint(point) {
   $("embed-card-name").title = point.name;
   card.hidden = false;
   // Picking moves the rotation centre at once rather than waiting for a drag,
-  // so the auto-spin starts orbiting the new pick too. Nothing on screen moves.
+  // so a spin already running starts orbiting the new pick too. Nothing on
+  // screen moves.
   if (embedMap.orbit) pivotOnSelection();
 }
 
@@ -3787,6 +3973,7 @@ function initEmbedMap() {
     }
     lastX = downX = e.clientX;
     lastY = downY = e.clientY;
+    markEmbedDirty();
   });
   // or the menu would land in the middle of a right-drag
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -3806,6 +3993,7 @@ function initEmbedMap() {
     }
     lastX = e.clientX;
     lastY = e.clientY;
+    markEmbedDirty();
   });
   window.addEventListener("mouseup", (e) => {
     if (!dragging) return;
@@ -3824,7 +4012,7 @@ function initEmbedMap() {
       embedPointAt((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr)
     );
   });
-  canvas.addEventListener("dblclick", () => (embedMap.spin = !embedMap.spin));
+  canvas.addEventListener("dblclick", () => setEmbedSpin(!embedMap.spin));
   // The preview panel's initZoom() arithmetic, in backing-store pixels against
   // the canvas centre: keep whatever is under the cursor under the cursor.
   canvas.addEventListener(
@@ -3841,14 +4029,16 @@ function initEmbedMap() {
       embedMap.panY = cy - (cy - embedMap.panY) * k;
       embedMap.zoom = next;
       if (next === 1) resetEmbedView(); // scrolling back out reframes the cloud
+      markEmbedDirty();
     },
     { passive: false }
   );
 
-  // No redraw to schedule: the rAF loop is already drawing every frame, so the
-  // slider only has to move the number it reads.
+  // No redraw to schedule beyond saying one is due: the rAF loop is already
+  // running, so the slider only has to move the number it reads.
   $("embed-size").oninput = (e) => {
     embedMap.spriteScale = Number(e.target.value);
+    markEmbedDirty();
   };
   // Unlike Size, this one costs a request — a different k is a different
   // k-means fit — so the readout tracks the drag while the fetch waits for it
@@ -3892,11 +4082,13 @@ function initEmbedMap() {
   };
   // Costs nothing but the pivot, like Size and unlike Groups — and re-pivoting
   // on the tick is what makes the box read as an answer rather than a promise:
-  // the auto-spin swings onto the pick immediately, without moving it.
+  // a spin already running swings onto the pick immediately, without moving it.
   $("embed-orbit").onchange = (e) => {
     embedMap.orbit = e.target.checked;
     if (embedMap.orbit) pivotOnSelection();
+    markEmbedDirty();
   };
+  $("embed-spin").onchange = (e) => setEmbedSpin(e.target.checked);
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;
     // Keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint —

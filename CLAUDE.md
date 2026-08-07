@@ -207,7 +207,16 @@ one place silently breaks another.
   reuses, so an `<image_id>.npy` would outlive its image and be read back as its
   successor's position in the cloud. It embeds the *thumbnail*, so re-framing
   invalidates it (`db.clear_embedding` in the crop PUT) and nothing else does.
-  The projection is library-wide, so it is deliberately never cached.
+- **The projection is library-wide, so it cannot be a column — it is the
+  `projections` table, one row per method, keyed by a hash of every vector that
+  went into the fit** (`main._projected`). The key *is* the input, which is what
+  buys the cache no invalidation logic at all: an image added, deleted or
+  re-framed moves some byte of it, and there is nothing anywhere to remember to
+  call. Two things ride in the hash beside the vectors — the image ids, and a
+  `_PROJECTION_VERSION` to bump when `_project`'s arithmetic changes, since
+  nothing migrates a cached fit any more than it migrates a node's params.
+  Clustering stays uncached: it is tens of milliseconds, and it depends on
+  `clusters`, which is a slider.
 - **Cluster labels and search both need the *joint* 512-d space, which
   `embed.py` does not promise.** `server/label_vectors.npz` and
   `text_embed.encode_query` alike are only comparable to an `image_embeds`
@@ -243,7 +252,11 @@ one place silently breaks another.
   needs it — opening the map, typing a query, lighting the Bokeh button — so
   nobody pays for a model they never use.
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
-  ALTER TABLE). User databases contain real work; never require a wipe.
+  ALTER TABLE) — a new *column* only, since that is the one thing `SCHEMA`'s
+  `CREATE TABLE IF NOT EXISTS` cannot add to a table that already exists. A new
+  table or index just goes in `SCHEMA` and needs no such dance, which is how
+  `projections` and `nodes_image` arrive. User databases contain real work;
+  never require a wipe.
 
 ### Frontend
 
@@ -311,8 +324,20 @@ one place silently breaks another.
   what makes that loop terminate.
 - **A `requestAnimationFrame` loop ends itself**; it does not trust callers to
   stop it. The RGB cluster plot's `tick` returns when `#cluster-modal` is closed,
-  so "it only spins while you are looking at it" holds however the dialog was
+  so "it only runs while you are looking at it" holds however the dialog was
   dismissed — a `close` listener alone would be one forgotten path from a leak.
+- **Neither 3D view spins by default, and the map's loop therefore only paints
+  when the picture would differ.** Repainting regardless was free to overlook
+  while something was always moving; still by default it is the whole library
+  composited sixty times a second to reproduce the frame already on screen. Every
+  gesture, filter and sprite load calls `markEmbedDirty()` — and `EMBED_IDLE_MS`
+  bounds how stale a frame can get, because a dirty flag's failure mode is a
+  *frozen* canvas the first time one mutation forgets to mark itself, which is a
+  far worse thing to ship than a fifth of a second of lag. `setEmbedSpin()` is
+  the single write path, since two controls ask for the spin (the checkbox and
+  the canvas's double-click) and a flag written by one leaves the other lying.
+  `openEmbedMap()` pushes both checkboxes from their flags for the same reason:
+  `orbit` and `spin` outlive an open, so the markup cannot be a second truth.
 - **The Image map's search filter is display-only, and `embedMap.scores === null`
   is the off state.** Nothing is re-fitted on the survivors: matches keep the
   coordinates they already had, so the cloud you learned stays put. `p.hidden` is
@@ -322,15 +347,25 @@ one place silently breaks another.
   Scores are keyed by `image_id`, which is what lets a filter survive a
   re-projection; the threshold is applied locally, so dragging Match costs a
   redraw where typing a query costs a request.
-- **Both of the map's filters are resolved in `applyEmbedFilter()`, the one
-  writer of `p.hidden` and of the status line.** Match asks its question of each
-  image alone; Near asks one *about the pick* — a radius in the projected cube,
-  exponential in the slider with the ends clipped to 0 and Infinity — so it runs
-  second, over Match's survivors, and turns itself off when there is no pick.
-  That order is why the pick is dropped *between* the passes rather than after
-  them, and why `clearEmbedSearch()` delegates here instead of clearing
-  `hidden` itself: ending a query must not reveal what the other filter says is
-  out.
+- **All three of the map's filters are resolved in `applyEmbedFilter()`, the one
+  writer of `p.hidden` and of the status line.** Match and the edit chips each
+  ask their question of an image alone, so they resolve together in one pass;
+  Near asks one *about the pick* — a radius in the projected cube, exponential in
+  the slider with the ends clipped to 0 and Infinity — so it runs second, over
+  their survivors, and turns itself off when there is no pick. That order is why
+  the pick is dropped *between* the passes rather than after them, and why
+  `clearEmbedSearch()` delegates here instead of clearing `hidden` itself: ending
+  a query must not reveal what the other filters say is out. Anything else asking
+  "is the cloud filtered" asks `embedFiltering()`, never `embedMap.scores` — the
+  two were the same question only while search was the only filter, and the
+  cluster pills' counts were the thing that quietly stopped being true.
+- **The edit filter's tokens are effect names plus `any`/`none`, OR'd, and its
+  chips are built from the library rather than the registry** (`renderEditChips`,
+  fed by `list_images`' `effects` aggregate). A chip for an effect nothing has
+  been run through can only ever answer "nothing", so the row lists what there is
+  to find and says how much of it there is. OR because the chips are how you
+  *widen*; the empty set is `null`, so pressing the last lit chip again turns the
+  filter off rather than emptying the map.
 - **The map opens on the image you are working on** (`state.imageId`), picked
   and centred by `centerOnSelection()` — which is `pivotOnSelection()`'s
   opposite, and needs no drawn frame behind it. That is what makes Orbit worth

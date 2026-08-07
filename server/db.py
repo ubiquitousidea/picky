@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS masks (
   created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS masks_image_name ON masks(image_id, name);
+CREATE TABLE IF NOT EXISTS projections (
+  method TEXT PRIMARY KEY,   -- one row per method: a new fit replaces the old
+  fingerprint TEXT NOT NULL, -- hash of the vectors the fit was over
+  coords BLOB NOT NULL,      -- float32 (n, 3), C-order, in list_images() order
+  created_at TEXT NOT NULL
+);
+-- Every per-image question about the work tree is a scan without this: both of
+-- `list_images`' correlated subqueries, `image_node_ids`, `get_tree`. At 1426
+-- images over 1891 nodes it takes that list from 90 ms to 2 ms.
+CREATE INDEX IF NOT EXISTS nodes_image ON nodes(image_id);
 """
 
 
@@ -119,6 +129,12 @@ def image_dict(row: sqlite3.Row) -> dict:
     """
     d = dict(row)
     d["crop"] = json.loads(d["crop"]) if d.get("crop") else None
+    # Only when the query actually asked for it. An absent key and an empty list
+    # are different answers — "nobody looked" against "this image is untouched" —
+    # and defaulting to the second would let `get_image`, which does not select
+    # the column, claim every image has no edits.
+    if "effects" in d:
+        d["effects"] = d["effects"].split(",") if d["effects"] else []
     return d
 
 
@@ -174,11 +190,22 @@ def create_image(name: str) -> tuple[dict, bool]:
 
 
 def list_images() -> list[dict]:
+    """Every image, with its root node and the kinds of edit it carries.
+
+    `effects` is the *set* of effect names anywhere in the image's work tree, in
+    no particular order — what the Image map's edit filter asks its question of,
+    and cheap enough here (one indexed subquery) that it need not be a second
+    endpoint the map would have to keep in step with this one. Every image's root
+    node has `effect IS NULL` (see `create_image`), so the list is empty exactly
+    when nothing has been done to the image.
+    """
     with connect() as conn:
         rows = conn.execute(
             """SELECT i.id, i.name, i.created_at, i.crop,
                       (SELECT id FROM nodes n WHERE n.image_id = i.id
-                       AND n.parent_id IS NULL) AS root_node_id
+                       AND n.parent_id IS NULL) AS root_node_id,
+                      (SELECT group_concat(DISTINCT n.effect) FROM nodes n
+                       WHERE n.image_id = i.id AND n.effect IS NOT NULL) AS effects
                FROM images i ORDER BY i.created_at DESC"""
         ).fetchall()
     return [image_dict(r) for r in rows]
@@ -245,6 +272,35 @@ def clear_embedding(image_id: int) -> None:
     with connect() as conn:
         conn.execute(
             "UPDATE images SET embedding = NULL WHERE id = ?", (image_id,)
+        )
+
+
+# ---------- The fitted projection (see main._projected) ----------
+#
+# Unlike an embedding, a point's coordinates are not a property of its own image
+# — the fit is over the whole library — so this cannot be a column on the image
+# row. It is one row per method holding the whole `(n, 3)` result, with a
+# fingerprint of the vectors that produced it standing in for a cache key. That
+# is the entire invalidation story: the caller compares fingerprints and refits
+# on a mismatch, so nothing here has to know what stales a projection.
+
+
+def get_projection(method: str) -> sqlite3.Row | None:
+    with connect() as conn:
+        return conn.execute(
+            "SELECT fingerprint, coords FROM projections WHERE method = ?", (method,)
+        ).fetchone()
+
+
+def set_projection(method: str, fingerprint: str, coords: bytes) -> None:
+    """Replace this method's cached fit. REPLACE rather than INSERT because the
+    table is a cache of fixed size: two methods, two rows, whatever happens to
+    the library."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO projections (method, fingerprint, coords, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (method, fingerprint, coords, _now()),
         )
 
 

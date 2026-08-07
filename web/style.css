@@ -786,7 +786,8 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-search::placeholder { color: var(--muted); }
 /* The sprite size slider, sitting with the other header chips. Green like the
    map's own heading, where a param slider would be orange. */
-#embed-size-row, #embed-cluster-row, #embed-match-row, #embed-near-row, #embed-orbit-row {
+#embed-size-row, #embed-cluster-row, #embed-match-row, #embed-near-row,
+#embed-orbit-row, #embed-spin-row {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -800,9 +801,37 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-clusters { width: 5rem; accent-color: var(--rb-green); }
 #embed-match { width: 5rem; accent-color: var(--rb-green); }
 #embed-near { width: 5rem; accent-color: var(--rb-green); }
-/* the one checkbox in the map; green like the sliders it sits beside */
-#embed-orbit-row { cursor: pointer; }
-#embed-orbit { accent-color: var(--rb-green); margin: 0; cursor: pointer; }
+/* the map's two checkboxes; green like the sliders they sit beside */
+#embed-orbit-row, #embed-spin-row { cursor: pointer; }
+#embed-orbit, #embed-spin { accent-color: var(--rb-green); margin: 0; cursor: pointer; }
+/* The edit filter's chips. `flex-basis: 100%` is what gives them their own line
+   in the wrapping header rather than making them the things that wrap off the
+   end of a row already carrying a title, a search box, four sliders, two
+   checkboxes, a picker and Close. */
+#embed-edit-row {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+#embed-edit-row[hidden] { display: none; } /* the id rule above beats UA [hidden] */
+.embed-chip {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.7rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+.embed-chip:hover { color: var(--text); }
+/* Lit, in the map's green — the same "this is on" the sliders' accent means */
+.embed-chip.on {
+  background: color-mix(in srgb, var(--rb-green) 25%, var(--panel-2));
+  border-color: var(--rb-green);
+  color: var(--text);
+}
 /* Fixed width and tabular digits: the readout sits left of the method picker,
    and letting 2 -> 20 shove it along makes the whole header twitch on a drag. */
 #embed-cluster-count {

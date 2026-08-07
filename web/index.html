@@ -99,7 +99,7 @@
   <dialog id="cluster-modal">
     <h2>RGB clusters</h2>
     <canvas id="cluster-canvas" width="268" height="268"></canvas>
-    <div class="hint">drag to rotate · double-click to pause spin</div>
+    <div class="hint">drag to rotate · double-click to spin</div>
     <div class="modal-actions">
       <button id="cluster-close-btn">Close</button>
     </div>
@@ -133,11 +133,19 @@
         <input id="embed-orbit" type="checkbox" checked>
         Orbit pick
       </label>
+      <label id="embed-spin-row" title="Turn the cloud on its own, so its depth reads without dragging. Double-clicking the cloud does the same.">
+        <input id="embed-spin" type="checkbox">
+        Spin
+      </label>
       <select id="embed-method" title="How the 512-d embedding is flattened to 3 dimensions">
         <option value="pca">PCA</option>
         <option value="tsne" selected>t-SNE</option>
       </select>
       <button id="embed-close-btn">Close</button>
+      <!-- Filled from the library on every load, so it lists only kinds of edit
+           something actually carries. Its own line in the wrapping header: the
+           chips are a set to read across, not one more control to squeeze in. -->
+      <div id="embed-edit-row" hidden title="Show only the images carrying a given kind of edit"></div>
     </div>
     <div id="embed-stage">
       <canvas id="embed-canvas"></canvas>

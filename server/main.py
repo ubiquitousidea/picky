@@ -1,5 +1,6 @@
 """Picky — browser-based JPG effects app."""
 
+import hashlib
 import io
 import sqlite3
 from pathlib import Path
@@ -188,7 +189,10 @@ def _project(vectors, method: str):
     nothing, which is what PCA is still here for — that one is *stable* (adding
     an image nudges the map instead of reshuffling it) and its axes are real
     directions of variation. Within one library t-SNE is stable too, since the
-    fit below is seeded, so reopening the map does not reshuffle it.
+    fit below is seeded — and exactly stable rather than nearly, because
+    `_projected` hands back the same coordinates rather than reproducing them:
+    sklearn's Barnes-Hut t-SNE is threaded, so a seed alone never quite promised
+    the same bits twice.
 
     Both are guarded for tiny libraries, where the defaults raise: PCA cannot
     ask for more components than it has samples, and t-SNE's perplexity must be
@@ -231,6 +235,54 @@ def _project(vectors, method: str):
     # origin, hence the guard.
     extent = float(np.abs(coords).max())
     return coords / extent if extent > 0 else coords
+
+
+# Bumped when `_project`'s arithmetic changes, so a fit cached by the old code is
+# never served as the new code's answer. The same rule an effect's params follow:
+# nothing migrates, so what could go stale has to ride in the key.
+_PROJECTION_VERSION = 1
+
+
+def _projected(stacked, image_ids, method: str):
+    """`_project`, remembered across requests — the Image map's whole open cost.
+
+    The fit is the expensive part and by far: over a library of ~1400 it is a
+    couple of seconds of t-SNE against ~30 ms of k-means and ~3 ms of the hashing
+    below. It is also *seeded*, so every one of those recomputations was
+    reproducing the answer it had already found.
+
+    **The cache key is the input, not a description of the input.** A fingerprint
+    over the exact vectors that would be fitted — plus the ids they belong to and
+    the version above — is what makes this correct with no invalidation logic
+    anywhere: every way a projection could change moves some byte of that input.
+    An image added or deleted changes the id list; a re-framed one changes its
+    vector, because the crop PUT clears the embedding and `_collect_embeddings`
+    recomputes it. There is deliberately nothing here to remember to call, which
+    is the property a cache keyed on "library state" would not have.
+
+    Two concurrent misses both fit and both write, and that is fine rather than
+    guarded: these are sync endpoints sharing a threadpool, and a seeded fit over
+    identical input writes identical bytes. The worst case is doing the work
+    twice, never disagreeing about the answer.
+    """
+    key = hashlib.blake2b(digest_size=16)
+    key.update(f"{_PROJECTION_VERSION}:{method}:".encode())
+    key.update(np.asarray(image_ids, dtype=np.int64).tobytes())
+    key.update(stacked.tobytes())
+    fingerprint = key.hexdigest()
+
+    row = db.get_projection(method)
+    if row and row["fingerprint"] == fingerprint:
+        coords = np.frombuffer(row["coords"], dtype=np.float32).reshape(-1, 3)
+        # The fingerprint already implies the count, so this only fires on a
+        # truncated blob — where the alternative is a `zip()` that silently drops
+        # the tail of the library and looks like a working map.
+        if len(coords) == len(stacked):
+            return coords
+
+    coords = np.ascontiguousarray(_project(stacked, method), dtype=np.float32)
+    db.set_projection(method, fingerprint, coords.tobytes())
+    return coords
 
 
 MAX_CLUSTERS = 20
@@ -292,6 +344,11 @@ def _collect_embeddings(images: list[dict]):
                 "node_id": image["root_node_id"],
                 "name": image["name"],
                 "color": rendering.mean_color(image["root_node_id"]),
+                # What kinds of edit this image carries, for the map's edit
+                # filter. It rides on the point rather than being a second
+                # request the frontend would have to keep in step, and it is
+                # free here: `list_images` already selected it.
+                "effects": image["effects"],
             }
         )
     return vectors, points
@@ -323,10 +380,13 @@ def embedding_map(method: str = "tsne", clusters: int = 0):
 
     Library-scoped, unlike every other endpoint here, and necessarily so: the
     projection is fitted across the whole library, so no point's coordinates are
-    a property of its own image. That is why only the 512-d vectors are cached
-    (on the image row) and the projection is redone per request — it is a
-    sub-second fit over ~100 points, against embeddings that are the expensive
-    part and are computed once.
+    a property of its own image. That is why the 512-d vectors are cached on the
+    image row and the *fit* is cached apart from them, in its own table, keyed by
+    a fingerprint of every vector that went into it — see `_projected`, which is
+    also where the argument for that key lives. The two caches answer different
+    questions: one is "what is this photo", which survives everything but a
+    re-frame, and the other is "where does it sit among the others", which
+    survives nothing but an unchanged library.
 
     Any vector this finds missing it computes on the spot, so the map is correct
     regardless of whether anyone called `prepare` first. That is deliberately
@@ -338,10 +398,12 @@ def embedding_map(method: str = "tsne", clusters: int = 0):
     so the control can be initialized from the answer rather than duplicating the
     formula.
 
-    Clustering and labelling are recomputed per request alongside the projection
-    and deliberately not cached. Both are milliseconds at this scale (k-means
-    over ~100x512, then one ~850x512 matrix product), and a cache keyed on
-    library state would be a second thing that can disagree with the map.
+    Clustering and labelling stay recomputed per request, and deliberately so
+    even now that the projection is not: both are tens of milliseconds over a
+    library of ~1400 (k-means over n×512, then one ~850×512 matrix product),
+    which is not worth a second cache — and unlike the fit they also depend on
+    `clusters`, so the row would have to be keyed by a slider position the user
+    drags.
     """
     if method not in EMBED_METHODS:
         raise HTTPException(400, f"unknown method {method!r}")
@@ -353,7 +415,7 @@ def embedding_map(method: str = "tsne", clusters: int = 0):
         return {"method": method, "points": [], "clusters": []}
 
     stacked, points = _library_vectors(images)
-    coords = _project(stacked, method)
+    coords = _projected(stacked, [p["image_id"] for p in points], method)
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
 
