@@ -1,5 +1,6 @@
 """Effect implementations. Each operates on an RGB uint8 numpy array."""
 
+import functools
 import math
 
 import numpy as np
@@ -144,10 +145,11 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 SHOW_MODES = ["bokeh", "depth", "kernels"]
 
-# The kernel chart's grid, in columns across the long side; the short side gets
-# however many rows keep the cells square. Enough to read the shape's drift from
-# centre to corner, few enough that the discs are drawn at true size without the
-# frame becoming solid overlap at a large `amount`.
+# Where the kernel chart's `density` slider starts, in columns across the long
+# side; the short side gets however many rows keep the cells square. Enough to
+# read the shape's drift from centre to corner without the lattice itself
+# becoming the thing you look at — the density that answers "what is this blur
+# doing", where the top of the range answers "what does it do *there*".
 _KERNEL_COLS = 9
 
 # Everything blurred is computed on a canvas no larger than this on the long
@@ -239,6 +241,71 @@ def _lens_runs(r: int, t: float, theta: float) -> tuple[np.ndarray, np.ndarray, 
     keep = hi >= lo
     dys, lo, hi = dys[keep], lo[keep], hi[keep]
     return dys, lo, hi, int((hi - lo + 1).sum())
+
+
+@functools.lru_cache(maxsize=48)
+def _aperture_stamp(r: int, t: float, theta: float, thickness: int) -> np.ndarray:
+    """The aperture's outline as a `(2r+1, 2r+1)` bool tile, centred.
+
+    The kernel chart's mark: the aperture `_lens_runs` gives, rasterized solid
+    and then hollowed out by its own erosion. It is not a circle this function
+    derives for itself, so the outline is by construction the exact footprint
+    the blur gets — the property the chart exists to have.
+
+    Erosion rather than the obvious "draw it again a few pixels smaller and
+    subtract", which is wrong in a way that only shows up on the elongated
+    apertures a high `swirl` produces. Two independently rasterized cat's eyes
+    differ by about one column along a steep flank however far apart their
+    radii are, so the difference there is a one-pixel run per row while the
+    boundary itself is climbing two or three columns per row — a dashed line,
+    right at the pointed tips that are the whole reason for looking. `filled &
+    ~erode(filled)` cannot do that: every boundary pixel of a set is in it, so
+    the outline is closed at any thickness, and `thickness` becomes an honest
+    perpendicular width instead of a horizontal one.
+
+    Cached because the cache is what makes a dense grid affordable — but only
+    where it can be exact. At `swirl = 0` the aspect is 1.0, `_lens_runs` puts
+    its two circles at d = 0, and the shape stops depending on `theta` at all;
+    the caller passes 0.0 for it there, so every cell sharing a radius shares
+    one stamp and the whole chart costs a handful of rasterizations. With swirl
+    on, each cell has its own angle and mostly misses — which is the right way
+    round. Rounding `theta` into buckets would buy that back by drawing a
+    kernel rotated a few degrees from the one the render uses, and a chart that
+    quietly disagrees with the render is the failure this whole view is built
+    to avoid.
+
+    `maxsize` is small because a tile is O(r^2) and `r` here is the
+    *full-resolution* radius: at the top of `amount` on a 40 MP frame one stamp
+    is most of a megabyte.
+
+    Returned tiles are shared, so callers must treat them as read-only.
+    """
+    size = 2 * r + 1
+    filled = np.zeros((size, size), dtype=bool)
+    dys, lo, hi, _ = _lens_runs(r, t, theta)
+    for dy, left, right in zip(dys, lo, hi):
+        filled[int(dy) + r, int(left) + r : int(right) + r + 1] = True
+    if r <= thickness:
+        # A ring as thick as the kernel is wide is not a ring. Below that the
+        # mark is the aperture solid, which is what the chart drew at every size
+        # before it had a density to worry about.
+        return filled
+
+    inner = filled
+    for _ in range(thickness):
+        # One 4-neighbour erosion step. The tile is exactly the shape's bounding
+        # box, so the shape touches all four borders and the world outside them
+        # is empty — hence the border rows and columns erode away rather than
+        # being left as they were by the shifts.
+        eroded = inner.copy()
+        eroded[1:, :] &= inner[:-1, :]
+        eroded[:-1, :] &= inner[1:, :]
+        eroded[:, 1:] &= inner[:, :-1]
+        eroded[:, :-1] &= inner[:, 1:]
+        eroded[0, :] = eroded[-1, :] = False
+        eroded[:, 0] = eroded[:, -1] = False
+        inner = eroded
+    return filled & ~inner
 
 
 def _swirl_aspect(rho: np.ndarray | float, swirl: float) -> np.ndarray | float:
@@ -395,48 +462,66 @@ def _kernel_chart(
     span: float,
     r_full: float,
     swirl: float,
+    density: int,
 ) -> np.ndarray:
-    """The apertures themselves, drawn at true size on a grid over the frame.
+    """The apertures themselves, outlined at true size on a grid over the frame.
 
     A diagram of what `show: "bokeh"` is doing, for aiming the other four
-    sliders: every disc is the actual footprint `_lens_runs` hands the blur, at
+    sliders: every ring is the actual footprint `_lens_runs` hands the blur, at
     the actual radius the depth under it earns, so its size reads `amount`,
     `focus` and `falloff` and its shape reads `swirl`. Nothing here recomputes
     that geometry — a chart that drew its own idea of the kernel could agree
     with the render today and drift from it silently, which is the one way a
     diagnostic view is worse than none.
 
+    `density` is what makes the chart answer a second question. At the default
+    9 columns the grid reads the blur across the whole frame; wound up, it puts
+    several samples on each side of a depth edge, which is the only way to see
+    whether the kernel steps across that edge or ramps over it and how wide the
+    ramp is. The mark had to stop being a filled disc for that to be possible:
+    a dense grid and a solid mark cannot coexist, since neighbours overlap
+    everywhere at a large `amount` and the frame goes to a white sheet. An
+    outline overlaps legibly at any density, still reads size and cat's-eye
+    shape at a glance, and is what makes the maximum composite below do what it
+    always claimed to.
+
     Drawn at the *full-resolution* radius rather than the working canvas's,
     because that is the blur you see in the output; `_BOKEH_WORK_R` is an
     internal economy, not something to explain to someone aiming a slider.
 
-    Two deliberate omissions. The discs are not dimmed by `_vignette`, though
-    the render's are: the corner kernels are the ones worth looking at, and
-    dimming them by the three stops the aperture actually costs would hide the
-    shape this view exists to show — their area already tells that story. And
-    they are composited with a maximum rather than a sum, so where a large
-    `amount` makes neighbours overlap the outlines stay legible instead of
-    saturating to a white sheet.
+    One deliberate omission: the rings are not dimmed by `_vignette`, though
+    the render's kernels are. The corner ones are exactly what is worth looking
+    at, and dimming them by the three stops the aperture actually costs would
+    hide the shape this view exists to show — their area already tells that
+    story.
     """
     h, w = img.shape[:2]
     cy, cx = h / 2.0, w / 2.0
     half_diagonal = np.hypot(cy, cx)
     dh, dw = d_small.shape[:2]
 
-    cols = _KERNEL_COLS if w >= h else max(3, round(_KERNEL_COLS * w / h))
-    rows = max(3, round(cols * h / w)) if w >= h else _KERNEL_COLS
+    cols = density if w >= h else max(3, round(density * w / h))
+    rows = max(3, round(cols * h / w)) if w >= h else density
     step_y, step_x = h / rows, w / cols
 
-    # The backdrop is the frame itself, dark enough that a white disc reads
-    # against a blown highlight but still legible as the photo — the discs mean
-    # much more when you can see which of them landed on the subject.
+    # Fixed to the frame, not to the kernel: a stroke proportional to `r` would
+    # weight the far ring heavier than the near one, which is the comparison
+    # being made. Scaled by the frame so it survives the preview's downscale.
+    thickness = max(1, round(max(h, w) / 800))
+
+    # The backdrop is the frame itself, dark enough that a white ring reads
+    # against a blown highlight but still legible as the photo — the kernels
+    # mean much more when you can see which of them landed on the subject.
     out = (img * 0.3).astype(np.uint8)
-    ink = np.zeros((h, w), dtype=np.uint8)
+    ink = np.zeros((h, w), dtype=bool)
 
     for row in range(rows):
         for col in range(cols):
             gy, gx = (row + 0.5) * step_y, (col + 0.5) * step_x
-            # nearest depth sample; the map is ~0.4 MP and this wants one number
+            # nearest depth sample; the map is ~0.4 MP and this wants one
+            # number. Deliberately not `depth.depth_at`'s median window: that
+            # exists to stop a *picked* focus landing on an edge value, and
+            # here the edge is the thing being looked at.
             dy_i = min(dh - 1, max(0, int(gy / h * dh)))
             dx_i = min(dw - 1, max(0, int(gx / w * dw)))
             pixel_t = abs(float(d_small[dy_i, dx_i]) - focus) / span
@@ -444,25 +529,30 @@ def _kernel_chart(
             gy_i, gx_i = int(gy), int(gx)
 
             if r < 1:
-                # In focus: no disc to draw, and an empty cell would read as a
-                # bug rather than as the focal plane. A dot marks the sample.
-                ink[max(0, gy_i - 1) : gy_i + 2, max(0, gx_i - 1) : gx_i + 2] = 255
+                # In focus: no aperture to draw, and an empty cell would read as
+                # a bug rather than as the focal plane. A dot marks the sample,
+                # sized off the same stroke as the rings so the focal plane does
+                # not simply vanish on a large frame.
+                k = thickness
+                ink[max(0, gy_i - k) : gy_i + k + 1, max(0, gx_i - k) : gx_i + k + 1] = True
                 continue
 
             rho = np.hypot(gy - cy, gx - cx) / half_diagonal
-            dys, lo, hi, _ = _lens_runs(
-                r, _swirl_aspect(rho, swirl), np.arctan2(gy - cy, gx - cx)
-            )
-            for dy, left, right in zip(dys, lo, hi):
-                y = gy_i + int(dy)
-                if 0 <= y < h:
-                    x0 = min(max(gx_i + int(left), 0), w)
-                    x1 = min(max(gx_i + int(right) + 1, 0), w)
-                    if x1 > x0:
-                        ink[y, x0:x1] = 255
+            aspect = _swirl_aspect(rho, swirl)
+            # Exactly round: `_lens_runs` puts both circles at one point, so the
+            # angle cannot matter. Passing 0.0 rather than the cell's own angle
+            # is what collapses a whole swirl-free chart onto one stamp per
+            # radius — a cache hit, not an approximation.
+            theta = 0.0 if aspect >= 1.0 else float(np.arctan2(gy - cy, gx - cx))
+            stamp = _aperture_stamp(r, float(aspect), theta, min(thickness, max(1, r // 3)))
 
-    mask = ink > 0
-    out[mask] = (out[mask] * 0.25 + 0.75 * 255).astype(np.uint8)
+            top, left = gy_i - r, gx_i - r
+            y0, y1 = max(0, top), min(h, top + stamp.shape[0])
+            x0, x1 = max(0, left), min(w, left + stamp.shape[1])
+            if y1 > y0 and x1 > x0:
+                ink[y0:y1, x0:x1] |= stamp[y0 - top : y1 - top, x0 - left : x1 - left]
+
+    out[ink] = (out[ink] * 0.25 + 0.75 * 255).astype(np.uint8)
     return out
 
 
@@ -621,7 +711,8 @@ def bokeh(img: np.ndarray, params: dict) -> np.ndarray:
     if params["show"] == "kernels":
         # Before the working canvas is sized: the chart is about the blur you
         # get, and `scale` is only ever about how cheaply it is computed.
-        return _kernel_chart(img, d_small, focus, falloff, span, r_full, swirl)
+        density = int(params.get("density", _KERNEL_COLS))
+        return _kernel_chart(img, d_small, focus, falloff, span, r_full, swirl, density)
 
     scale = min(1.0, _BOKEH_WORK_PX / max(h, w), _BOKEH_WORK_R / max(r_full, 1e-6))
     ww, wh = max(1, round(w * scale)), max(1, round(h * scale))
@@ -898,6 +989,11 @@ EFFECTS = {
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
             {"name": "bloom", "label": "Highlight bloom", "type": "float", "min": 0.0, "max": 12.0, "step": 0.5, "default": 0.0},
             {"name": "swirl", "label": "Swirl (shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0},
+            # Read by the "kernels" view alone, and sitting next to `show` for
+            # that reason. The panel has no way to show a param conditionally,
+            # and a diagnostic knob is not worth growing a mode system in
+            # `buildParamControls` for.
+            {"name": "density", "label": "Kernel grid (columns)", "type": "int", "min": 3, "max": 32, "step": 1, "default": _KERNEL_COLS},
             {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
     },
