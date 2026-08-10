@@ -5,6 +5,7 @@ import io
 import sqlite3
 from pathlib import Path
 
+import anthropic
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -12,7 +13,17 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import db, depth, depth_job, embed_job, labels, rendering, text_embed, text_job
+from . import (
+    agent,
+    db,
+    depth,
+    depth_job,
+    embed_job,
+    labels,
+    rendering,
+    text_embed,
+    text_job,
+)
 from .effects import (
     EFFECTS,
     crop_geometry,
@@ -94,6 +105,15 @@ class CropUpdate(BaseModel):
 class CropPreviewRequest(BaseModel):
     node_id: int
     angle: float = 0.0
+
+
+class AgentRequest(BaseModel):
+    prompt: str
+    # the conversation so far, held by the browser and posted back — see agent_turn
+    history: list = []
+    # what the person is looking at; None when nothing is open yet
+    image_id: int | None = None
+    node_id: int | None = None
 
 
 def _image_response(image: dict) -> dict:
@@ -1260,6 +1280,56 @@ def apply_preset(node_id: int, body: PresetApply):
         raise HTTPException(500, f"applying preset failed: {exc}")
 
     return {"created": created, "terminal_node_id": created[-1]}
+
+
+# ---------- The command row ----------
+#
+# A sentence in, endpoint calls out. The loop lives in `agent.py`; what is here
+# is the two things a request needs — whether there is a key at all, and one POST
+# to play a turn. Every write the agent makes re-enters this file through the
+# same functions the browser posts to, so there is no second set of rules.
+
+
+@app.get("/api/agent")
+def agent_status():
+    """Whether the command row should exist.
+
+    Asked once by `init()`, which leaves the row hidden when this is false. A
+    key is either configured or it is not, so offering a box that can only ever
+    fail is worse than offering nothing.
+    """
+    return {"configured": agent.configured(), "model": agent.MODEL}
+
+
+@app.post("/api/agent")
+def agent_turn(body: AgentRequest):
+    """Play one turn of the conversation.
+
+    409 rather than 500 for a missing key, for `search_embedding_map`'s reason:
+    the state is wrong rather than the server unwell, and it is the caller's own
+    `.env` that fixes it.
+
+    `history` arrives from the browser and goes back updated — the Messages API
+    is stateless and this app has no sessions, so the client is the natural place
+    to hold a conversation. It is trimmed in `agent._trim` rather than trusted:
+    what comes back is whatever the last response handed out, but an unbounded
+    transcript is an unbounded bill either way.
+    """
+    prompt = body.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "say something first")
+    if not agent.configured():
+        raise HTTPException(409, "no ANTHROPIC_API_KEY is configured")
+    context = {"image_id": body.image_id, "node_id": body.node_id}
+    try:
+        return agent.run_turn(prompt, body.history, context)
+    except anthropic.APIStatusError as exc:
+        # Surface the API's own complaint — a bad key, a rate limit and an
+        # overload all need different things from the user, and "agent failed"
+        # tells them none of it.
+        raise HTTPException(502, f"Claude API error ({exc.status_code}): {exc.message}")
+    except anthropic.APIConnectionError:
+        raise HTTPException(502, "could not reach the Claude API")
 
 
 @app.get("/api/stats")

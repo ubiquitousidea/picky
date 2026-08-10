@@ -23,6 +23,11 @@ const state = {
   selection: { value: null, nodeId: null, imageId: null },
   // The filmstrip is off by default — the Image map is the picker it defers to.
   filmstrip: false,
+  // The command row's conversation, held here because the Messages API is
+  // stateless and this app has no sessions — it is posted back on every turn and
+  // replaced by whatever comes back. `busy` is what stops a second Enter while
+  // the first turn is still applying effects.
+  agent: { history: [], busy: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -4201,6 +4206,122 @@ async function deleteImage() {
   await selectImage(state.images.length ? state.images[0].id : null);
 }
 
+// ---------- The command row ----------
+//
+// A sentence goes to /api/agent, which drives the same endpoints these buttons
+// do and reports what it touched. Two things come back besides words: `focus`,
+// the node to navigate to, and `pending`, a destructive action the server
+// refused to perform until someone presses a button here.
+//
+// The conversation is held here rather than on the server: the Messages API is
+// stateless and this app has no sessions, so the browser is the natural owner.
+// It is posted back verbatim and replaced with whatever comes back.
+
+function agentLine(text, kind) {
+  const div = document.createElement("div");
+  div.className = `agent-line${kind ? ` agent-${kind}` : ""}`;
+  div.textContent = text;
+  $("agent-log").append(div);
+  // The log is a strip inside a scrolling row, so the newest line has to be
+  // walked to rather than waited for.
+  div.scrollIntoView({ block: "nearest", inline: "nearest" });
+  return div;
+}
+
+// The queued delete, rendered as the button the server declined to be. The
+// agent never holds this trigger — what it sent was a description, and this is
+// the ordinary DELETE the tree's own buttons call, reached by a human click.
+function renderAgentPending(pending) {
+  const row = document.createElement("div");
+  row.className = "agent-line agent-pending";
+  row.append(`${pending.description}?`);
+
+  const go = document.createElement("button");
+  go.textContent = "Delete";
+  go.className = "agent-danger";
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+
+  const settle = (note) => {
+    row.replaceChildren();
+    row.className = "agent-line agent-note";
+    row.textContent = note;
+  };
+  cancel.onclick = () => settle("Cancelled — nothing was deleted.");
+  go.onclick = async () => {
+    go.disabled = cancel.disabled = true;
+    try {
+      if (pending.action === "delete_node") {
+        const res = await api(`/api/nodes/${pending.id}`, { method: "DELETE" });
+        const keep = res.deleted.includes(state.nodeId) ? res.parent_id : state.nodeId;
+        await selectImage(state.imageId, keep);
+      } else {
+        await api(`/api/images/${pending.id}`, { method: "DELETE" });
+        await refreshGallery();
+        await selectImage(state.images.length ? state.images[0].id : null);
+      }
+      settle("Deleted.");
+    } catch (err) {
+      settle(`Delete failed: ${err.message}`);
+    }
+  };
+  row.append(go, cancel);
+  $("agent-log").append(row);
+  row.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+async function runAgent() {
+  const input = $("agent-input");
+  const prompt = input.value.trim();
+  if (!prompt || state.agent.busy) return;
+
+  state.agent.busy = true;
+  input.value = "";
+  input.disabled = $("agent-go").disabled = true;
+  $("agent-status").hidden = false;
+  agentLine(prompt, "you");
+
+  try {
+    const res = await api("/api/agent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        history: state.agent.history,
+        image_id: state.imageId,
+        node_id: state.nodeId,
+      }),
+    });
+    state.agent.history = res.history;
+    // Steps first, then the sentence: what it did, then what it says about it.
+    for (const step of res.steps) {
+      agentLine(`${step.ok ? "·" : "×"} ${step.summary}`, step.ok ? "step" : "fail");
+    }
+    if (res.reply) agentLine(res.reply, "reply");
+    // selectImage() is the single choke point every path that changes what you
+    // are looking at goes through — it repaints the preview, tree, masks and
+    // presets together, so the row does not need to know about any of them.
+    if (res.focus) await selectImage(res.focus.image_id, res.focus.node_id);
+    if (res.pending) renderAgentPending(res.pending);
+  } catch (err) {
+    // Into the log, never an alert(): alert() blocks, and this is a control you
+    // press over and over.
+    agentLine(err.message, "fail");
+  } finally {
+    state.agent.busy = false;
+    input.disabled = $("agent-go").disabled = false;
+    $("agent-status").hidden = true;
+    $("agent-clear").hidden = !state.agent.history.length;
+    input.focus();
+  }
+}
+
+function clearAgent() {
+  state.agent.history = [];
+  $("agent-log").replaceChildren();
+  $("agent-clear").hidden = true;
+}
+
 // ---------- Init ----------
 
 async function init() {
@@ -4269,6 +4390,25 @@ async function init() {
     );
     if (files.length) uploadFiles(files);
   });
+
+  // The command row exists only if the server has a key to talk to Claude with.
+  // Asked once, here, rather than discovered by a failing POST later.
+  try {
+    const agentInfo = await api("/api/agent");
+    if (agentInfo.configured) {
+      $("agent-section").hidden = false;
+      $("agent-go").onclick = runAgent;
+      $("agent-clear").onclick = clearAgent;
+      $("agent-input").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault(); // the row lives in a footer, not a form, but be sure
+          runAgent();
+        }
+      });
+    }
+  } catch {
+    // An older server without the endpoint just has no command row.
+  }
 
   await refreshGallery();
   await refreshPresets();

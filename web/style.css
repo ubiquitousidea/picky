@@ -280,6 +280,85 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 #control-bar > section + section { border-top: 1px solid var(--border); }
 #control-bar > section[hidden] { display: none; }
+/* Step 1 — say what you want. First row of the bar, above the manual controls
+   it drives, and cyan because every other dialog and row has already claimed a
+   hue. Wraps rather than scrolls, for #effects-section's reason: the log is the
+   only record of what was done to the library, and a scroller would let it slide
+   out of sight while it was still being written. */
+#agent-section {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+}
+#agent-input {
+  /* the chip look #embed-search wears, for the same reason: it is a phrase box
+     sitting among buttons, not a form field */
+  flex: 1 1 14rem;
+  min-width: 0; /* or the flex item's automatic minimum widens the whole column */
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+}
+#agent-input::placeholder { color: var(--muted); }
+#agent-input:focus { outline: 1px solid var(--rb-cyan); }
+#agent-go, #agent-clear {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+#agent-go:hover:not(:disabled) { border-color: var(--rb-cyan); color: var(--rb-cyan); }
+#agent-go:disabled { opacity: 0.5; cursor: default; }
+#agent-clear { color: var(--muted); }
+#agent-status { font-size: 0.75rem; color: var(--rb-cyan); }
+#agent-status[hidden], #agent-clear[hidden] { display: none; }
+/* The transcript takes the whole second line — it is prose, and sharing a line
+   with the box would give it a column two words wide. */
+#agent-log {
+  flex: 1 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  max-height: 7rem;
+  overflow-y: auto;
+  font-size: 0.75rem;
+}
+#agent-log:empty { display: none; }
+.agent-line { color: var(--muted); }
+.agent-you { color: var(--text); }
+.agent-you::before { content: "› "; color: var(--rb-cyan); }
+.agent-step { color: var(--rb-cyan); }
+.agent-reply { color: var(--text); }
+.agent-fail { color: var(--rb-orange); }
+.agent-note { color: var(--muted); font-style: italic; }
+/* A queued delete is the one line here that is a control, so it reads as one. */
+.agent-pending {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  color: var(--text);
+}
+.agent-pending button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.1rem 0.6rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.agent-pending button:disabled { opacity: 0.5; cursor: default; }
+.agent-danger { color: var(--rb-red); border-color: var(--rb-red); }
+
 /* Step 2 — the effect, its params, and Apply on one line where there is room.
    It wraps rather than scrolls, unlike the rows below: Apply is the primary
    action of the whole app, and hiding it off the end of a scroller would be a

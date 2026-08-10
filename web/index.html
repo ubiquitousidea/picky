@@ -47,6 +47,16 @@
        where you are in the tree. The filmstrip is last so toggling it on never
        reorders anything above it. -->
   <footer id="control-bar">
+    <!-- Ships hidden and stays that way unless GET /api/agent reports a key —
+         see init(). A box that can only ever fail is worse than no box. -->
+    <section id="agent-section" hidden>
+      <input id="agent-input" type="text" autocomplete="off"
+             placeholder="say what you want — “find a photo of a cat and posterize it”">
+      <button id="agent-go">Go</button>
+      <span id="agent-status" hidden>thinking…</span>
+      <button id="agent-clear" hidden title="Forget the conversation so far">Clear</button>
+      <div id="agent-log"></div>
+    </section>
     <section id="effects-section">
       <div id="effect-buttons" role="group" aria-label="Effect"></div>
       <div id="effect-params"></div>

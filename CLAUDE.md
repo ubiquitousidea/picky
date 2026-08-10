@@ -286,6 +286,47 @@ one place silently breaks another.
   `projections` and `nodes_image` arrive. User databases contain real work;
   never require a wipe.
 
+### The agent
+
+- **`server/agent.py` is a second front end, not a second implementation.** The
+  command row posts a sentence to `POST /api/agent`, and the tool loop's writes
+  re-enter `main.py` through the very functions the browser posts to
+  (`create_node`, `update_node`, `apply_preset`), so clamping, ownership checks,
+  `_check_effect_ready`'s 409, the descendant sweep and the eager re-render are
+  the same code Apply runs. Reaching into `db`/`rendering` from a tool would be a
+  second place that has to know the rules. `main` imports `agent` to mount the
+  endpoints, so the handlers import `main` **inside the function** — the cycle is
+  real and the deferral is the fix.
+- **The agent's effect vocabulary is derived from `EFFECTS`** (`_effects_doc`),
+  for the reason `GET /api/effects` is: a new effect must stay one registry entry
+  and nothing else. There is deliberately no tool schema per effect —
+  `apply_effect` takes a name and a free-form `params`, and `validate_params`
+  remains the only thing that judges them.
+- **Refusal lives in the tool result, not the system prompt.** A CLIP search
+  ranks the library rather than judging it, so the top hit for gibberish scores
+  about as well as the top hit for a photo you own; `STRONG_MATCH` is where the
+  raw cosine stops meaning "that subject is in this photo". Below it
+  `_find_photos` still returns the photos but prepends a do-not-edit directive to
+  the result — said only in the system prompt, this lost to the model's
+  enthusiasm every time, and the model edited a real library image.
+- **Destructive tools propose; they never act.** `delete_node`/`delete_photo`
+  return a description and set `pending`; the browser renders the button and
+  calls the ordinary `DELETE` itself (`renderAgentPending`). The agent never
+  holds that trigger — the manual path already asks (`deleteNode`'s `confirm()`),
+  and a misread sentence must not be able to destroy work.
+- **Selections are out of reach on purpose**, so "blur the background" is a
+  whole-frame blur the model is told to own up to. A click selection is a pixel
+  coordinate the model cannot see, and banking one into a mask is the frontend's
+  job by design — see `bankSelection`, above.
+- **The conversation lives in the browser** (`state.agent.history`), posted back
+  each turn: the Messages API is stateless and the app has no sessions. It is
+  trimmed in `agent._trim` on a boundary the API accepts — a `tool_result` turn
+  cannot lead, so a blind tail slice is a 400.
+- Two model gates ride along: `find_photos` starts `text_job` and `apply_effect`
+  starts `depth_job` on a 409, each returning "still downloading" rather than
+  holding a request open. That keeps "the tower is fetched only when someone
+  searches" true — an agent search *is* someone searching.
+
 ### Frontend
 
 - **Node ids are topological** — both parents of a node always have smaller ids —
@@ -421,4 +462,10 @@ one place silently breaks another.
 - **The filmstrip is opt-in** (`picky:filmstrip` in localStorage, off by
   default): the Image map is the intended picker. It is the bar's last row, so
   toggling it never reorders anything above it.
+- **`#agent-section` is the bar's first row and ships `hidden`**, unhidden by
+  `init()` only when `GET /api/agent` reports a key — a box that can only fail is
+  worse than no box. Its result lands through `selectImage()` like every other
+  path that changes what you are looking at, and its errors render into
+  `#agent-log` rather than `alert()`, which blocks a control you press
+  repeatedly.
 - Deep links `?image=N&node=M` override the localStorage last-image.
