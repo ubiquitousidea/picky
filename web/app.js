@@ -1206,11 +1206,14 @@ function syncParamVisibility(container, effect, rows) {
 // thing you want sharp. The button carries `.sel-pick` deliberately, not just
 // for the styling: that class is what disarmPick() sweeps, so arming this and
 // arming click-to-segment cannot both look lit, and either one disarms the
-// other for free. The slider stays the only thing Apply reads.
+// other for free. `.depth-pick` beside it is what tells the two apart — this one
+// sits under a slider and fills its width, the selection's own sits beside
+// `clear` in a shrink-to-fit row — and is also how the commit closure below
+// finds this button again. The slider stays the only thing Apply reads.
 function buildDepthPick(container, p, sourceNodeId, allowPick) {
   const btn = document.createElement("button");
   btn.type = "button"; // inside no form, but readParams() walks past it either way
-  btn.className = "sel-pick";
+  btn.className = "sel-pick depth-pick";
   const idle = "Focus on a click";
   btn.textContent = idle;
   // Disabled rather than absent in the edit modal, exactly as the selection's

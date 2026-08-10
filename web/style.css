@@ -362,7 +362,10 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 /* Step 2 — the effect, its params, and Apply on one line where there is room.
    It wraps rather than scrolls, unlike the rows below: Apply is the primary
    action of the whole app, and hiding it off the end of a scroller would be a
-   worse trade than a second line. */
+   worse trade than a second line. The same goes one level in — see
+   #effect-params, which has to wrap *and* be shrinkable for this to hold, since
+   `flex: none` here would otherwise hand the section one unbreakable item as
+   wide as bokeh's whole set of sliders. */
 #effects-section {
   display: flex;
   flex-direction: row;
@@ -457,8 +460,20 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 #effect-params {
   display: flex;
   flex-direction: row;
+  /* Wrap, and — the load-bearing half — be allowed to shrink, overriding
+     `#effects-section > * { flex: none }` above on source order at equal
+     specificity. Without the shrink, wrapping never fires: the box would still
+     be sized to its widest possible single line and bokeh's seven controls
+     would go on scrolling sideways. Shrink but not grow, so #apply-btn's
+     `margin-left: auto` still parks it at the right end.
+     Deliberately no `min-width: 0`: a wrapping flex container's automatic
+     minimum is its widest item's min-content, which .param-row's `min-width:
+     8rem` below puts a floor under — that floor is what stops a narrow
+     viewport crushing a slider instead of breaking the line. */
+  flex-wrap: wrap;
+  flex: 0 1 auto;
   align-items: flex-end;
-  gap: 0.75rem;
+  gap: 0.5rem 0.75rem;
 }
 #effect-params .param-row { flex: none; min-width: 8rem; margin-bottom: 0; }
 #effect-params .curve-canvas { width: 120px; height: 120px; aspect-ratio: auto; }
@@ -480,8 +495,13 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 /* A pick button that sits under a slider is the width of the control it fills
    in — its own shape rather than the bar's layout, so unlike the rules further
-   down this one is not scoped to #effect-params: the edit modal wants it too. */
-.param-row .sel-pick { width: 100%; margin-top: 0.3rem; }
+   down this one is not scoped to #effect-params: the edit modal wants it too.
+   It is scoped to `.depth-pick`, not to `.param-row`, because the selection's
+   own pick is *also* inside a .param-row and must not have this: there its row
+   is shrink-to-fit, so a percentage width is circular — the button claims the
+   width the row was measured at and pushes `clear` out under the level dropdown
+   (the same failure `.sel-level` is patched for, below). */
+.sel-pick.depth-pick { width: 100%; margin-top: 0.3rem; }
 .sel-pick:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
 .sel-pick.armed { background: var(--rb-teal); color: var(--bg); }
 .sel-pick.busy { opacity: 0.7; }
