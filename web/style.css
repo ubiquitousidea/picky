@@ -631,6 +631,9 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .fx-original  { color: var(--rb-teal); }
 .fx-posterize { color: var(--rb-violet); }
 .fx-blur      { color: var(--rb-blue); }
+/* sand rather than another of the six: bokeh is the blur with a lens behind it,
+   so it reads next to blur's blue without being a second blue */
+.fx-bokeh     { color: var(--rb-sand); }
 .fx-edges     { color: var(--rb-yellow); }
 .fx-dither    { color: var(--rb-orange); }
 .fx-pixelate  { color: var(--rb-green); }

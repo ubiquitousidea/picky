@@ -616,20 +616,47 @@ function iconCurves() {
   return svg;
 }
 
-// out-of-focus highlights: the overlapping discs a fast lens turns points into,
-// growing and fading as they recede. One stays crisp — that is the subject
+// out-of-focus highlights: the shapes a fast lens turns points into, round on
+// the axis and clipped to cat's eyes by the barrel as they leave it — the swirl
+// the effect's slider is a dial for. One point stays crisp: that is the subject.
 function iconBokeh() {
   const svg = iconSvg();
-  const discs = [
-    [17, 7.5, 5.2, 0.22], [7.5, 9, 4, 0.35], [15.5, 17, 4.6, 0.28], [6, 18, 2.8, 0.45],
-  ];
-  for (const [cx, cy, r, opacity] of discs) {
-    svg.appendChild(svgEl("circle", {
-      cx, cy, r, fill: "currentColor", "fill-opacity": opacity,
+  // The aperture is the intersection of two equal circles whose centres lie on
+  // the radial line — `_lens_runs`' construction, which SVG can draw exactly
+  // rather than approximate, since it is only ever two arcs. `R` is the long
+  // half-axis and it points *across* the radius: highlights lie down tangentially
+  // as they go out, which is what makes a ring of them read as a swirl.
+  //
+  // Aspect follows the server's `1 - swirl*rho^2`, but off the icon's own scale:
+  // measured against the frame diagonal the way `_swirl_aspect` measures, no
+  // highlight that fits in 24 units gets below t ≈ 0.8, which at 28 px on screen
+  // is just a circle. So rho is distance over 11 and swirl is 0.9 — chosen to
+  // read at button size. This is decoration, not a transfer function; unlike
+  // `curveLut()` it has no pact with the server, and drifting from it costs
+  // nothing.
+  const catsEye = (cx, cy, R, opacity) => {
+    const dx = cx - 12, dy = cy - 12;
+    const theta = Math.atan2(dy, dx);
+    const t = 1 - 0.9 * Math.min(Math.hypot(dx, dy) / 11, 1) ** 2;
+    const rc = (R * (1 / t + t)) / 2; // radius of each of the two circles
+    // the two tips, at ±R across theta. At t = 1 the arcs become semicircles and
+    // this is a plain circle — the same degeneracy `_lens_runs` has at d = 0.
+    const [ux, uy] = [-Math.sin(theta) * R, Math.cos(theta) * R];
+    const [x1, y1, x2, y2] = [cx + ux, cy + uy, cx - ux, cy - uy];
+    return svgEl("path", {
+      d: `M ${x1} ${y1} A ${rc} ${rc} 0 0 1 ${x2} ${y2} A ${rc} ${rc} 0 0 1 ${x1} ${y1}`,
+      fill: "currentColor", "fill-opacity": opacity,
       stroke: "currentColor", "stroke-width": 0.9, "stroke-opacity": opacity + 0.3,
-    }));
-  }
-  svg.appendChild(svgEl("circle", { cx: 11, cy: 12, r: 2.2, fill: "currentColor" }));
+    });
+  };
+  // distances vary on purpose: the near one is nearly round and the far one is
+  // pointed, so the icon shows the ramp and not just four identical lenses
+  const highlights = [
+    [17.5, 7.5, 5, 0.22], [8, 8.5, 3.6, 0.34], [16, 17.5, 4.4, 0.27], [6, 17.5, 3, 0.42],
+  ];
+  for (const [cx, cy, R, opacity] of highlights) svg.appendChild(catsEye(cx, cy, R, opacity));
+  // on the axis, and so the one thing measured from rather than deformed
+  svg.appendChild(svgEl("circle", { cx: 12, cy: 12, r: 2, fill: "currentColor" }));
   return svg;
 }
 
