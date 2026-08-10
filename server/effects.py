@@ -1138,22 +1138,30 @@ EFFECTS = {
             {"name": "falloff", "label": "Falloff (1 = optical)", "type": "float", "min": 0.3, "max": 3.0, "step": 0.1, "default": 1.0},
             {"name": "bloom", "label": "Highlight bloom", "type": "float", "min": 0.0, "max": 12.0, "step": 0.5, "default": 0.0},
             # The dropdown sits immediately above the two sliders it switches
-            # between, since only one of them applies at a time and nothing in
-            # the panel can hide the other — `density`'s precedent. "lens" is
-            # the default because it is what every node already on disk
-            # rendered as, no `aperture` key having existed when it was saved.
+            # between, and `when` is what hides whichever of them the mode is
+            # not about — at most one of `swirl` and `hole` is ever non-zero, so
+            # the other is a control that provably does nothing. "lens" is the
+            # default because it is what every node already on disk rendered as,
+            # no `aperture` key having existed when it was saved.
+            #
+            # `when` is presentation, exactly like `pick` above: a param is shown
+            # only while every control it names holds one of the listed values.
+            # `validate_params` never sees the key, the hidden control stays in
+            # the DOM, and its value is still read and still stored — so a hidden
+            # slider keeps its setting across a flip of the mode, and `bokeh()`
+            # remains the one place that decides a mode zeroes it.
             {"name": "aperture", "label": "Aperture", "type": "choice", "options": APERTURE_MODES, "default": "lens"},
-            {"name": "swirl", "label": "Swirl (lens: shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0},
+            {"name": "swirl", "label": "Swirl (shape + vignette)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.0, "when": {"aperture": ["lens"]}},
             # Hole diameter over aperture diameter. Defaults to a real
             # catadioptric's ~0.4 rather than to 0, unlike every other param
             # here, because it is gated behind the dropdown: a 0 default would
             # make choosing "mirror" do nothing at all and read as broken.
-            {"name": "obstruction", "label": "Hole Ø (mirror)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.4},
-            # Read by the "kernels" view alone, and sitting next to `show` for
-            # that reason. The panel has no way to show a param conditionally,
-            # and a diagnostic knob is not worth growing a mode system in
-            # `buildParamControls` for.
-            {"name": "density", "label": "Kernel grid (columns)", "type": "int", "min": 3, "max": 32, "step": 1, "default": _KERNEL_COLS},
+            {"name": "obstruction", "label": "Hole Ø (× aperture)", "type": "float", "min": 0.0, "max": 0.85, "step": 0.05, "default": 0.4, "when": {"aperture": ["mirror"]}},
+            # Read by the "kernels" view alone, which is both why it sits next to
+            # `show` and what its `when` says. The gate points *forward* here,
+            # at a param declared after it — the panel resolves visibility in a
+            # pass of its own once every control exists, so order is free.
+            {"name": "density", "label": "Kernel grid (columns)", "type": "int", "min": 3, "max": 32, "step": 1, "default": _KERNEL_COLS, "when": {"show": ["kernels"]}},
             {"name": "show", "label": "Show", "type": "choice", "options": SHOW_MODES, "default": "bokeh"},
         ],
     },
@@ -1214,6 +1222,11 @@ BLEND_SPEC = {
             "options": BLEND_MODES,
             "default": "average",
         },
+        # Read by "average" alone — every other mode is a pixel function of the
+        # two inputs with nothing to weight. The gate is the same `when` bokeh's
+        # aperture sliders use (see there for what the key is and is not); it
+        # used to be hand-wired in `appendBlendTarget`, which was the frontend
+        # holding a fact about this spec that the spec can state itself.
         {
             "name": "weight",
             "label": "Blend weight",
@@ -1222,6 +1235,7 @@ BLEND_SPEC = {
             "max": 1.0,
             "step": 0.01,
             "default": 0.5,
+            "when": {"mode": ["average"]},
         },
     ],
 }

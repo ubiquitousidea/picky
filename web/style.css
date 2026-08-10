@@ -396,6 +396,12 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
    inverting the background would flatten each icon's tonal ramp */
 .fx-btn.selected { opacity: 1; background: var(--panel-2); border-color: currentColor; }
 .param-row { margin-bottom: 0.6rem; }
+/* A param spec's `when` hides a row whose mode is not selected, and this says
+   so at author specificity rather than leaving it to the UA sheet's
+   `[hidden] { display: none }` — which any scoped `display` rule outranks, as
+   #select-controls' below already would. Written here, on the component, since
+   the rule is the same in the bar and in the edit modal. */
+.param-row[hidden] { display: none; }
 .param-row label {
   display: flex;
   justify-content: space-between;

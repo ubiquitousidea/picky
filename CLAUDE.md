@@ -368,6 +368,17 @@ one place silently breaks another.
   float, `validate_params` never sees the key, and the slider stays the only
   thing Apply reads. It is off in the edit modal (`allowPick: false`) for the
   reason the selection's pick is: `showModal()` makes the image inert.
+- **`when` is the other presentation-only key, and `syncParamVisibility()` is
+  the only reader of it.** It hides a control that some other control's mode
+  makes inert — bokeh's `swirl` and `obstruction` under Aperture, its `density`
+  outside the kernels view, blend's `weight` outside "average". Hidden, never
+  removed: `readParams()` walks every `[data-param]` regardless, so the params
+  dict stays complete and a slider dialled in one mode still holds its value
+  when you switch back. Which of them the *effect* ignores stays the server's
+  business — `bokeh()` resolving the aperture mode to a `swirl` and a `hole` is
+  the invariant; `when` only stops the panel offering a knob that does nothing.
+  Keep the two in step: a mode that zeroes a param there and shows it here is a
+  control the user can drag with no effect, which is the bug this replaced.
 - **Param controls are built and read in one place** (`buildParamControls()` /
   `readParams()`), shared by the Apply panel and the edit modal, so ranges,
   defaults and coercion cannot drift between create and edit. The Method dropdown

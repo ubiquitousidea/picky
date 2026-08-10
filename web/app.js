@@ -1112,10 +1112,17 @@ function buildParamControls(
 ) {
   const effect = state.effects.find((e) => e.name === effectName);
   container.innerHTML = "";
+  // by param name, for syncParamVisibility() below: a row is found here, while
+  // it is being built, rather than dug back out of the DOM afterwards — the
+  // curve editor's is not a `.param-row` around a `[data-param]` and would need
+  // a second rule to reach.
+  const rows = new Map();
   for (const p of effect.params) {
     const current = values[p.name] ?? p.default;
     if (p.type === "points") {
-      container.appendChild(buildCurveEditor(p, current, sourceNodeId));
+      const editor = buildCurveEditor(p, current, sourceNodeId);
+      rows.set(p.name, editor);
+      container.appendChild(editor);
       continue;
     }
     const row = document.createElement("div");
@@ -1152,9 +1159,46 @@ function buildParamControls(
         row.appendChild(buildDepthPick(container, p, sourceNodeId, allowPick));
       }
     }
+    rows.set(p.name, row);
     container.appendChild(row);
   }
+  syncParamVisibility(container, effect, rows);
   return effect;
+}
+
+// A param spec's `when` says the control only applies in some mode of another
+// control — bokeh's two aperture sliders, blend's weight — and this is the one
+// place that reads it. Presentation, like `pick`: the row is hidden, never
+// removed, so readParams() still finds it (it walks every `[data-param]`,
+// visible or not). That is deliberate on both counts — the params dict Apply
+// sends stays complete, and a slider dialled in one mode still holds its value
+// when you come back to it. Which of them the effect then ignores is the
+// server's business, and `bokeh()` already resolves exactly that.
+//
+// A pass of its own, after every row exists, because a gate may point forward:
+// bokeh's `density` names `show`, which is declared after it.
+function syncParamVisibility(container, effect, rows) {
+  const syncs = new Map(); // controlling <select> → the syncs it drives
+  for (const p of effect.params) {
+    const row = rows.get(p.name);
+    if (!p.when || !row) continue;
+    // Every named control must hold a listed value. One entry is all any spec
+    // uses today; `every` is what makes a second one mean the obvious thing
+    // rather than silently the first one.
+    const gates = Object.entries(p.when).map(([name, allowed]) => [
+      container.querySelector(`[data-param="${name}"]`),
+      allowed,
+    ]);
+    const sync = () =>
+      (row.hidden = !gates.every(([el, allowed]) => el && allowed.includes(el.value)));
+    for (const [el] of gates) {
+      if (el) syncs.set(el, [...(syncs.get(el) || []), sync]);
+    }
+    sync(); // the panel is built in whatever mode it opens in
+  }
+  for (const [el, fns] of syncs) {
+    el.addEventListener("change", () => fns.forEach((fn) => fn()));
+  }
 }
 
 // A slider whose number nobody can read off a photo — bokeh's focal plane is a
@@ -1250,15 +1294,9 @@ function appendBlendTarget(container, { text, excludeId, selected = null, maxId 
   if (selected !== null && others.some((n) => n.id === selected)) sel.value = selected;
   row.append(label, sel);
   container.appendChild(row);
-
-  // the weight param only affects the "average" mode
-  const modeSel = container.querySelector('[data-param="mode"]');
-  const weightRow = container.querySelector('[data-param="weight"]')?.closest(".param-row");
-  if (modeSel && weightRow) {
-    const syncWeight = () => (weightRow.hidden = modeSel.value !== "average");
-    modeSel.addEventListener("change", syncWeight);
-    syncWeight();
-  }
+  // The weight row's "average only" rule is not here: `mode` and `weight` are
+  // both registry params, so BLEND_SPEC's `when` states it and
+  // buildParamControls() has already wired it by the time this runs.
   return others.length > 0;
 }
 
