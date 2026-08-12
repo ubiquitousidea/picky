@@ -86,10 +86,26 @@ restarts.
   are marked in the work tree), so editing the effect's params later
   re-composites against the same region. Model weights (~45 MB) download on
   first use.
-- **Saved masks** — **picking an object and applying an effect saves that
-  object automatically**, freezing its pixels to disk as a durable mask rather
-  than a click that has to be re-segmented. It appears as a silhouette icon
-  under the picker, named for you (*Object 1*, *Object 2*, …) and already
+- **Or name the object** — type what you want into the box beside the picker —
+  *the dog*, *the sky*, *the red car* — and press **Find**. A
+  [CLIPSeg](https://github.com/timojl/clipseg) model reads the words against the
+  picture and works out *where* the thing is; **SAM still traces the boundary**,
+  so a named selection has exactly the same crisp edges as a clicked one, and
+  the level dropdown still re-ranks it. The size of what it found chooses the
+  level for you, which is how *the sky* and *a cloud* come out as different
+  selections. The line under the row says what happened — *Found "the hair" —
+  3.3% of the frame* — and says **weak match** when nothing in the picture
+  really fits, rather than pretending; the outline is drawn either way, so you
+  can see for yourself in a glance. Phrasing is not something you have to get
+  right: the query is tried under several wordings at once, so *the person* and
+  *a person* find the same subject. It works in the edit dialog too, where
+  clicking cannot, so you can change which object an existing effect is limited
+  to. Model weights (~139 MB) download the first time you press **Find**.
+- **Saved masks** — **selecting an object and applying an effect saves that
+  object automatically**, whether you clicked it or named it, freezing its
+  pixels to disk as a durable mask rather than a pick that has to be
+  re-segmented. It appears as a silhouette icon under the picker, named for you
+  (*Object 1*, *Object 2*, …) and already
   ticked, so the next effect lands on exactly the same region — that is what
   lets you stack several effects on one object without re-selecting it each
   time. The shape is identical every time, and it survives deleting the node it
@@ -175,12 +191,14 @@ and cached renders live in `data/` (gitignored).
 
 Model weights are fetched to `data/models/` from revision-pinned Hugging Face
 URLs, each on the first gesture that needs it and never before: segmentation
-(~45 MB) when you click to segment, depth (~99 MB) when you press **Bokeh**,
+(~45 MB) when you click to segment, text-prompted segmentation (~139 MB) when
+you press **Find** to name an object, depth (~99 MB) when you press **Bokeh**,
 CLIP's vision tower (~335 MB) when you open the Image map, and its text tower
 (254 MB) only if you search there. To supply your own ONNX exports instead,
 point the matching env var at an absolute path — `PICKY_SAM_ENCODER`,
-`PICKY_SAM_DECODER`, `PICKY_DEPTH_MODEL`, `PICKY_CLIP_MODEL`, or
-`PICKY_CLIP_TEXT_MODEL`. Nothing else in the app requires any of the downloads.
+`PICKY_SAM_DECODER`, `PICKY_CLIPSEG_MODEL`, `PICKY_DEPTH_MODEL`,
+`PICKY_CLIP_MODEL`, or `PICKY_CLIP_TEXT_MODEL`. Nothing else in the app
+requires any of the downloads.
 
 ## Architecture
 
@@ -191,6 +209,7 @@ server/
   effects.py    effect registry: each effect maps an RGB numpy array -> array
   rendering.py  node render pipeline with per-node JPEG cache
   sam.py        MobileSAM via onnxruntime: click a point, get a mask
+  clipseg.py    CLIPSeg via onnxruntime: a phrase in, the place it means out
   depth.py      Depth Anything V2 via onnxruntime: a photo in, relative depth out
 web/
   index.html, app.js, style.css   vanilla JS single-page frontend
@@ -221,6 +240,29 @@ everything there is a cache that invalidation is free to delete. Applying an
 effect to a fresh pick saves it that way first, so the object outlives the
 click — a click is only meaningful on the node it was made on, and applying an
 effect moves you off that node.
+
+**Naming an object produces a click.** CLIPSeg answers with a 352 × 352 heat
+map, which is far too coarse to be a mask — so the server does not use it as
+one. It smooths the map, takes its peak as a point, measures how much of the
+frame the hot region covers, and asks SAM which of its candidate masks at that
+point is closest to that size. What comes back over the wire is an `{x, y,
+level}`, exactly what clicking produces, and the browser stores it as exactly
+that. Nothing downstream — the outline, banking, presets, invert — can tell
+which one you did, and no CLIPSeg pixel is ever stored or shown. The one thing
+this rests on is that the code choosing the level and the code re-decoding it
+later rank SAM's candidates through the same helper; if those two orderings
+drifted apart, a saved selection would quietly resolve to a different mask than
+the one you were shown.
+
+Two details are worth knowing if you change it. The model is pinned to its
+*quantized* export, a quarter the size of the float one, on the argument that
+its output only has to locate — the boundary is SAM's work, so quantization
+error would have to move the peak off the subject before it cost anything. And
+the query is run under four phrasings in one batch, combined by taking the
+strongest response at each pixel rather than the average: a wording that simply
+misses contributes zeros, and averaging those in was enough to drop a real
+subject below the confidence floor over nothing but the choice between *the*
+and *a*.
 
 Bokeh's variable blur is a **layered gather**. Depth is split into bands whose
 weights sum to 1 at every pixel; each band is filtered at its own radius and the
@@ -286,6 +328,7 @@ the preset is replayed against.
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
 | POST   | `/api/nodes/{id}/mask` | outline PNG for a selection — `points` segmented on the fly, or `masks` (saved ids) read back, plus an optional `invert`; persists nothing but the node's cached embedding |
+| POST   | `/api/nodes/{id}/select-text` | find a named object (`query`) in a node's pixels, answering with the `x`, `y` and `level` a click would have produced, plus the `score`, the `coverage` the resulting mask has, and `confident`. Stores nothing; 409s rather than downloading the model inside the request |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | GET    | `/api/nodes/{id}/depth-at` | the depth under one pixel (`x`, `y`) on bokeh's own normalized scale — what click-to-focus reads a `focus` value off; stores nothing |
@@ -308,4 +351,8 @@ the preset is replayed against.
 | GET    | `/api/text-model/progress` | where that download got to, including `ready` for a tower an earlier run already fetched |
 | POST   | `/api/depth-model/prepare` | start fetching the depth model (99 MB), which only Bokeh needs |
 | GET    | `/api/depth-model/progress` | where that download got to |
+| POST   | `/api/select-model/prepare` | start fetching the text-prompted segmentation model (139 MB), which only naming an object needs |
+| GET    | `/api/select-model/progress` | where that download got to, including `ready` for a model an earlier run already fetched |
+| GET    | `/api/agent` | whether an `ANTHROPIC_API_KEY` is configured, and which model the command row would talk to; the frontend hides the row when it is not |
+| POST   | `/api/agent` | run one turn (`prompt`, the browser's own `history`, and the `image_id`/`node_id` on screen). Answers with the `reply`, the `steps` it took, the updated `history`, a `focus` to navigate to, a `pending` action awaiting confirmation, and the `wire` record of the API calls the turn actually made |
 | GET    | `/api/stats` | library counts and disk usage |
