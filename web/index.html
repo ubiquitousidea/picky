@@ -54,6 +54,7 @@
              placeholder="say what you want — “find a photo of a cat and posterize it”">
       <button id="agent-go">Go</button>
       <span id="agent-status" hidden>thinking…</span>
+      <button id="agent-wire" hidden title="What was sent to and from the Claude API">Wire</button>
       <button id="agent-clear" hidden title="Forget the conversation so far">Clear</button>
       <div id="agent-log"></div>
     </section>
@@ -103,6 +104,16 @@
     <ul id="preset-list"></ul>
     <div class="modal-actions">
       <button id="presets-close-btn">Close</button>
+    </div>
+  </dialog>
+
+  <!-- The command row's conversation as the API saw it. Filled from
+       state.agent.wire on open — see openWire(). -->
+  <dialog id="wire-modal">
+    <h2>Wire</h2>
+    <div id="wire-body"></div>
+    <div class="modal-actions">
+      <button id="wire-close-btn">Close</button>
     </div>
   </dialog>
 

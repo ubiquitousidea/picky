@@ -26,8 +26,10 @@ const state = {
   // The command row's conversation, held here because the Messages API is
   // stateless and this app has no sessions — it is posted back on every turn and
   // replaced by whatever comes back. `busy` is what stops a second Enter while
-  // the first turn is still applying effects.
-  agent: { history: [], busy: false },
+  // the first turn is still applying effects. `wire` is the same conversation
+  // as the API saw it, one entry per turn, kept for the Wire dialog to read —
+  // it is a record, never posted back, and dies with the history it describes.
+  agent: { history: [], wire: [], busy: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -4361,6 +4363,10 @@ async function runAgent() {
       }),
     });
     state.agent.history = res.history;
+    // The prompt rides along because it is what makes a turn recognisable in
+    // the Wire dialog — the messages list carries it too, but buried at the
+    // bottom of whatever the trim left of the previous turns.
+    if (res.wire) state.agent.wire.push({ prompt, ...res.wire });
     // Steps first, then the sentence: what it did, then what it says about it.
     for (const step of res.steps) {
       agentLine(`${step.ok ? "·" : "×"} ${step.summary}`, step.ok ? "step" : "fail");
@@ -4380,14 +4386,112 @@ async function runAgent() {
     input.disabled = $("agent-go").disabled = false;
     $("agent-status").hidden = true;
     $("agent-clear").hidden = !state.agent.history.length;
+    // Its own count, not the history's: a turn the API refused hands back no
+    // wire, and a Wire button that opens an empty dialog is a broken button.
+    $("agent-wire").hidden = !state.agent.wire.length;
     input.focus();
   }
 }
 
 function clearAgent() {
   state.agent.history = [];
+  // The record goes with the conversation it records. Keeping it would leave
+  // the Wire dialog describing messages the model has already been made to
+  // forget, which is the one thing it must not do.
+  state.agent.wire = [];
   $("agent-log").replaceChildren();
-  $("agent-clear").hidden = true;
+  $("agent-clear").hidden = $("agent-wire").hidden = true;
+}
+
+// ---------- The wire ----------
+//
+// Every request the last few turns made to the Messages API, and every response
+// back. Nothing here changes what the agent does; it is the loop in `run_turn`
+// made readable — a growing `messages` list re-sent each round, a response whose
+// `stop_reason` decides whether there is another one, and the system prompt and
+// tool schemas that ride along with all of them.
+//
+// Built with textContent throughout, never innerHTML: this view renders model
+// output and tool results verbatim, so it must not be somewhere markup can run.
+
+// `wrap` is for the one block that is prose rather than JSON: pretty-printed
+// JSON is already broken into short lines and wants its indentation left alone,
+// but the system prompt is paragraphs, and a paragraph you have to scroll
+// sideways to read is not one anybody reads.
+function wireBlock(summary, body, open, wrap) {
+  const details = document.createElement("details");
+  details.open = !!open;
+  const head = document.createElement("summary");
+  head.textContent = summary;
+  const pre = document.createElement("pre");
+  pre.className = `wire-pre${wrap ? " wire-wrap" : ""}`;
+  pre.textContent = body;
+  details.append(head, pre);
+  return details;
+}
+
+// The one-line reason a round happened, and what it cost.
+function wireRoundSummary(round, n) {
+  const res = round.response;
+  const use = res.usage || {};
+  return (
+    `round ${n} · ${round.messages.length} message${round.messages.length === 1 ? "" : "s"}` +
+    ` · ${res.stop_reason} · ${use.input_tokens ?? "?"} in / ${use.output_tokens ?? "?"} out` +
+    ` · ${round.ms}ms`
+  );
+}
+
+function openWire() {
+  const body = $("wire-body");
+  body.replaceChildren();
+
+  state.agent.wire.forEach((turn, i) => {
+    // The newest turn is what you opened this to see, so its rounds start
+    // expanded; the system prompt and the schemas never do — they are long, and
+    // the same every turn.
+    const newest = i === state.agent.wire.length - 1;
+    const section = document.createElement("div");
+    section.className = "wire-turn";
+
+    const prompt = document.createElement("div");
+    prompt.className = "wire-prompt";
+    prompt.textContent = turn.prompt;
+    const meta = document.createElement("div");
+    meta.className = "wire-meta";
+    meta.textContent = `${turn.call.model} · max_tokens ${turn.call.max_tokens}`;
+    section.append(prompt, meta);
+
+    section.append(
+      wireBlock(
+        `system prompt · ${turn.call.system.length.toLocaleString()} chars`,
+        turn.call.system, // raw text: it is prose, and JSON would only escape it
+        false,
+        true
+      ),
+      wireBlock(
+        `tools · ${turn.call.tools.length} schema${turn.call.tools.length === 1 ? "" : "s"}`,
+        JSON.stringify(turn.call.tools, null, 2),
+        false
+      )
+    );
+
+    turn.rounds.forEach((round, r) => {
+      const details = document.createElement("details");
+      details.open = newest;
+      const head = document.createElement("summary");
+      head.textContent = wireRoundSummary(round, r + 1);
+      details.append(head);
+      details.append(
+        wireBlock("→ messages", JSON.stringify(round.messages, null, 2), true),
+        wireBlock("← response", JSON.stringify(round.response, null, 2), true)
+      );
+      section.append(details);
+    });
+
+    body.append(section);
+  });
+
+  $("wire-modal").showModal();
 }
 
 // ---------- Init ----------
@@ -4467,6 +4571,10 @@ async function init() {
       $("agent-section").hidden = false;
       $("agent-go").onclick = runAgent;
       $("agent-clear").onclick = clearAgent;
+      // Both bindings live inside the configured branch: with no key there is
+      // no row, so there is nothing that could open the dialog either.
+      $("agent-wire").onclick = openWire;
+      $("wire-close-btn").onclick = () => $("wire-modal").close();
       $("agent-input").addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault(); // the row lives in a footer, not a form, but be sure

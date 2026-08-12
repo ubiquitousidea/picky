@@ -66,6 +66,7 @@ h2 {
 #crop-modal h2 { color: var(--rb-sand); }
 #presets-modal h2 { color: var(--rb-teal); }
 #cluster-modal h2 { color: var(--rb-violet); }
+#wire-modal h2 { color: var(--rb-cyan); } /* the command row's own hue */
 
 /* The 268x268 backing store in the markup was sized for the old side panel; the
    dialog is a little wider, so aspect-ratio keeps the CSS box square and the
@@ -306,7 +307,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 #agent-input::placeholder { color: var(--muted); }
 #agent-input:focus { outline: 1px solid var(--rb-cyan); }
-#agent-go, #agent-clear {
+#agent-go, #agent-clear, #agent-wire {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -317,9 +318,10 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 #agent-go:hover:not(:disabled) { border-color: var(--rb-cyan); color: var(--rb-cyan); }
 #agent-go:disabled { opacity: 0.5; cursor: default; }
-#agent-clear { color: var(--muted); }
+#agent-clear, #agent-wire { color: var(--muted); }
+#agent-wire:hover { border-color: var(--rb-cyan); color: var(--rb-cyan); }
 #agent-status { font-size: 0.75rem; color: var(--rb-cyan); }
-#agent-status[hidden], #agent-clear[hidden] { display: none; }
+#agent-status[hidden], #agent-clear[hidden], #agent-wire[hidden] { display: none; }
 /* The transcript takes the whole second line — it is prose, and sharing a line
    with the box would give it a column two words wide. */
 #agent-log {
@@ -844,6 +846,46 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   margin-top: 0.9rem;
   line-height: 1.4;
 }
+
+/* Wire — the agent's requests and responses. Wider than the 320px base dialog
+   because the content is pretty-printed JSON, and a column that narrow would
+   wrap every line of it into unreadability. */
+#wire-modal { width: min(56rem, 94vw); }
+.wire-turn { padding-top: 0.7rem; }
+.wire-turn + .wire-turn { border-top: 1px solid var(--border); margin-top: 0.7rem; }
+.wire-prompt { font-size: 0.85rem; }
+.wire-prompt::before { content: "› "; color: var(--rb-cyan); }
+.wire-meta {
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+#wire-modal summary {
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: var(--rb-cyan);
+  padding: 0.15rem 0;
+}
+/* Nested one level: a round's disclosure holds the two halves of the exchange,
+   which are the quieter heading of the pair. */
+#wire-modal details details { margin-left: 0.9rem; }
+#wire-modal details details > summary { color: var(--muted); }
+/* Both axes scroll inside the box. Without overflow-x a single long line — a
+   base64 blob in a tool result, say — would widen the dialog past the viewport
+   rather than scroll within it. */
+.wire-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  line-height: 1.45;
+  white-space: pre;
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 0.5rem;
+  margin: 0.2rem 0 0.4rem;
+  max-height: 22rem;
+  overflow: auto;
+}
+.wire-wrap { white-space: pre-wrap; word-break: break-word; }
 
 /* Image map — the 3D embedding cloud. Full viewport, unlike the 320px base
    dialog: the cloud is the content, so everything else is a thin strip around

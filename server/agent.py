@@ -27,8 +27,10 @@ Two things are deliberately narrower than the UI:
   `confirm()`); this is that gate, kept where the user can see it.
 """
 
+import copy
 import json
 import os
+import time
 from pathlib import Path
 
 import anthropic
@@ -800,21 +802,45 @@ def run_turn(prompt: str, history: list, context: dict) -> dict:
     """One request from the box, played out to the end.
 
     Returns the reply, the transcript, the updated history for the client to
-    hold, where to navigate, and any destructive action awaiting a button.
+    hold, where to navigate, any destructive action awaiting a button, and the
+    round-by-round record of what actually went to the API.
     """
     turn = _Turn(context)
     messages = _trim([dict(m) for m in history]) + [{"role": "user", "content": prompt}]
     system = SYSTEM.format(effects=_effects_doc(), context=_context_doc(context))
     client = _get_client()
 
+    # The request as one dict, called with `**request` below, so the Wire
+    # dialog reads the very thing that was sent rather than a description of it
+    # written alongside — two spellings of one request is one of them free to
+    # drift, and a log that lies is worse than no log.
+    request = {
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "tools": TOOLS,
+        "messages": messages,  # the one list, grown in place as the turn plays out
+    }
+    # Everything but `messages` is fixed for the whole turn, so it is recorded
+    # once here and the rounds carry only what differs.
+    wire = {"call": {k: v for k, v in request.items() if k != "messages"}, "rounds": []}
+
     reply = ""
     for _ in range(MAX_ROUNDS):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
+        started = time.perf_counter()
+        response = client.messages.create(**request)
+        wire["rounds"].append(
+            {
+                # Deep-copied because `messages` is appended to in place: a
+                # reference would show every round holding the *final*
+                # transcript, which is precisely what this view exists to tell
+                # apart. `model_dump` is the same serialization the assistant
+                # turn below uses, so the whole response — id, stop_reason,
+                # usage — comes along for free.
+                "messages": copy.deepcopy(messages),
+                "response": response.model_dump(exclude_none=True),
+                "ms": round((time.perf_counter() - started) * 1000),
+            }
         )
         # Serialized to plain dicts because this list makes a round trip through
         # the browser as JSON; `exclude_none` drops the optional block fields the
@@ -858,4 +884,5 @@ def run_turn(prompt: str, history: list, context: dict) -> dict:
         "history": messages,
         "focus": turn.focus,
         "pending": turn.pending,
+        "wire": wire,
     }

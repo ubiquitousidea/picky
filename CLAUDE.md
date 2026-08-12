@@ -318,6 +318,16 @@ one place silently breaks another.
   whole-frame blur the model is told to own up to. A click selection is a pixel
   coordinate the model cannot see, and banking one into a mask is the frontend's
   job by design — see `bankSelection`, above.
+- **The wire log is read off the request, not written beside it.** `run_turn`
+  builds one `request` dict and calls `client.messages.create(**request)`, so
+  the Wire dialog cannot show a request that was not sent; the per-round
+  `messages` are deep-copied because that list is grown in place, and a
+  reference would show every round holding the final transcript. A turn that
+  dies *inside* the API call is the one gap — it becomes `main`'s 502 and
+  carries no wire, which is why the button's visibility is keyed on
+  `state.agent.wire.length` and not on the history's. Clearing the
+  conversation clears the record with it (`clearAgent`): a log describing
+  messages the model has been made to forget is worse than no log.
 - **The conversation lives in the browser** (`state.agent.history`), posted back
   each turn: the Messages API is stateless and the app has no sessions. It is
   trimmed in `agent._trim` on a boundary the API accepts — a `tool_result` turn
