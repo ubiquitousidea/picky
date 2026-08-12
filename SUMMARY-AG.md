@@ -209,13 +209,14 @@ The agentic interface allows users to operate Picky via natural language command
 | [ Web Frontend ]                                                                  |
 | - User enters prompt in Command Row                                               |
 | - Manages conversation history in `state.agent.history`                           |
+| - Retains the wire-level record in `state.agent.wire` for the Wire dialog         |
 | - Dispatches to `POST /api/agent`                                                 |
 +-----------------------------------------------------------------------------------+
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
 | [ server/agent.py (Orchestrator) ]                                                |
-| - Model: Claude 3.5 Haiku (`claude-haiku-4-5`) via Anthropic Messages API        |
+| - Model: Claude Haiku 4.5 (`claude-haiku-4-5`) via Anthropic Messages API         |
 | - System prompt injected with dynamic `_effects_doc()` and `_context_doc()`       |
 | - Conversation loop (bounded to MAX_ROUNDS = 10, trimmed to MAX_HISTORY = 20)     |
 +-----------------------------------------------------------------------------------+
@@ -245,6 +246,7 @@ The agentic interface allows users to operate Picky via natural language command
 | - `steps`: Structured execution transcript with status markers                    |
 | - `focus`: Target navigation object `{image_id, node_id}`                         |
 | - `pending`: Interactive confirmation card payload (if deletion queued)           |
+| - `wire`: Round-by-round record of the API calls the turn actually made           |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -304,6 +306,12 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
    - Each tool execution appends a human-readable summary step (`turn.steps`).
    - The frontend renders these sequentially with bullet indicators (`·` for success, `×` for failure) alongside the agent's textual response, providing total transparency into all automated actions.
 
+7. **Full Wire-Level Inspection**:
+   - `run_turn` builds each request as a single dictionary and invokes `client.messages.create(**request)`, so the record returned as `wire` is read off the very object that was sent rather than reconstructed alongside it — the log cannot describe a request that was never made.
+   - Recorded once per turn: `model`, `max_tokens`, the compiled system prompt, and the full tool schemas. Recorded per round: a deep copy of the `messages` list as sent (the list is grown in place, so a reference would show every round holding the final transcript), the complete response object including `stop_reason` and token `usage`, and wall-clock duration.
+   - The browser holds this in `state.agent.wire` and renders it in the **Wire** dialog (`openWire`), one collapsible section per round summarised as `round 1 · 3 messages · tool_use · 4231 in / 122 out · 780ms`. The conversation and its record are cleared together.
+   - A turn that fails *inside* the API call surfaces as a 502 and carries no `wire`, which is why the button's visibility keys on the record's own length rather than the conversation history's.
+
 ---
 
 ## 4. Summary Table of Endpoints & Component Mapping
@@ -317,4 +325,4 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
 | **Presets** | `server/main.py`, `server/db.py` | `openPresetModal()`, `applyPreset()` | `GET/POST/DELETE /api/presets`<br>`POST /api/nodes/{id}/apply-preset` |
 | **Output Framing** | `server/effects.py`, `server/rendering.py` | `initCropOverlay()`, `saveCrop()` | `PUT /api/images/{id}/crop`<br>`POST /api/images/{id}/crop-preview` |
 | **3D Image Map** | `server/embed.py`, `server/text_embed.py`, `server/labels.py` | `openEmbedMap()`, `drawEmbedMap()` | `GET /api/embedding-map`<br>`GET /api/embedding-map/search`<br>`POST/GET /api/embedding-map/prepare` |
-| **Agent Interface** | `server/agent.py`, `server/main.py` | `runAgent()`, `renderAgentPending()`, `agentLine()` | `GET/POST /api/agent` |
+| **Agent Interface** | `server/agent.py`, `server/main.py` | `runAgent()`, `renderAgentPending()`, `agentLine()`, `openWire()` | `GET/POST /api/agent` |
