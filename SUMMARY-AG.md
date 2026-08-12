@@ -1,6 +1,6 @@
 # Picky: Capabilities & Technical Architecture Summary
 
-This document provides a comprehensive technical overview of **Picky**, a non-destructive, browser-based image effects and library management application. It details the system architecture, core application capabilities, mathematical and algorithmic implementations of the visual filter pipeline, and the design and execution of the integrated agentic interface.
+This document provides a comprehensive technical overview of **Picky**, a non-destructive, browser-based image effects and library management application. It details the system architecture, core application capabilities, mathematical and algorithmic implementations of the visual filter pipeline, the click- and text-driven segmentation stack, and the design and execution of the integrated agentic interface.
 
 ---
 
@@ -45,9 +45,10 @@ Picky is designed around non-destructive, exploratory image editing and semantic
    - The server publishes the closed-form inverse affine transformation matrix with each image (`crop_geometry`), enabling the frontend to map clicks on rotated/cropped previews back into native node coordinates with zero client-side trigonometry.
 
 5. **Saved Masks & Interactive Segmentation**:
-   - Subjects are isolated using a **MobileSAM** model by clicking a single point.
+   - Subjects are isolated using a **MobileSAM** model, addressed either by clicking a single point or by **naming the object in words** ("the dog", "the sky"), the latter resolved by a **CLIPSeg** text-prompted segmentation pass.
+   - Both routes produce the *same* artifact — a point and a granularity level — so a typed selection and a clicked one are indistinguishable to everything downstream. CLIPSeg supplies only the location; SAM draws every boundary.
    - Picked selections are automatically "banked" into durable 1-bit PNG masks (`data/masks/<mask_id>.png`) when an effect is applied, detaching the mask from volatile click coordinates and preventing model drift.
-   - Multiple saved masks can be combined via boolean unions to apply an effect across several distinct objects simultaneously.
+   - Multiple saved masks can be combined via boolean unions to apply an effect across several distinct objects simultaneously, and a union may be inverted to select everything *except* the named subjects.
 
 6. **Portable Relative Presets**:
    - Effect chains are captured as reusable recipes (`presets`) by traversing ancestor closures.
@@ -200,7 +201,68 @@ Combines two nodes of the same image DAG (`parent_id` and `parent2_id`) across f
 
 ---
 
-## 3. Technical Details: The Agentic Interface
+## 3. Technical Details: Selection & Text-Prompted Segmentation
+
+A selection restricts an effect to part of the frame. It is resolved at render time in `rendering._apply` as a boolean stencil — $\text{out} = \text{mask} \,?\, f(\text{img}) : \text{img}$ — and can be addressed two ways: by clicking the object, or by naming it.
+
+```
+   [ Click (x, y) ]                    [ Phrase: "the dog" ]
+          |                                     |
+          |                          [ 4 prompt templates, one batch ]
+          |                                     |
+          |                          [ CLIPSeg rd64-refined (ONNX) ]
+          |                            352x352 logits per prompt
+          |                                     |
+          |                          [ Pixelwise max -> sigmoid ]
+          |                                     |
+          |                          [ Box-mean smoothing (prefix sum) ]
+          |                                     |
+          |                          [ argmax -> point ; >0.5*peak -> blob area ]
+          |                                     |
+          +------------------+------------------+
+                             |
+                 [ MobileSAM decoder: 3-4 candidate masks ]
+                             |
+            [ Rank by area -> subpart / part / whole ]
+              (click: user's dropdown; text: nearest blob area)
+                             |
+                 [ {points: [{x, y, level}], invert} ]
+                             |
+              [ Banked on Apply -> 1-bit PNG (data/masks/) ]
+```
+
+### 3.1. Interactive Segmentation (MobileSAM)
+- **Two-stage ONNX pipeline**: the image encoder ($\sim 28\text{ MB}$) is run once per node and its embedding cached on disk as `<node_id>.embedding.npy` ($\sim 4\text{ MB}$), written atomically because a truncated `.npy` raises on load. The mask decoder ($\sim 16\text{ MB}$) then costs milliseconds per point, so additional clicks on one node are effectively free.
+- **Coordinate transform**: input is resized longest-side to $1024\text{ px}$ with SAM's own `ResizeLongestSide` rounding, and click coordinates are scaled by the identical factor — a mismatch here silently offsets every mask. Normalization uses SAM's constants applied to **0-255** pixels, unlike the other three models in the tree.
+- **Granularity levels**: the decoder emits 3-4 candidate masks per click. Since SAM guarantees no ordering among them, candidates are ranked by pixel area and exposed as `subpart` (smallest), `part` (median) and `whole` (largest); `auto` instead trusts the model's own predicted-IoU head. Low-resolution exports return $256 \times 256$ logits covering the padded square, whose valid region is cropped before bilinear upscaling to full resolution.
+
+### 3.2. Text-Prompted Localization (CLIPSeg)
+- **Model**: CLIPSeg rd64-refined exported to ONNX, pinned by commit hash and **deliberately taken in its dynamically quantized form** ($139\text{ MB}$ against the float graph's $545\text{ MB}$). The justification is architectural: this model's output is used only to *locate*, so quantization error would have to displace the heatmap peak off the subject entirely before it could affect a boundary that SAM draws. Measured separation is unchanged from the float graph.
+- **Preprocessing**: a **squash to $352 \times 352$ with no center crop** — unlike the CLIP vision tower's shortest-side-then-crop, since a crop would discard the region an object was just named in. Normalization is plain ImageNet over 0-1 floats ($\mu = [0.485, 0.456, 0.406]$, $\sigma = [0.229, 0.224, 0.225]$), numerically identical to the depth model's and intentionally not shared with it.
+- **Tokenization**: reuses the hand-inlined byte-level BPE in `server/text_embed.py`, which keeps `transformers`/`tokenizers` out of the dependency tree entirely. The vocabulary and merge table ($1.7\text{ MB}$) are fetched independently of that module's $254\text{ MB}$ text tower, which CLIPSeg does not use.
+- **Prompt ensembling with max reduction**: the query is expanded across four templates (`"{}"`, `"a photo of {}"`, `"a photo of a {}"`, `"a close-up photo of {}"`) and run as a single batch. The per-prompt probability maps are reduced by a **pixelwise maximum**:
+  $$H(x,y) = \max_{t \in \text{templates}} \sigma\!\left(\text{logits}_t(x,y)\right)$$
+  This is deliberately *not* the arithmetic mean used for CLIP text vectors in `encode_terms`. There, each prompt is a unit vector in a shared space and their mean *is* the concept; here each prompt yields an independent per-pixel probability, and a phrasing that simply fails contributes zeros that drag the subject below threshold. Empirically, on one library photo a single bare prompt scored "the person" at $0.19$ against a subject that "a person" scored $0.30$ on — one side of the floor each, for a difference of one article. Under the max ensemble the same pair reads $0.42$ and $0.52$. The reduction introduces no false positives, because a subject absent from the frame is missed by all four phrasings.
+- **Peak extraction**: the map is smoothed by a separable box mean (radius 3, evaluated with the same 1D prefix-sum trick the disk blur uses, edges clamped) *before* the `argmax`. An unsmoothed argmax can land on a single noisy cell straddling an object boundary, and a point one pixel outside the subject hands SAM an entirely different object.
+- **Size estimation**: the count of cells above $0.5 \times \text{peak}$, rescaled to the node's pixel count, is passed to `sam.level_for_area`, which selects whichever named granularity has the closest area. This is what distinguishes "the sky" from "a cloud in it" given the same click point.
+
+### 3.3. Confidence Floor & Asymmetric Refusal
+- A heatmap always has a maximum, so a query for something absent still peaks somewhere — the same failure mode `STRONG_MATCH` addresses for library search. Measured across this library, subjects genuinely present score $0.36$–$0.99$ while absent ones (submarine, dog, giraffe, moon, laptop) reach at most $0.21$; `MATCH_FLOOR = 0.30` sits in the gap.
+- **The refusal is asymmetric by design.** The HTTP endpoint returns the point regardless, flagged `confident: false`, because the browser draws the resulting outline immediately and a person can judge it at a glance — and "no match" is the wrong answer to a subject that is present but oddly worded. The agent's `select_object` tool, which cannot see the picture, instead banks nothing and returns a directive not to edit.
+
+### 3.4. Representation & Reproducibility Invariant
+- A selection is a **union in one of two shapes**: `{points: [{x, y, level}, ...], invert}`, re-segmented by SAM on demand, or `{masks: [id, ...], invert}`, loaded from frozen PNGs. Members are OR'd and `invert` is applied once to the result.
+- **Text prompting introduces no third shape.** `POST /api/nodes/{id}/select-text` answers with the point and level a person would have produced, so banking, preset capture, mask reuse and the invert toggle are untouched code paths, and no CLIPSeg pixel is ever persisted or displayed.
+- This rests on one invariant: `sam.level_for_area` (which chose the level) and `sam.decode_mask` (which re-decodes it later) rank candidates through a single shared `_ranked` helper. Were the two orderings to diverge, a stored selection would silently resolve to a different mask than the one measured.
+- Masks are **image-scoped** and validated on every write (`main._check_selection`), since union members must share one image's dimensions; a mask referenced by any node cannot be deleted (HTTP 409).
+
+### 3.5. Lazy Model Acquisition
+- The CLIPSeg weights are fetched by `server/clipseg_job.py` on a daemon thread with byte-level progress reporting, triggered **only** by the gesture that needs them: pressing **Find** in the selection row, or the agent calling `select_object`. Until the files are on disk the endpoint returns HTTP 409 rather than downloading inside a request.
+- This mirrors the depth model and CLIP text tower jobs. Four such jobs exist and remain separate modules rather than phases of one, so that a session which never names an object, never searches, and never applies bokeh downloads none of those weights.
+
+---
+
+## 4. Technical Details: The Agentic Interface
 
 The agentic interface allows users to operate Picky via natural language commands entered into a dedicated **Command Row** in the web interface.
 
@@ -227,10 +289,11 @@ The agentic interface allows users to operate Picky via natural language command
          |                               |                               |
          v                               v                               v
 [ Navigation / Inspection ]     [ Edits & Applications ]      [ Destructive Safety Gate ]
-- `find_photos` (CLIP/Filename)  - `apply_effect`             - `delete_node`
-- `show_photo`                   - `edit_node`                - `delete_photo`
-- `list_photo_nodes`             - `apply_preset`             (Returns `pending` payload;
-- `list_presets`                 (Executes via `main.py`)      requires GUI confirmation)
+- `find_photos` (CLIP/Filename)  - `select_object` (CLIPSeg)  - `delete_node`
+- `show_photo`                   - `apply_effect` (+mask_id)  - `delete_photo`
+- `list_photo_nodes`             - `edit_node`                (Returns `pending` payload;
+- `list_presets`                 - `apply_preset` (+mask_id)   requires GUI confirmation)
+                                 (Executes via `main.py`)
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
@@ -250,7 +313,7 @@ The agentic interface allows users to operate Picky via natural language command
 +-----------------------------------------------------------------------------------+
 ```
 
-### 3.1. Core Architectural Principle: Second Front End, Not Second Implementation
+### 4.1. Core Architectural Principle: Second Front End, Not Second Implementation
 The agent is designed strictly as a **second front end** over the existing API.
 - The tool execution handlers in `server/agent.py` do not manipulate the database or filesystem directly; instead, they import and call the exact FastAPI endpoint handler functions in `server/main.py` (`create_node`, `update_node`, `apply_preset`, `search_embedding_map`).
 - **Benefits**:
@@ -258,26 +321,27 @@ The agent is designed strictly as a **second front end** over the existing API.
   - Image ownership checks and security boundaries are shared.
   - Eager rendering, cache invalidation closures (`delete_render_files`), and model readiness checks (`_check_effect_ready`) behave identically whether triggered by a human GUI click or an AI tool call.
 
-### 3.2. Dynamic System Prompt & Vocabulary Generation
+### 4.2. Dynamic System Prompt & Vocabulary Generation
 The system prompt in `server/agent.py` is compiled dynamically on every turn:
 1. **Dynamic Effect Schema (`_effects_doc()`)**: Generated directly from `effect_specs()`. Any new effect added to the Python registry is immediately exposed to the agent with its exact parameter types, numerical ranges, defaults, and choice options without manual prompt editing.
 2. **Dynamic Context (`_context_doc()`)**: Injects the active state of the user's viewport, including current image ID, image filename, active node ID, and the human-readable ancestor effect chain (e.g., `original → curves → bokeh`). This resolves ambiguous references such as "make it brighter" or "blur this".
 
-### 3.3. Complete Tool Definitions & Schema
+### 4.3. Complete Tool Definitions & Schema
 
 | Tool Name | Purpose | Key Inputs | Behavior / Safety Invariants |
 | :--- | :--- | :--- | :--- |
 | `find_photos` | Semantic & keyword library search | `description` (str), `limit` (int) | Combines substring filename search with 512-d CLIP text-vision cosine search (`search_embedding_map`). Scores against `STRONG_MATCH = 0.275`. |
 | `show_photo` | Switch UI focus | `image_id` (int), `node_id` (int, opt) | Sets `turn.focus` to update client viewport. |
 | `list_photo_nodes` | Inspect DAG history | `image_id` (int) | Returns full tree structure of all versions. |
-| `apply_effect` | Create and render a new child node | `image_id`, `node_id`, `effect`, `params`, `second_node_id` | Validates, calls `main.create_node`, renders eagerly, updates `turn.focus`. |
-| `edit_node` | Re-tune existing node in place | `node_id` (int), `params` (dict) | Merges new params over existing params, updates DB, invalidates descendant render caches. |
+| `select_object` | Locate a named object and bank it as a mask | `image_id`, `node_id` (opt), `description` (str) | CLIPSeg + SAM via `main.select_text`, then `main.create_mask`. Returns `mask_id`, coverage and score. Banks **nothing** below `MATCH_FLOOR = 0.30`. |
+| `apply_effect` | Create and render a new child node | `image_id`, `node_id`, `effect`, `params`, `second_node_id`, `mask_id`, `invert_mask` | Validates, calls `main.create_node`, renders eagerly, updates `turn.focus`. A `mask_id` becomes a `{masks: [id], invert}` selection checked for image ownership. |
+| `edit_node` | Re-tune existing node in place | `node_id` (int), `params` (dict) | Merges new params over existing params, updates DB, invalidates descendant render caches. Carries the node's existing selection forward explicitly. |
 | `list_presets` | List saved recipes | None | Returns saved preset names and step summaries. |
-| `apply_preset` | Replay multi-step recipe | `node_id` (int), `preset_name` (str) | Replays relative DAG steps; rolls back on failure. |
+| `apply_preset` | Replay multi-step recipe | `node_id` (int), `preset_name` (str), `mask_id`, `invert_mask` | Replays relative DAG steps; rolls back on failure. A supplied mask overrides the recipe's own selection on every step. |
 | `delete_node` | Queue node deletion | `node_id` (int) | **Non-destructive**: Queues a `pending` confirmation action. |
 | `delete_photo` | Queue image deletion | `image_id` (int) | **Non-destructive**: Queues a `pending` confirmation action. |
 
-### 3.4. Safety Guardrails & Robustness Mechanisms
+### 4.4. Safety Guardrails & Robustness Mechanisms
 
 1. **Two-Phase Commit for Destructive Operations**:
    - `delete_node` and `delete_photo` never execute deletions directly.
@@ -287,15 +351,19 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
 2. **Confidence-Gated Hallucination Prevention**:
    - CLIP similarity search computes cosine scores against the library. When query matches fall below `STRONG_MATCH = 0.275`, the tool output injects an explicit system directive:
      > *"NOTE: none of these is a confident match... Do NOT edit any of them. Say what the closest photos are and ask which one they meant."*
-   - Placing the refusal directive directly inside the tool result ensures the model adheres to it consistently.
+   - Placing the refusal directive directly inside the tool result ensures the model adheres to it consistently; stated only in the system prompt, it lost to the model's enthusiasm.
+   - The same pattern is applied a second time in `select_object`: below `MATCH_FLOOR = 0.30` no mask is created and the result itself instructs the model not to edit. Both floors exist because a ranking function returns a best answer whether or not a good one exists.
 
-3. **Explicit Handling of Selections**:
-   - LLMs cannot inspect pixel coordinates or interactively click objects.
-   - The system prompt explicitly instructs the agent that selections are unavailable to tools. When asked to "blur the background", the agent applies the effect to the full frame and clearly informs the user that they can restrict the effect using the UI selection picker.
+3. **Names, Not Coordinates**:
+   - An LLM cannot inspect pixel coordinates or click an object, so the agent is given no tool that accepts a position. What it can do is *name* a subject: `select_object` runs the same text-prompted search the UI's **Find** box runs, freezes the result into a saved mask, and hands back only a `mask_id`.
+   - Every id the model then passes is re-validated against the target image by `main._check_selection`, so a fabricated or foreign id is rejected as a 400 rather than silently applying the wrong stencil. "Blur the background" is expressed as that mask plus `invert_mask`.
+   - Two asymmetries against the browser are deliberate. The mask is banked inside the tool rather than deferred to Apply, because a tool call happens once and its result must be a durable handle, whereas a live click selection would otherwise be re-banked on every Apply. And it is named after the user's words, since a `mask_id` is all the model ever sees while the person has a thumbnail in the mask strip.
+   - An object that cannot be named — a corner, a spot, one of several identical items — remains a whole-frame edit, and the system prompt requires the agent to say so plainly and point at the manual picker.
 
 4. **Asynchronous Model Download Gates**:
-   - If the agent invokes an effect requiring unloaded weights (e.g., Bokeh or semantic text search), the server returns a 409 status and triggers the background download job (`depth_job.start()` or `text_job.start()`).
+   - If the agent invokes a capability requiring unloaded weights, the server returns a 409 status and the tool triggers the corresponding background download job: `depth_job.start()` for Bokeh, `text_job.start()` for semantic library search, `clipseg_job.start()` for naming an object.
    - The agent catches this, informs the user of the active download percentage, and prompts them to try again shortly, avoiding hung requests.
+   - This preserves the invariant that weights are fetched only by the gesture that needs them — an agent search *is* someone searching, and an agent naming an object is someone naming one.
 
 5. **Stateless Backend with Client-Side Conversation History**:
    - The server maintains no conversational session state.
@@ -314,14 +382,15 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
 
 ---
 
-## 4. Summary Table of Endpoints & Component Mapping
+## 5. Summary Table of Endpoints & Component Mapping
 
 | Subsystem | Primary Server Files | Primary Frontend Functions | Core Endpoints |
 | :--- | :--- | :--- | :--- |
 | **DAG Work Tree** | `server/main.py`, `server/db.py`, `server/rendering.py` | `selectImage()`, `layoutGraph()`, `renderTree()` | `GET/POST /api/images/{id}/nodes`<br>`PATCH/DELETE /api/nodes/{id}`<br>`GET /api/nodes/{id}/render` |
 | **Effects Engine** | `server/effects.py`, `server/rendering.py` | `buildParamControls()`, `readParams()`, `setEffect()` | `GET /api/effects`<br>`POST /api/nodes/{id}/preview`<br>`GET /api/nodes/{id}/histogram` |
 | **Bokeh & Depth** | `server/effects.py`, `server/depth.py`, `server/depth_job.py` | `buildDepthPick()`, `syncParamVisibility()` | `GET /api/nodes/{id}/depth-at`<br>`POST/GET /api/depth-model/prepare` |
-| **Segmentation** | `server/sam.py`, `server/rendering.py` | `bankSelection()`, `renderSelectControls()` | `POST /api/nodes/{id}/mask`<br>`GET/POST/DELETE /api/images/{id}/masks` |
+| **Segmentation** | `server/sam.py`, `server/rendering.py` | `bankSelection()`, `renderSelectControls()`, `appendSelectionControls()` | `POST /api/nodes/{id}/mask`<br>`GET/POST/DELETE /api/images/{id}/masks` |
+| **Text-Prompted Selection** | `server/clipseg.py`, `server/clipseg_job.py`, `server/sam.py`, `server/text_embed.py` | `findObject()`, `prepareSelectModel()` | `POST /api/nodes/{id}/select-text`<br>`POST/GET /api/select-model/prepare` |
 | **Presets** | `server/main.py`, `server/db.py` | `openPresetModal()`, `applyPreset()` | `GET/POST/DELETE /api/presets`<br>`POST /api/nodes/{id}/apply-preset` |
 | **Output Framing** | `server/effects.py`, `server/rendering.py` | `initCropOverlay()`, `saveCrop()` | `PUT /api/images/{id}/crop`<br>`POST /api/images/{id}/crop-preview` |
 | **3D Image Map** | `server/embed.py`, `server/text_embed.py`, `server/labels.py` | `openEmbedMap()`, `drawEmbedMap()` | `GET /api/embedding-map`<br>`GET /api/embedding-map/search`<br>`POST/GET /api/embedding-map/prepare` |
