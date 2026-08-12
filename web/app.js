@@ -2150,6 +2150,54 @@ function selSummary(sel) {
   return pts.length === 1 ? `@ ${pts[0].x}, ${pts[0].y}` : `${pts.length} points`;
 }
 
+// Latched for prepareDepthModel()'s reason: the round trip happens once a
+// session rather than on every Find.
+let selectReady = false;
+
+// Fetch the model behind "name an object", reporting progress through `say`.
+//
+// Unlike prepareDepthModel() this reports into the caller's own line rather
+// than #preview-status: the control that waits for this is built into the edit
+// modal too, where that status line is not on screen. It returns whether the
+// model is usable, so the caller decides what not to do — falling through to
+// the request would 409 and say something less useful than the reason.
+//
+// That is also why this needs none of prepareDepthModel()'s staleness guard:
+// its line is shared, so a poll that outlives its reason overwrites something
+// else's message, where `say` here writes into one control's own span and a
+// rebuild simply detaches it.
+async function prepareSelectModel(say) {
+  if (selectReady) return true;
+  try {
+    let job = await api("/api/select-model/prepare", { method: "POST" });
+    while (job.state === "running") {
+      say(selectJobText(job));
+      await new Promise((done) => setTimeout(done, EMBED_POLL_MS));
+      job = await api("/api/select-model/progress");
+    }
+    if (!job.ready) throw new Error(job.error || "not available");
+  } catch (err) {
+    // Reported and not retried, for runEmbedSearch()'s reason: falling through
+    // would repeat the whole download to reach the same error.
+    say(`Could not load the object model: ${err.message}`);
+    return false;
+  }
+  selectReady = true;
+  return true;
+}
+
+// One phase and one unit, like textJobText() and depthJobText() — and separate
+// from both for their reason, that naming the model is most of what the
+// sentence is for.
+function selectJobText(job) {
+  if (job.phase === "download") {
+    const mb = (bytes) => Math.round(bytes / 1e6);
+    const of = job.total ? ` of ${mb(job.total)}` : ""; // no Content-Length
+    return `Downloading the object model — ${mb(job.done)}${of} MB (first use only)`;
+  }
+  return "Loading the object model…";
+}
+
 // The appendBlendTarget analogue for selections: any effect can be masked, so
 // like blend's target this is not a registry param. The state lives in `store`
 // — `state.selection` for the Apply panel, `edit.selection` for the modal — so
@@ -2192,6 +2240,27 @@ function appendSelectionControls(
   pickRow.className = "sel-row";
   pickRow.append(pick, clear);
 
+  // The other way to say which object: name it. A typed query resolves on the
+  // server to the point a click would have made, so everything below this line
+  // — the level, invert, Save, the overlay — cannot tell the two apart, and
+  // this needs no state of its own beyond the words in the box.
+  const query = document.createElement("input");
+  query.type = "text";
+  query.className = "sel-text";
+  query.placeholder = "or name an object…";
+  const find = document.createElement("button");
+  find.type = "button";
+  find.className = "sel-find";
+  find.textContent = "Find";
+  const findRow = document.createElement("div");
+  findRow.className = "sel-row";
+  findRow.append(query, find);
+  // What the search found, in words: the outline says *where*, this says how
+  // sure. Inline rather than an alert, which would block a control you press
+  // repeatedly, and empty most of the time — `:empty` hides it.
+  const note = document.createElement("span");
+  note.className = "sel-note";
+
   const level = document.createElement("select");
   level.className = "sel-level";
   for (const name of ["auto", "whole", "part", "subpart"]) {
@@ -2209,7 +2278,7 @@ function appendSelectionControls(
   optRow.className = "sel-row";
   optRow.append(level, invertLabel);
 
-  row.append(coords, pickRow, optRow);
+  row.append(coords, pickRow, findRow, optRow);
 
   // Save, then the saved objects themselves — the order the workflow runs in:
   // pick an object, use it (which banks it), repeat, then tick the ones this
@@ -2219,6 +2288,10 @@ function appendSelectionControls(
   save.className = "sel-save-mask";
   save.textContent = "Save selection";
   if (allowManage) row.appendChild(save);
+  // after the controls and before the strip: in the bar the note takes a line
+  // of its own, and putting it here keeps Save on the line with the pickers
+  // rather than pushed below a sentence.
+  row.appendChild(note);
 
   const list = document.createElement("ul");
   list.className = "sel-mask-list";
@@ -2227,6 +2300,8 @@ function appendSelectionControls(
 
   const current = () => store.value;
   const commit = (sel) => {
+    // every path through here supersedes whatever the last search reported
+    note.textContent = "";
     store.value = sel;
     store.nodeId = sel ? sourceNodeId : null;
     store.imageId = sel ? state.imageId : null;
@@ -2303,11 +2378,62 @@ function appendSelectionControls(
     rows.push({ mask, li, box });
   }
 
+  // The typed counterpart of the pick closure below, and it commits the same
+  // shape: a point and a level, which is all a click ever produced either.
+  //
+  // `prepareSelectModel` runs first rather than after a 409, the way
+  // runEmbedSearch() calls the text model's prepare before searching — the
+  // server answers `done` synchronously once the files are there, so this is one
+  // extra request on the first Find of a session and none after it.
+  let finding = false;
+  async function findObject() {
+    const text = query.value.trim();
+    if (!text || finding || sourceNodeId === null) return;
+    finding = true;
+    render(current()); // the row goes busy the same way it comes back
+    const say = (message) => (note.textContent = message);
+    try {
+      say(`Looking for “${text}”…`);
+      if (!(await prepareSelectModel(say))) return;
+      const found = await api(`/api/nodes/${sourceNodeId}/select-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: text }),
+      });
+      // The server's level rather than the dropdown's, which `render()` then
+      // pushes into the control: it was chosen to match how much of the frame
+      // the phrase covers, and that is the whole of how "the sky" and "a cloud"
+      // end up as different selections from the same kind of click.
+      commit({
+        points: [{ x: found.x, y: found.y, level: found.level }],
+        invert: invert.checked,
+      });
+      const covers = `${(found.coverage * 100).toFixed(1)}% of the frame`;
+      say(
+        found.confident
+          ? `Found “${text}” — ${covers}.`
+          : `Weak match for “${text}” — ${covers}. Check the outline.`
+      );
+    } catch (err) {
+      say(`Could not find that: ${err.message}`);
+    } finally {
+      // A repaint, not two assignments: `commit()` above re-rendered the whole
+      // control while this was still running, so the row is currently painted
+      // busy and only running it again with the flag down puts it back.
+      finding = false;
+      render(current());
+    }
+  }
+
   function render(sel) {
     const points = selPoints(sel);
     coords.textContent = selSummary(sel);
     pick.textContent = points.length ? "Re-pick object" : "Select object";
     pick.disabled = !allowPick;
+    // Naming an object needs no click on the picture, so unlike the picker this
+    // stays live in the edit modal — showModal() making the image inert is the
+    // whole of why that one is disabled there.
+    query.disabled = find.disabled = finding || sourceNodeId === null;
     // a frozen mask has no candidate masks left to re-rank
     level.value = points.length === 1 ? points[0].level : "auto";
     level.disabled = points.length !== 1;
@@ -2349,6 +2475,15 @@ function appendSelectionControls(
       $("preview-wrap").classList.add("picking");
     };
   }
+  find.onclick = findObject;
+  query.onkeydown = (event) => {
+    // Enter is the gesture the box invites; there is no form to submit, so
+    // nothing else would happen to it.
+    if (event.key === "Enter") {
+      event.preventDefault();
+      findObject();
+    }
+  };
   level.onchange = () => {
     const pts = selPoints(current());
     if (pts.length === 1) {

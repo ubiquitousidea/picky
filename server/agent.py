@@ -16,10 +16,13 @@ this file the second place an effect has to be declared.
 
 Two things are deliberately narrower than the UI:
 
-- **No selections.** A click selection is a pixel coordinate the model cannot
-  see, and banking one into a saved mask is the frontend's job by design (see
-  `bankSelection` in CLAUDE.md) — so "blur the background" becomes a whole-frame
-  blur, and the system prompt makes the model say so rather than pretend.
+- **No coordinates.** A click selection is a pixel the model cannot see, and
+  banking one into a saved mask is the frontend's job by design (see
+  `bankSelection` in CLAUDE.md). What the model *can* do is name an object:
+  `select_object` runs the same text search the Select control's box runs and
+  freezes the result into a saved mask, so the model passes a `mask_id` around
+  and never a position. An object it cannot name is still a whole-frame edit,
+  and the system prompt makes it say so rather than pretend.
 - **Deleting proposes, it does not act.** `delete_node`/`delete_photo` describe
   what would go and hand a `pending` action back to the browser, which runs the
   ordinary DELETE after the user presses a button. A misread sentence should not
@@ -37,7 +40,7 @@ import anthropic
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
-from . import db, depth_job, text_job
+from . import clipseg_job, db, depth_job, text_job
 from .effects import effect_specs
 
 # Haiku by choice: these turns are a handful of tool calls and a sentence, and
@@ -162,11 +165,15 @@ actually stored — report those, not the ones you asked for.
 - Omitted parameters take their default. When editing a node, name only the \
 parameter you are changing; the rest are kept.
 - `blend` mixes two nodes of the same photo and needs `second_node_id`.
-- Effects apply to the whole frame. You cannot select an object, a background or \
-a region — that needs a click on the picture, which only the person can do. If \
-they ask for "blur the background", apply the effect to the whole frame and tell \
-them plainly that you blurred everything, and that they can use the Select \
-control to limit it to an object.
+- Effects apply to the whole frame unless you pass a `mask_id`. To limit one to \
+an object, call `select_object` with a plain name for it — "the dog", "the sky" \
+— and pass the `mask_id` it returns to `apply_effect`. For "blur the \
+background", select the subject and pass `invert_mask`.
+- `select_object` finds one thing, the best match, and it only knows what a \
+photo *looks* like. If it comes back unsure, say what it found and ask, rather \
+than editing. If the thing cannot be named — a corner, a spot, one of several \
+identical objects — apply to the whole frame and say plainly that you did, and \
+that they can click it themselves with the Select control.
 - Deleting is not something you do. The delete tools only describe what would \
 go; the person confirms with a button. Stop and say what you queued.
 
@@ -271,6 +278,38 @@ TOOLS = [
         },
     },
     {
+        "name": "select_object",
+        "description": (
+            "Find one named object in a photo and save it as a reusable mask, "
+            "so an effect can be limited to it. Pass the mask_id this returns "
+            "to apply_effect or apply_preset.\n\n"
+            "Name the thing in plain words — 'the dog', 'the sky', 'the red "
+            "car'. It finds the single best match, not every one of them, and "
+            "it goes by what the photo looks like: `confident` is false when "
+            "nothing in the picture really matches, and then the mask is *not* "
+            "saved. Do not retry the same words twice — say what happened."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_id": {"type": "integer"},
+                "node_id": {
+                    "type": "integer",
+                    "description": (
+                        "The version to find it in — normally the same one you "
+                        "are about to apply the effect to. Defaults to the "
+                        "unedited original."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What the object is, in plain words.",
+                },
+            },
+            "required": ["image_id", "description"],
+        },
+    },
+    {
         "name": "apply_effect",
         "description": (
             "Apply an effect to a version of a photo, creating a new version "
@@ -297,6 +336,21 @@ TOOLS = [
                 "second_node_id": {
                     "type": "integer",
                     "description": "For blend only: the other version to mix in.",
+                },
+                "mask_id": {
+                    "type": "integer",
+                    "description": (
+                        "Limit the effect to a saved object, from select_object. "
+                        "Omit to change the whole frame."
+                    ),
+                },
+                "invert_mask": {
+                    "type": "boolean",
+                    "description": (
+                        "With mask_id: change everything *except* that object. "
+                        "This is how 'blur the background' is done — select the "
+                        "subject, then invert."
+                    ),
                 },
             },
             "required": ["image_id", "node_id", "effect"],
@@ -335,6 +389,14 @@ TOOLS = [
             "properties": {
                 "node_id": {"type": "integer"},
                 "preset_name": {"type": "string"},
+                "mask_id": {
+                    "type": "integer",
+                    "description": (
+                        "Limit every step of the chain to a saved object, from "
+                        "select_object. Omit to replay it over the whole frame."
+                    ),
+                },
+                "invert_mask": {"type": "boolean"},
             },
             "required": ["node_id", "preset_name"],
         },
@@ -542,6 +604,122 @@ def _list_photo_nodes(args: dict, turn: _Turn) -> tuple[str, str]:
     return json.dumps(nodes), f"listed {len(nodes)} version(s)"
 
 
+def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
+    """Name an object, and get back a saved mask to aim an effect with.
+
+    Two of the app's own endpoints back to back, and neither is reimplemented
+    here: `main.select_text` is what the Select control's text box posts to, and
+    `main.create_mask` is what the browser posts to when it banks a selection.
+    So a mask the model made is a mask in every way — it appears in
+    the strip, it can be reused by hand, and deleting it is guarded by the same
+    409 as any other.
+
+    The mask is saved *here*, unlike in the browser, where banking waits for the
+    Apply that uses it (`bankSelection`). The reason that rule exists is that a
+    click selection is live in the panel and would be banked again on every
+    Apply; a tool call happens once and its result has to be a durable name for
+    an object, because a `mask_id` is the only handle the model gets.
+    """
+    from . import main
+
+    image_id = int(args["image_id"])
+    description = str(args.get("description") or "").strip()
+    if not description:
+        raise _ToolError("description must not be empty")
+    node = _node_of(image_id, args.get("node_id"))
+
+    try:
+        found = main.select_text(node["id"], main.SelectTextRequest(query=description))
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            # Naming an object is the one gesture that fetches this model, and
+            # this is that gesture — start it and say so, rather than holding the
+            # request open for a 139 MB download.
+            job = clipseg_job.start()
+            pct = int(100 * job["done"] / job["total"]) if job.get("total") else 0
+            raise _ToolError(
+                f"finding objects by name needs a model that is still downloading "
+                f"({pct}% done). Tell them to try again shortly."
+            )
+        raise _ToolError(str(exc.detail))
+
+    if not found["confident"]:
+        # Nothing is saved and nothing is selected. Said in the result rather
+        # than the system prompt for `_find_photos`' reason — a rule about
+        # restraint loses to the model's enthusiasm wherever it is not the very
+        # thing the model just read.
+        return (
+            json.dumps(
+                {
+                    "found": False,
+                    "score": found["score"],
+                    "best_guess_covers": found["coverage"],
+                }
+            ),
+            f"no confident match for “{description}”",
+        )
+
+    spec = {
+        "points": [{"x": found["x"], "y": found["y"], "level": found["level"]}],
+        "invert": False,
+    }
+    # The description is the name, because a mask the model made is one the
+    # person has to recognise in a strip of thumbnails. Names are unique per
+    # image and `create_mask` takes a given one literally, so collisions are
+    # numbered here — `_auto_mask_name`'s arrangement, one caller along.
+    name = description[:60]
+    for attempt in range(1, 6):
+        try:
+            mask = main.create_mask(
+                image_id,
+                main.MaskCreate(
+                    name=name if attempt == 1 else f"{name} {attempt}",
+                    node_id=node["id"],
+                    selection=spec,
+                ),
+            )
+            break
+        except HTTPException as exc:
+            if exc.status_code != 409 or attempt == 5:
+                raise _ToolError(str(exc.detail))
+    else:  # unreachable: every pass either breaks or raises. Belt to that brace.
+        raise _ToolError(f"could not name a mask after '{name}'")
+
+    # Last write wins, so an apply_effect after this moves it on again. Set here
+    # so that selecting *without* editing still puts the photo on screen — and
+    # because the browser re-fetches the image's masks on the way, which is what
+    # makes the new object appear in the strip.
+    turn.focus = {"image_id": image_id, "node_id": node["id"]}
+    return (
+        json.dumps(
+            {
+                "found": True,
+                "mask_id": mask["id"],
+                "name": mask["name"],
+                # Two numbers that answer different questions: how sure the
+                # model is the thing is there, and how much of the frame the
+                # selection actually covers.
+                "score": found["score"],
+                "covers": found["coverage"],
+            }
+        ),
+        f"selected “{mask['name']}” · {round(found['coverage'] * 100)}% of the frame",
+    )
+
+
+def _mask_selection(args: dict) -> dict | None:
+    """The `mask_id`/`invert_mask` pair as a selection, or None for whole-frame.
+
+    Not validated here: it goes into the same `NodeCreate`/`PresetApply` the
+    browser builds, and `main._check_selection` is what refuses a mask belonging
+    to another photo. A model cannot invent an id that survives that.
+    """
+    mask_id = args.get("mask_id")
+    if mask_id is None:
+        return None
+    return {"masks": [int(mask_id)], "invert": bool(args.get("invert_mask"))}
+
+
 def _apply_effect(args: dict, turn: _Turn) -> tuple[str, str]:
     from . import main
 
@@ -560,6 +738,7 @@ def _apply_effect(args: dict, turn: _Turn) -> tuple[str, str]:
                 parent2_id=args.get("second_node_id"),
                 effect=effect,
                 params=params,
+                selection=_mask_selection(args),
             ),
         )
     except HTTPException as exc:
@@ -576,6 +755,7 @@ def _apply_effect(args: dict, turn: _Turn) -> tuple[str, str]:
         raise _ToolError(str(exc.detail))
 
     turn.focus = {"image_id": image_id, "node_id": node["id"]}
+    where = _mask_where(node["selection"])
     return (
         json.dumps(
             {
@@ -585,10 +765,26 @@ def _apply_effect(args: dict, turn: _Turn) -> tuple[str, str]:
                 # silently, so this is the only place the difference between what
                 # was asked for and what happened is visible.
                 "params_stored": node["params"],
+                "applied_to": where or "the whole frame",
             }
         ),
-        f"applied {effect} {_terse(node['params'])}",
+        f"applied {effect} {_terse(node['params'])}" + (f" · {where}" if where else ""),
     )
+
+
+def _mask_where(selection: dict | None) -> str:
+    """A stored selection as the phrase the transcript prints, or "" for none.
+
+    Read back off the created node rather than off the tool's arguments, so what
+    it says is what was stored — the same reason `params_stored` is reported and
+    not the params that were asked for.
+    """
+    ids = (selection or {}).get("masks") or []
+    if not ids:
+        return ""
+    names = [db.get_mask(mask_id) for mask_id in ids]
+    named = ", ".join(m["name"] if m else f"mask #{i}" for i, m in zip(ids, names))
+    return f"everything except {named}" if selection["invert"] else named
 
 
 def _edit_node(args: dict, turn: _Turn) -> tuple[str, str]:
@@ -664,8 +860,11 @@ def _apply_preset(args: dict, turn: _Turn) -> tuple[str, str]:
     node = db.get_node(node_id)
     if node is None:
         raise _ToolError(f"there is no version with node_id {node_id}")
+    selection = _mask_selection(args)
     try:
-        result = main.apply_preset(node_id, main.PresetApply(preset_id=preset["id"]))
+        result = main.apply_preset(
+            node_id, main.PresetApply(preset_id=preset["id"], selection=selection)
+        )
     except HTTPException as exc:
         raise _ToolError(str(exc.detail))
 
@@ -673,15 +872,20 @@ def _apply_preset(args: dict, turn: _Turn) -> tuple[str, str]:
         "image_id": node["image_id"],
         "node_id": result["terminal_node_id"],
     }
+    # An apply-time selection replaces the recipe's own for every step, which is
+    # exactly what the tool promises, so this is read off what was sent.
+    where = _mask_where(selection)
     return (
         json.dumps(
             {
                 "preset": preset["name"],
                 "node_id": result["terminal_node_id"],
                 "versions_added": len(result["created"]),
+                "applied_to": where or "the whole frame",
             }
         ),
-        f"applied preset “{preset['name']}” · {len(result['created'])} step(s)",
+        f"applied preset “{preset['name']}” · {len(result['created'])} step(s)"
+        + (f" · {where}" if where else ""),
     )
 
 
@@ -731,6 +935,7 @@ HANDLERS = {
     "find_photos": _find_photos,
     "show_photo": _show_photo,
     "list_photo_nodes": _list_photo_nodes,
+    "select_object": _select_object,
     "apply_effect": _apply_effect,
     "edit_node": _edit_node,
     "list_presets": _list_presets,

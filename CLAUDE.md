@@ -164,6 +164,15 @@ one place silently breaks another.
   result. Older spellings still on disk **upgrade on read** in `db.node_dict`
   (via `effects.validate_selection`), so exactly one shape ever leaves the
   database; nothing migrates them in place.
+- **Naming an object produces a click, not a third shape.** `POST
+  /api/nodes/{id}/select-text` answers with the `{x, y, level}` a person would
+  have picked (`rendering.locate_object` → `clipseg.locate` for the place,
+  `sam.level_for_area` for which candidate mask at it), and the frontend commits
+  that as an ordinary points selection. So nothing downstream — the overlay,
+  banking, presets, `_portable_selection` — can tell a sentence from a finger,
+  and no CLIPSeg pixel is ever stored or displayed. What makes the point
+  re-decode to the mask that was measured is that `sam.level_for_area` and
+  `decode_mask` rank candidates through one `_ranked`.
 - **A click selection is banked into a saved mask by the frontend**
   (`bankSelection()`, called from `applyEffect`/`applyPreset`), not by
   `create_node`. From the server the store would still hold the points, so every
@@ -263,22 +272,41 @@ one place silently breaks another.
   most sessions never type in the box, so `text_job.py` is triggered by the
   search box alone — never by opening the map — and `/api/embedding-map/search`
   409s instead of fetching a quarter-gigabyte inside a GET.
-- **Three ONNX models, three different normalizations.** SAM's constants are
+- **Four ONNX models, three different normalizations.** SAM's constants are
   applied to 0-255 pixels, CLIP's to 0-1 floats, and `depth.py`'s are plain
-  ImageNet over 0-1 floats. Crossing them yields output that still looks like
-  output — a plausible depth map, a well-spread vector — and nothing downstream
-  can detect it. `sam.py` owns `MODELS_DIR` and `download_model`; `embed.py`
-  and `depth.py` both borrow them rather than re-deriving the pinned-revision
-  and atomic-write contract.
-- **`server/embed_job.py` is only ever an optimization; `server/text_job.py`
-  and `server/depth_job.py` are not.** `GET /api/embedding-map` still embeds
-  whatever it finds missing, so the map is correct if nobody prepared, if the
-  job died, or if both run at once — keep it that way, a prepare the map
-  *required* would be a second source of truth. Search and bokeh have no such
-  fallback by choice (see above), which is exactly why the three are separate
-  modules rather than phases of one: each is triggered by the one gesture that
-  needs it — opening the map, typing a query, lighting the Bokeh button — so
-  nobody pays for a model they never use.
+  ImageNet over 0-1 floats — which `clipseg.py`'s also are, numerically, and
+  are still written out there rather than imported: two checkpoints agreeing on
+  their preprocessing is a coincidence, and sharing the array would make
+  re-pinning either one a silent change to the other. Crossing them yields
+  output that still looks like output — a plausible depth map, a well-spread
+  vector — and nothing downstream can detect it. `sam.py` owns `MODELS_DIR` and
+  `download_model`; `embed.py`, `depth.py` and `clipseg.py` all borrow them
+  rather than re-deriving the pinned-revision and atomic-write contract.
+- **`clipseg.py` answers with a *location*, and SAM still draws every
+  boundary.** Its 352×352 map is too coarse to be a mask, so `locate` reduces it
+  to a point and a size — which is also what keeps "select by name" from being
+  a second kind of selection (see above). The query is run under `TEMPLATES` in
+  one batch and reduced by a pixelwise **max**, where `text_embed.encode_terms`
+  averages: there the templates are unit vectors whose mean is the concept, here
+  they are independent per-pixel probabilities and a phrasing that fails
+  contributes zeros. The max is why "the person" and "a person" now find the
+  same subject, and it invents nothing, because an absent subject is missed by
+  all four.
+- **`server/embed_job.py` is only ever an optimization; `server/text_job.py`,
+  `server/depth_job.py` and `server/clipseg_job.py` are not.** `GET
+  /api/embedding-map` still embeds whatever it finds missing, so the map is
+  correct if nobody prepared, if the job died, or if both run at once — keep it
+  that way, a prepare the map *required* would be a second source of truth.
+  Search, bokeh and naming an object have no such fallback by choice (see
+  above), which is exactly why the four are separate modules rather than phases
+  of one: each is triggered by the one gesture that needs it — opening the map,
+  typing a query, lighting the Bokeh button, pressing Find or calling
+  `select_object` — so nobody pays for a model they never use. The one thing
+  two of them share is CLIP's tokenizer files, which is why
+  `text_embed.ensure_tokenizer()` is separable from its 254 MB tower:
+  `clipseg.py` needs the vocabulary and none of the graph, and the alternative
+  would be a second copy of CLIP's merge table on disk and a second module
+  owning "the tokenizer".
 - **Schema changes migrate in place** in `db.init()` (PRAGMA table_info check +
   ALTER TABLE) — a new *column* only, since that is the one thing `SCHEMA`'s
   `CREATE TABLE IF NOT EXISTS` cannot add to a table that already exists. A new
@@ -314,10 +342,19 @@ one place silently breaks another.
   calls the ordinary `DELETE` itself (`renderAgentPending`). The agent never
   holds that trigger — the manual path already asks (`deleteNode`'s `confirm()`),
   and a misread sentence must not be able to destroy work.
-- **Selections are out of reach on purpose**, so "blur the background" is a
-  whole-frame blur the model is told to own up to. A click selection is a pixel
-  coordinate the model cannot see, and banking one into a mask is the frontend's
-  job by design — see `bankSelection`, above.
+- **Coordinates are out of reach, names are not.** A click is a pixel the model
+  cannot see, so `select_object` is the whole of its access to selections: it
+  runs the same `select-text` search the Select control's box runs and freezes
+  the result through `main.create_mask`, so the model passes a `mask_id` to
+  `apply_effect`/`apply_preset` and never a position — and `_check_selection`
+  refuses an id belonging to another photo, so it cannot invent one either.
+  "Blur the background" is that mask plus `invert_mask`. Two asymmetries with
+  the browser are deliberate: the mask is banked *here* rather than at Apply
+  (`bankSelection` exists because a live click selection would be re-banked on
+  every Apply; a tool call happens once and its result must be a durable
+  handle), and it is named after the words, because a `mask_id` is all the model
+  gets while the person has a thumbnail. An object that cannot be named is still
+  a whole-frame edit the model is told to own up to.
 - **The wire log is read off the request, not written beside it.** `run_turn`
   builds one `request` dict and calls `client.messages.create(**request)`, so
   the Wire dialog cannot show a request that was not sent; the per-round
@@ -332,10 +369,17 @@ one place silently breaks another.
   each turn: the Messages API is stateless and the app has no sessions. It is
   trimmed in `agent._trim` on a boundary the API accepts — a `tool_result` turn
   cannot lead, so a blind tail slice is a 400.
-- Two model gates ride along: `find_photos` starts `text_job` and `apply_effect`
-  starts `depth_job` on a 409, each returning "still downloading" rather than
-  holding a request open. That keeps "the tower is fetched only when someone
-  searches" true — an agent search *is* someone searching.
+- Three model gates ride along: `find_photos` starts `text_job`, `apply_effect`
+  starts `depth_job` and `select_object` starts `clipseg_job` on a 409, each
+  returning "still downloading" rather than holding a request open. That keeps
+  "the tower is fetched only when someone searches" true — an agent search *is*
+  someone searching, and an agent naming an object is someone naming one.
+- **Refusal below `clipseg.MATCH_FLOOR` is the tool's, not the endpoint's.**
+  The browser hands back a weak match anyway, because the outline appears next
+  to the words and the person can judge it in a glance; `select_object` banks
+  nothing and says so, for the reason `_find_photos` puts its directive in the
+  result — the model cannot see the picture, and a rule about restraint that
+  lives only in the system prompt loses to its enthusiasm.
 
 ### Frontend
 
@@ -365,6 +409,13 @@ one place silently breaks another.
   `nodeId` changes (their coords are in that node's pixel space), saved masks
   only when `imageId` does — which is what lets you stack masked effects on one
   object.
+- **The selection's text box arms nothing, which is why it works in the edit
+  modal.** The click picker is disabled there because `showModal()` makes the
+  image inert; naming an object never touches the image, so `allowPick: false`
+  does not reach it. Its one trap is the busy state: `findObject` sets `finding`
+  and repaints, and the `commit()` in the middle repaints *again* while the flag
+  is still up — so the row must come back through `render()` in a `finally`, not
+  by putting two `disabled` flags back by hand.
 - **One armed picker, and `selPicker.armed.owner` is the button holding it.**
   Two controls arm it — selecting an object and bokeh's Focus pick — so "press
   the lit button to cancel" has to mean the *lit* one, or taking the picker from

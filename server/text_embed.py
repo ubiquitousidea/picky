@@ -33,6 +33,14 @@ Two things here have no analogue in `embed.py` and are the ones to get right:
 - **The revision is pinned to the text half of the vision tower's checkpoint.**
   Two towers from different checkpoints are not in one space, and nothing
   downstream can detect it.
+
+This module also owns **the only tokenizer in the tree**, which is why
+`ensure_tokenizer()` is separable from `ensure_model()`: `clipseg.py` needs
+CLIP's byte-level BPE and none of this tower, and the alternative — letting it
+fetch a second copy of the vocabulary from its own repo — would put CLIP's
+merge table on disk twice and make "the tokenizer" a thing two modules own.
+The two files are 1.7 MB against the graph's 254 MB, so the split costs the
+search path nothing.
 """
 
 import functools
@@ -221,16 +229,22 @@ def ready() -> bool:
     return all(path.is_file() for path in model_paths().values())
 
 
-def ensure_model(on_progress=None) -> dict[str, Path]:
-    """The three files, downloading whichever are missing.
+def tokenizer_ready() -> bool:
+    """Is `tokenizer()` free right now? `ready()` asked of the small files only.
 
-    Public and separate from `_session` for `embed.ensure_model`'s reason: the
-    slow part has to be doable up front, off the request, with progress. Since
-    `download_model` only calls `on_progress` while bytes move, a caller learns
-    for free whether a download happened at all.
+    `clipseg.ready()`'s other half: that module needs CLIP's BPE and not this
+    graph, so it must be able to ask about the two without the answer depending
+    on the 254 MB one.
     """
     paths = model_paths()
-    for name, path in paths.items():
+    return all(paths[name].is_file() for name in _FILES if name != _MODEL_FILE)
+
+
+def _fetch(names, on_progress=None) -> dict[str, Path]:
+    """Download whichever of `names` are missing, in `_FILES` order."""
+    paths = model_paths()
+    for name in names:
+        path = paths[name]
         if path.is_file():
             continue
         if name == _MODEL_FILE and os.environ.get(_ENV_VAR):
@@ -241,9 +255,34 @@ def ensure_model(on_progress=None) -> dict[str, Path]:
     return paths
 
 
+def ensure_tokenizer(on_progress=None) -> dict[str, Path]:
+    """Just the vocabulary and the merge table — 1.7 MB, no tower.
+
+    Split out of `ensure_model` for `clipseg.py`, which tokenizes with CLIP's
+    BPE and never runs this graph: without the split, asking this module for a
+    tokenizer would download 254 MB of text tower that the caller has no use
+    for. Search still goes through `ensure_model`, which calls this first, so
+    nothing about that path changed.
+    """
+    return _fetch([name for name in _FILES if name != _MODEL_FILE], on_progress)
+
+
+def ensure_model(on_progress=None) -> dict[str, Path]:
+    """The three files, downloading whichever are missing.
+
+    Public and separate from `_session` for `embed.ensure_model`'s reason: the
+    slow part has to be doable up front, off the request, with progress. Since
+    `download_model` only calls `on_progress` while bytes move, a caller learns
+    for free whether a download happened at all.
+    """
+    return _fetch(list(_FILES), on_progress)
+
+
 @functools.lru_cache(maxsize=None)
 def tokenizer() -> ClipTokenizer:
-    paths = ensure_model()
+    # `ensure_tokenizer`, not `ensure_model`: the two small files are all this
+    # needs, and `clipseg.py` asks for a tokenizer without ever wanting a tower.
+    paths = ensure_tokenizer()
     return ClipTokenizer(paths["clip_vocab.json"], paths["clip_merges.txt"])
 
 

@@ -184,14 +184,16 @@ def compute_embedding(img: np.ndarray) -> np.ndarray:
     return embedding.astype(np.float32)
 
 
-def decode_mask(
-    embedding: np.ndarray, orig_h: int, orig_w: int, x: int, y: int, level: str
-) -> np.ndarray:
-    """Decode one click into a boolean (orig_h, orig_w) mask.
+def _candidates(
+    embedding: np.ndarray, orig_h: int, orig_w: int, x: int, y: int
+) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Every mask SAM offers for one click, plus its IoU scores if the export
+    emits them.
 
-    `level` picks among SAM's candidate masks: `auto` trusts the model's IoU
-    ranking; `whole`/`part`/`subpart` rank the multi-mask candidates by area
-    (SAM does not guarantee an ordering, so index order can't be trusted).
+    Split out of `decode_mask` so `level_for_area` can rank the same candidates
+    the same way without a second decoder run or a second copy of the coordinate
+    transform. Which one of these is *the* mask stays a caller's decision — that
+    is the whole of what a `level` is.
     """
     x = min(max(0, x), orig_w - 1)
     y = min(max(0, y), orig_h - 1)
@@ -227,17 +229,38 @@ def decode_mask(
     masks = next(o for o in outputs if o.ndim == 4)[0]
     scores = next((o for o in outputs if o.ndim == 2), None)
     binary = [_upscale(m, orig_h, orig_w, new_h, new_w) > 0.0 for m in masks]
+    return binary, scores
 
-    # the multi-mask granularities are candidates 1.. when the single-mask
-    # token is also present (official multi export returns 4 masks)
+
+def _ranked(binary: list[np.ndarray]) -> list[int]:
+    """The candidate indices worth offering, smallest area first.
+
+    The multi-mask granularities are candidates 1.. when the single-mask token
+    is also present (the official multi export returns 4 masks), and SAM
+    guarantees no ordering among them — so area is what `whole`/`part`/`subpart`
+    have ever meant, and both readers of this list rank by it.
+    """
+    first = 1 if len(binary) > 3 else 0
+    return sorted(range(first, len(binary)), key=lambda i: (int(binary[i].sum()), -i))
+
+
+def decode_mask(
+    embedding: np.ndarray, orig_h: int, orig_w: int, x: int, y: int, level: str
+) -> np.ndarray:
+    """Decode one click into a boolean (orig_h, orig_w) mask.
+
+    `level` picks among SAM's candidate masks: `auto` trusts the model's IoU
+    ranking; `whole`/`part`/`subpart` rank the multi-mask candidates by area
+    (SAM does not guarantee an ordering, so index order can't be trusted).
+    """
+    binary, scores = _candidates(embedding, orig_h, orig_w, x, y)
     first = 1 if len(binary) > 3 else 0
     if level == "auto" and scores is not None:
         # skip the single-mask token for the same reason the level picker does,
         # and as official SAM does whenever the multi-mask outputs are in play
         pick = first + int(np.argmax(scores[0][first:]))
     else:
-        candidates = list(range(first, len(binary)))
-        by_area = sorted(candidates, key=lambda i: (int(binary[i].sum()), -i))
+        by_area = _ranked(binary)
         if level == "subpart":
             pick = by_area[0]
         elif level == "part":
@@ -247,6 +270,33 @@ def decode_mask(
         else:  # auto without scores
             pick = by_area[-1]
     return binary[pick]
+
+
+def level_for_area(
+    embedding: np.ndarray, orig_h: int, orig_w: int, x: int, y: int, area: float
+) -> tuple[str, int]:
+    """The named level whose mask is closest in size to `area`, and its pixels.
+
+    What turns CLIPSeg's blob into a click: the heatmap knows roughly how much
+    of the frame the phrase covers, and that is exactly the question `level`
+    answers — a point on a face belongs to a face, a head and a person, and only
+    the size says which was meant.
+
+    Returns a level name and not a mask on purpose. The name is all a selection
+    stores, so re-decoding it later through `decode_mask` has to land on this
+    same candidate — which it does, because both go through `_ranked`.
+    """
+    binary, _ = _candidates(embedding, orig_h, orig_w, x, y)
+    by_area = _ranked(binary)
+    # subpart/part/whole are positions in this list, not indices into it: `part`
+    # is its median wherever the export puts three candidates or four.
+    named = {
+        "subpart": by_area[0],
+        "part": by_area[len(by_area) // 2],
+        "whole": by_area[-1],
+    }
+    best = min(named, key=lambda name: abs(int(binary[named[name]].sum()) - area))
+    return best, int(binary[named[best]].sum())
 
 
 def _upscale(logits: np.ndarray, orig_h: int, orig_w: int, new_h: int, new_w: int) -> np.ndarray:

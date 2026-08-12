@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from . import (
     agent,
+    clipseg,
+    clipseg_job,
     db,
     depth,
     depth_job,
@@ -72,6 +74,14 @@ class MaskRequest(BaseModel):
     mask: int | None = None
     invert: bool = False
     level: str = "auto"
+
+
+class SelectTextRequest(BaseModel):
+    """The words, and nothing else. What they resolve *against* is the node in
+    the path — the same node a click would have been made on, since the point
+    that comes back is in that node's pixel space."""
+
+    query: str
 
 
 class MaskCreate(BaseModel):
@@ -565,6 +575,27 @@ def text_model_progress():
     return text_job.snapshot()
 
 
+@app.post("/api/select-model/prepare")
+def prepare_select_model():
+    """Start fetching the text-prompted segmentation model, and report where it
+    already is.
+
+    The search box's arrangement again, one more door along: the frontend calls
+    this when someone names an object and the model is not there yet, and only
+    then. Naming an object is the one gesture that needs it, so nothing else may
+    trigger the 139 MB.
+    """
+    return clipseg_job.start()
+
+
+@app.get("/api/select-model/progress")
+def select_model_progress():
+    """Where the fetch from `prepare` got to. Safe to call at any time; a server
+    nobody has named an object on this run reports `idle` with `ready` already
+    true if an earlier run downloaded the files."""
+    return clipseg_job.snapshot()
+
+
 @app.post("/api/depth-model/prepare")
 def prepare_depth_model():
     """Start fetching the depth model, and report where it already is.
@@ -825,6 +856,39 @@ def get_mask(node_id: int, body: MaskRequest):
     except Exception as exc:
         raise HTTPException(500, f"segmentation failed: {exc}")
     return Response(content=data, media_type="image/png")
+
+
+@app.post("/api/nodes/{node_id}/select-text")
+def select_text(node_id: int, body: SelectTextRequest):
+    """Name an object instead of clicking one.
+
+    The click picker's counterpart, and deliberately not a third kind of
+    selection: this answers with the *point* a person would have clicked, so
+    what the caller does with it — post it back to `/mask`, apply an effect
+    through it, bank it into a saved mask — is the code that was already there.
+    A selection on disk cannot say whether a finger or a sentence produced it.
+
+    Refuses rather than downloading, for `search_embedding_map`'s reason: a
+    409 says the state is wrong rather than the server unwell, and it is the
+    caller's own `POST /api/select-model/prepare` that fixes it.
+
+    A low-scoring match is *not* a refusal — the point comes back with
+    `confident: false`, because the person can see the outline the moment it
+    lands and a query for something that is there but oddly worded deserves an
+    answer. `clipseg.MATCH_FLOOR` explains where the number comes from.
+    """
+    node = db.get_node(node_id)
+    if node is None:
+        raise HTTPException(404, "node not found")
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(400, "query must not be empty")
+    if not clipseg.ready():
+        raise HTTPException(409, "the object model is not downloaded yet")
+    try:
+        return rendering.locate_object(node_id, query)
+    except Exception as exc:
+        raise HTTPException(500, f"finding the object failed: {exc}")
 
 
 @app.get("/api/nodes/{node_id}/clusters")

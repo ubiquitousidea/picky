@@ -281,6 +281,11 @@ def mean_color(root_node_id: int) -> list[int]:
 
 # ---------- Click-to-segment (SAM) ----------
 
+# How much of a node's render `locate_object` decodes. Generous rather than 352:
+# libjpeg's DCT scaling only halves, so this is the smallest draft that leaves
+# any frame at least CLIPSeg's own input size in both directions.
+LOCATE_SAMPLE = 1024
+
 
 def embedding_path(node_id: int) -> Path:
     return db.RENDERS_DIR / f"{node_id}.embedding.npy"
@@ -352,6 +357,48 @@ def compute_mask(node_id: int | None, selection: dict) -> np.ndarray:
     if selection["invert"]:
         mask = ~mask
     return mask
+
+
+def locate_object(node_id: int, query: str) -> dict:
+    """Turn a phrase into the click a person would have made on this node.
+
+    The whole of "select by name", and deliberately nothing more: it returns a
+    point and a level, which is a `{points: [...]}` selection's entire content.
+    Everything after this — the overlay, banking into a saved mask, a preset
+    replaying it — cannot tell that a sentence rather than a finger produced it.
+
+    The decode is drafted down: `clipseg` squashes to 352 square whatever it is
+    given, so a full 40 MP decode would be thrown away, and `histogram` reads
+    its pixels the same way. `im.size` is read *before* the draft because the
+    point has to come back in the node's own pixel space — the space the
+    selection stores, and the space `sam` re-decodes it in.
+    """
+    from . import clipseg  # imported here so a broken/absent export costs only this
+
+    with Image.open(render_node(node_id)) as im:
+        w, h = im.size
+        im.draft("RGB", (LOCATE_SAMPLE, LOCATE_SAMPLE))
+        small = np.asarray(im.convert("RGB"))
+
+    found = clipseg.locate(small, query)
+    # draft() only ever *reduces*, and by a power of two, so this is a scale-up
+    # by a small integer factor and never a stretch.
+    sh, sw = small.shape[:2]
+    x = min(w - 1, round(found["x"] * w / sw))
+    y = min(h - 1, round(found["y"] * h / sh))
+
+    # The blob was measured on the drafted pixels; the candidates are the node's.
+    area = found["area"] * (w * h) / (sw * sh)
+    level, pixels = sam.level_for_area(node_embedding(node_id), h, w, x, y, area)
+    return {
+        "x": x,
+        "y": y,
+        "level": level,
+        "score": round(found["score"], 4),
+        # what the selection will actually cover, not what CLIPSeg guessed
+        "coverage": round(pixels / (w * h), 4),
+        "confident": found["confident"],
+    }
 
 
 # ---------- Saved masks (frozen pixels) ----------
@@ -547,9 +594,12 @@ def storage_stats() -> dict:
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
         "originals": _totals(db.ORIGINALS_DIR.iterdir()),
         "masks": _totals(db.MASKS_DIR.iterdir()),
-        # ONNX weights (MobileSAM, CLIP) — neither user data nor a cache: they
-        # re-download rather than rebuild. Reported because at ~378 MB they are
-        # the second-largest thing on disk and were previously invisible here.
+        # ONNX weights (MobileSAM, CLIP, depth, CLIPSeg) — neither user data nor
+        # a cache: they re-download rather than rebuild. Reported because at the
+        # better part of a gigabyte, once every feature that has a model behind
+        # it has been used, they are among the largest things on disk and were
+        # previously invisible here. Whatever is in the directory counts, so a
+        # fifth model needs no line of its own.
         "models": _totals(
             sam.MODELS_DIR.iterdir() if sam.MODELS_DIR.is_dir() else []
         ),
