@@ -355,6 +355,23 @@ one place silently breaks another.
   handle), and it is named after the words, because a `mask_id` is all the model
   gets while the person has a thumbnail. An object that cannot be named is still
   a whole-frame edit the model is told to own up to.
+- **A name buys a mask or a number, and bokeh's focus is the number.** `focus`
+  is a reading on one node's normalized depth, which is why the panel fills it
+  in with a picker rather than a typed value — so with `select_object` as the
+  only object-shaped tool, "focus on the cat" came out as bokeh masked to
+  everything *but* the cat. `measure_focus` is that picker with a phrase where
+  the click is: `main.select_text` for the point (shared with `select_object` as
+  `_locate`, so the two agree on what a name finds) and `main.get_depth_at` for
+  the value. It writes nothing — no mask, no node, not even `turn.focus`, since
+  nothing it does changes what is on screen — and its two 409s are two different
+  models, CLIPSeg to find the thing and the depth net to measure it. Below
+  `clipseg.MATCH_FLOOR` it returns no number at all rather than one sampled
+  where nothing was found.
+- **The model is shown each param's `label`** (`_param_line`), because a range
+  alone does not say which end is which — `focus: float 0.0..1.0` is silent on
+  the thing "Focus (1 = nearest)" says. The registry is still the only source
+  (`_effects_doc` ← `effect_specs()`), so this stays a rendering choice and not
+  a second vocabulary.
 - **The wire log is read off the request, not written beside it.** `run_turn`
   builds one `request` dict and calls `client.messages.create(**request)`, so
   the Wire dialog cannot show a request that was not sent; the per-round

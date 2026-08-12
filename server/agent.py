@@ -122,7 +122,13 @@ class _ToolError(Exception):
 
 
 def _param_line(p: dict) -> str:
-    """One param spec as a line the model can dial from."""
+    """One param spec as a line the model can dial from.
+
+    The `label` is carried through because a range alone does not say which end
+    of it is which: bokeh's `focus` is a number in 0..1 either way, and only
+    "Focus (1 = nearest)" says which way round. The panel has shown it all
+    along — the model was the one reader of `effect_specs()` not being told.
+    """
     kind = p["type"]
     if kind == "choice":
         detail = "one of " + ", ".join(p["options"])
@@ -130,7 +136,10 @@ def _param_line(p: dict) -> str:
         detail = f"list of [x, y] pairs, {p['min']}..{p['max']}, max {p['max_points']}"
     else:
         detail = f"{kind} {p['min']}..{p['max']}"
-    return f"    {p['name']}: {detail} (default {json.dumps(p['default'])})"
+    return (
+        f"    {p['name']}: {detail} (default {json.dumps(p['default'])})"
+        f" — {p['label']}"
+    )
 
 
 def _effects_doc() -> str:
@@ -169,6 +178,12 @@ parameter you are changing; the rest are kept.
 an object, call `select_object` with a plain name for it — "the dog", "the sky" \
 — and pass the `mask_id` it returns to `apply_effect`. For "blur the \
 background", select the subject and pass `invert_mask`.
+- Naming an object is not always a mask. A mask says *where* an effect lands; \
+bokeh's `focus` says *how far away* the sharp plane is, and it is a reading off \
+that node's depth, not a place. To put a named thing in focus, call \
+`measure_focus` and pass the number it returns as bokeh's `focus` — no \
+`mask_id`, no `invert_mask`. Masking bokeh to a subject is a different edit, \
+and inverting one is not "focus on it" at all.
 - `select_object` finds one thing, the best match, and it only knows what a \
 photo *looks* like. If it comes back unsure, say what it found and ask, rather \
 than editing. If the thing cannot be named — a corner, a spot, one of several \
@@ -304,6 +319,39 @@ TOOLS = [
                 "description": {
                     "type": "string",
                     "description": "What the object is, in plain words.",
+                },
+            },
+            "required": ["image_id", "description"],
+        },
+    },
+    {
+        "name": "measure_focus",
+        "description": (
+            "Read bokeh's `focus` value off a named object — what to pass when "
+            "someone wants a particular thing to be the sharp one. Returns a "
+            "number, not a selection: put it in apply_effect's params as "
+            "`focus`, and do not pass a mask_id for it.\n\n"
+            "Name the thing in plain words, as for select_object. The number "
+            "only means anything on the version it was measured on, so measure "
+            "on the same node_id you are about to apply bokeh to. `found` is "
+            "false when nothing in the picture really matches; then leave "
+            "`focus` at its default and say the subject could not be found "
+            "rather than guessing a number."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_id": {"type": "integer"},
+                "node_id": {
+                    "type": "integer",
+                    "description": (
+                        "The version to measure on — the one you are about to "
+                        "apply bokeh to. Defaults to the unedited original."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What should be in focus, in plain words.",
                 },
             },
             "required": ["image_id", "description"],
@@ -604,21 +652,12 @@ def _list_photo_nodes(args: dict, turn: _Turn) -> tuple[str, str]:
     return json.dumps(nodes), f"listed {len(nodes)} version(s)"
 
 
-def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
-    """Name an object, and get back a saved mask to aim an effect with.
+def _locate(args: dict) -> tuple[dict, str, dict]:
+    """The words → `main.select_text` half both naming tools start with.
 
-    Two of the app's own endpoints back to back, and neither is reimplemented
-    here: `main.select_text` is what the Select control's text box posts to, and
-    `main.create_mask` is what the browser posts to when it banks a selection.
-    So a mask the model made is a mask in every way — it appears in
-    the strip, it can be reused by hand, and deleting it is guarded by the same
-    409 as any other.
-
-    The mask is saved *here*, unlike in the browser, where banking waits for the
-    Apply that uses it (`bankSelection`). The reason that rule exists is that a
-    click selection is live in the panel and would be banked again on every
-    Apply; a tool call happens once and its result has to be a durable name for
-    an object, because a `mask_id` is the only handle the model gets.
+    Shared so the CLIPSeg gate is worded once: `select_object` goes on to freeze
+    a mask, `measure_focus` to sample a depth, and neither should be the place
+    that knows what a 409 from that endpoint means.
     """
     from . import main
 
@@ -642,6 +681,29 @@ def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
                 f"({pct}% done). Tell them to try again shortly."
             )
         raise _ToolError(str(exc.detail))
+    return node, description, found
+
+
+def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
+    """Name an object, and get back a saved mask to aim an effect with.
+
+    Two of the app's own endpoints back to back, and neither is reimplemented
+    here: `main.select_text` is what the Select control's text box posts to, and
+    `main.create_mask` is what the browser posts to when it banks a selection.
+    So a mask the model made is a mask in every way — it appears in
+    the strip, it can be reused by hand, and deleting it is guarded by the same
+    409 as any other.
+
+    The mask is saved *here*, unlike in the browser, where banking waits for the
+    Apply that uses it (`bankSelection`). The reason that rule exists is that a
+    click selection is live in the panel and would be banked again on every
+    Apply; a tool call happens once and its result has to be a durable name for
+    an object, because a `mask_id` is the only handle the model gets.
+    """
+    from . import main
+
+    image_id = int(args["image_id"])
+    node, description, found = _locate(args)
 
     if not found["confident"]:
         # Nothing is saved and nothing is selected. Said in the result rather
@@ -704,6 +766,72 @@ def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
             }
         ),
         f"selected “{mask['name']}” · {round(found['coverage'] * 100)}% of the frame",
+    )
+
+
+def _measure_focus(args: dict, turn: _Turn) -> tuple[str, str]:
+    """Name what should be sharp, and get back the number bokeh's `focus` is.
+
+    The counterpart of `_select_object`, and the reason it exists: a mask says
+    *where* an effect lands, and bokeh's focus is not a place at all — it is a
+    reading on the normalized scale of one node's depth map, which is why the
+    browser fills it in by arming a picker (`buildDepthPick`) rather than
+    letting anyone type one. With no such tool the model has only the
+    object-shaped one it does have, and "focus on the cat" comes out as bokeh
+    masked to everything *but* the cat.
+
+    So this is that picker, with a phrase where the click is: `main.select_text`
+    for the point — the same call `_select_object` makes, so the two agree on
+    what a name finds — and `main.get_depth_at` for the value, which is the very
+    endpoint the picker reads. Nothing is written: no mask, no node, no file,
+    and `turn.focus` is left alone, since nothing here changes what is on
+    screen. The `apply_effect` that follows is what moves the view.
+
+    The two 409s are two different models — CLIPSeg to find the thing, the depth
+    net to measure it — and each is started by the gesture that needs it,
+    exactly as it would be if a person had typed in the Select box and then
+    pressed Bokeh.
+    """
+    from . import main
+
+    node, description, found = _locate(args)
+
+    if not found["confident"]:
+        # No number at all, rather than a plausible one measured at a point
+        # nothing was found at — `_select_object`'s refusal, for its reason. It
+        # also saves running the depth net for an answer that would be noise.
+        return (
+            json.dumps({"found": False, "score": found["score"]}),
+            f"no confident match for “{description}”",
+        )
+
+    try:
+        depth = main.get_depth_at(node["id"], found["x"], found["y"])["depth"]
+    except HTTPException as exc:
+        # `get_depth_at` runs `_check_effect_ready("bokeh")`, so this is the
+        # depth model missing, not the segmenter — same handling `_apply_effect`
+        # gives it, since asking for a focus reading is asking for bokeh.
+        if exc.status_code == 409:
+            job = depth_job.start()
+            pct = int(100 * job["done"] / job["total"]) if job.get("total") else 0
+            raise _ToolError(
+                f"bokeh needs a depth model that is still downloading ({pct}% done). "
+                "Tell them to try again shortly."
+            )
+        raise _ToolError(str(exc.detail))
+
+    return (
+        json.dumps(
+            {
+                "found": True,
+                # Named `focus` because that is the param it is: the model's job
+                # is to hand it straight back to `apply_effect`.
+                "focus": depth,
+                "node_id": node["id"],
+                "score": found["score"],
+            }
+        ),
+        f"focus {depth} on “{description}”",
     )
 
 
@@ -936,6 +1064,7 @@ HANDLERS = {
     "show_photo": _show_photo,
     "list_photo_nodes": _list_photo_nodes,
     "select_object": _select_object,
+    "measure_focus": _measure_focus,
     "apply_effect": _apply_effect,
     "edit_node": _edit_node,
     "list_presets": _list_presets,

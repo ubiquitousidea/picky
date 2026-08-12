@@ -293,6 +293,7 @@ The agentic interface allows users to operate Picky via natural language command
 - `show_photo`                   - `apply_effect` (+mask_id)  - `delete_photo`
 - `list_photo_nodes`             - `edit_node`                (Returns `pending` payload;
 - `list_presets`                 - `apply_preset` (+mask_id)   requires GUI confirmation)
+- `measure_focus` (CLIPSeg+depth)
                                  (Executes via `main.py`)
                                          |
                                          v
@@ -334,6 +335,7 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
 | `show_photo` | Switch UI focus | `image_id` (int), `node_id` (int, opt) | Sets `turn.focus` to update client viewport. |
 | `list_photo_nodes` | Inspect DAG history | `image_id` (int) | Returns full tree structure of all versions. |
 | `select_object` | Locate a named object and bank it as a mask | `image_id`, `node_id` (opt), `description` (str) | CLIPSeg + SAM via `main.select_text`, then `main.create_mask`. Returns `mask_id`, coverage and score. Banks **nothing** below `MATCH_FLOOR = 0.30`. |
+| `measure_focus` | Read bokeh's `focus` off a named object | `image_id`, `node_id` (opt), `description` (str) | CLIPSeg via `main.select_text` for the point (shared with `select_object` as `_locate`), then `main.get_depth_at` for the value. Returns a number, never a selection; writes nothing and leaves `turn.focus` untouched. Returns **no number** below `MATCH_FLOOR = 0.30`. |
 | `apply_effect` | Create and render a new child node | `image_id`, `node_id`, `effect`, `params`, `second_node_id`, `mask_id`, `invert_mask` | Validates, calls `main.create_node`, renders eagerly, updates `turn.focus`. A `mask_id` becomes a `{masks: [id], invert}` selection checked for image ownership. |
 | `edit_node` | Re-tune existing node in place | `node_id` (int), `params` (dict) | Merges new params over existing params, updates DB, invalidates descendant render caches. Carries the node's existing selection forward explicitly. |
 | `list_presets` | List saved recipes | None | Returns saved preset names and step summaries. |
@@ -353,12 +355,14 @@ The system prompt in `server/agent.py` is compiled dynamically on every turn:
      > *"NOTE: none of these is a confident match... Do NOT edit any of them. Say what the closest photos are and ask which one they meant."*
    - Placing the refusal directive directly inside the tool result ensures the model adheres to it consistently; stated only in the system prompt, it lost to the model's enthusiasm.
    - The same pattern is applied a second time in `select_object`: below `MATCH_FLOOR = 0.30` no mask is created and the result itself instructs the model not to edit. Both floors exist because a ranking function returns a best answer whether or not a good one exists.
+   - `measure_focus` refuses on the same floor and for the same reason: a depth sampled where nothing was found is a plausible-looking number with nothing behind it, so it returns none at all and the model is told to leave `focus` at its default.
 
 3. **Names, Not Coordinates**:
    - An LLM cannot inspect pixel coordinates or click an object, so the agent is given no tool that accepts a position. What it can do is *name* a subject: `select_object` runs the same text-prompted search the UI's **Find** box runs, freezes the result into a saved mask, and hands back only a `mask_id`.
    - Every id the model then passes is re-validated against the target image by `main._check_selection`, so a fabricated or foreign id is rejected as a 400 rather than silently applying the wrong stencil. "Blur the background" is expressed as that mask plus `invert_mask`.
    - Two asymmetries against the browser are deliberate. The mask is banked inside the tool rather than deferred to Apply, because a tool call happens once and its result must be a durable handle, whereas a live click selection would otherwise be re-banked on every Apply. And it is named after the user's words, since a `mask_id` is all the model ever sees while the person has a thumbnail in the mask strip.
    - An object that cannot be named — a corner, a spot, one of several identical items — remains a whole-frame edit, and the system prompt requires the agent to say so plainly and point at the manual picker.
+   - A name does not always buy a mask. Bokeh's `focus` is a scalar on one node's normalized depth map, not a place, which is why the UI fills it in with a picker (`buildDepthPick` → `GET /api/nodes/{id}/depth-at`) rather than asking anyone to type one. With `select_object` as its only object-shaped tool, the agent expressed "focus on the cat" as bokeh masked to the *inverse* of the cat. `measure_focus` is that same picker with a phrase in place of the click — CLIPSeg for the point, the depth model for the value — and the system prompt now separates the two questions explicitly: a mask says *where* an effect lands, `focus` says how far away the sharp plane is.
 
 4. **Asynchronous Model Download Gates**:
    - If the agent invokes a capability requiring unloaded weights, the server returns a 409 status and the tool triggers the corresponding background download job: `depth_job.start()` for Bokeh, `text_job.start()` for semantic library search, `clipseg_job.start()` for naming an object.
