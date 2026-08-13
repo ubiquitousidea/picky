@@ -192,7 +192,9 @@ that they can click it themselves with the Select control.
 - Several photos are a map, not a list. When more than one photo answers what \
 they asked for, call `show_photos` with the ids `find_photos` gave you, best \
 first — they get the whole library laid out with those photos lit up in it, \
-which reading five filenames aloud is not. One photo is still `show_photo`.
+which reading five filenames aloud is not. Pass every id you found, and when \
+they are asking what there is of something rather than which one to edit, \
+search for plenty of them first. One photo is still `show_photo`.
 - Deleting is not something you do. The delete tools only describe what would \
 go; the person confirms with a button. Stop and say what you queued.
 
@@ -258,7 +260,14 @@ TOOLS = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "How many matches to return, 1 to 10. Default 5.",
+                    "description": (
+                        "How many matches to return, 1 to 50. Default 5. Ask "
+                        "for a lot of them when the person wants to *see* what "
+                        "there is of something — 'photos of people' means all "
+                        "of them, and show_photos lights up as many as you "
+                        "pass. A handful is enough when you are about to edit "
+                        "one of them."
+                    ),
                 },
             },
             "required": ["description"],
@@ -290,10 +299,13 @@ TOOLS = [
             "exactly these photos lit up in it. This is the answer to 'show me "
             "photos of X' when more than one photo fits — a list of filenames "
             "in the log is not the same thing as seeing them.\n\n"
-            "Pass the image_ids find_photos returned, best first. Use "
-            "show_photo instead when one photo is the answer. The map shows "
-            "precisely the photos you name and nothing else, so unlike a "
-            "search you may say how many."
+            "Pass the image_ids find_photos returned, best first — all of "
+            "them, not a sample. There is no limit here: forty sprites lit up "
+            "in the cloud is a better answer to 'photos of people' than five, "
+            "and if you want more than find_photos gave you, search again with "
+            "a bigger limit. Use show_photo instead when one photo is the "
+            "answer. The map shows precisely the photos you name and nothing "
+            "else, so unlike a search you may say how many."
         ),
         "input_schema": {
             "type": "object",
@@ -573,7 +585,13 @@ def _find_photos(args: dict, turn: _Turn) -> tuple[str, str]:
     description = str(args.get("description") or "").strip()
     if not description:
         raise _ToolError("description must not be empty")
-    limit = max(1, min(10, int(args.get("limit") or 5)))
+    # 50 rather than a handful, because the map can show every one of them at
+    # once and "photos of people" is a question about a whole library. Still
+    # bounded, and not because the search runs out: it ranks every image, so
+    # there is always a next hit and the hundredth is noise. What runs out is
+    # the model — each hit is a JSON object it has to read, and every id it
+    # then passes to `show_photos` is output tokens against MAX_TOKENS.
+    limit = max(1, min(50, int(args.get("limit") or 5)))
 
     images = db.list_images()
     if not images:
@@ -656,11 +674,22 @@ def _find_photos(args: dict, turn: _Turn) -> tuple[str, str]:
 
     # The directive rides in the tool result, next to the numbers it is about,
     # because that is where the model is actually reading.
+    #
+    # It says do not *edit*, and says outright that showing is fine, because a
+    # generic word scores lower than a concrete one — "people" tops out below
+    # the floor in a library full of people, where "a cat" clears it easily. Left
+    # to read as "do nothing", this refused to put a single photo on the map for
+    # exactly the queries the map is best at, which is the wrong trade: an edit
+    # to a real photo is what nobody asked for, while fifty weak matches drawn
+    # in a cloud are judged in a glance and cost nothing to be wrong about.
     if not any(h.get("confidence") == "strong" for h in hits):
         note = (
-            " — NOTE: none of these is a confident match, so the library "
-            "probably does not contain what was asked for. Do NOT edit any of "
-            "them. Say what the closest photos are and ask which one they meant."
+            " — NOTE: none of these is a confident match, so the library may "
+            "not contain what was asked for. Do NOT edit any of them: say what "
+            "the closest photos are and ask which one they meant. Showing them "
+            "is a different matter and usually the right answer — put them on "
+            "the map with show_photos and say the matches were weak, so they "
+            "can see for themselves what the words found."
             + note
         )
     return json.dumps(hits) + note, f"searched for “{description}” · {len(hits)} match(es)"
@@ -707,9 +736,12 @@ def _show_photos(args: dict, turn: _Turn) -> tuple[str, str]:
             ids.append(image_id)
     if not ids:
         raise _ToolError("image_ids must name at least one photo")
-    # The ceiling `find_photos`' `limit` already has, since that is where these
-    # came from: a map lit up with the whole library is the unfiltered map.
-    ids = ids[:10]
+    # No ceiling here on purpose. This is the *display*, and the map is as happy
+    # with fifty sprites as with five; the bound that matters is on
+    # `find_photos`, which is where a list this long has to be read and written
+    # rather than merely drawn. Two caps would also be two numbers to keep in
+    # step, and the smaller one would silently drop photos the model had just
+    # named in the log — the one thing the pin exists to prevent.
 
     # `_node_of` for the existence check every write does, so an id the model
     # invented comes back as a sentence it can recover from rather than as a
