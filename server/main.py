@@ -486,19 +486,42 @@ def search_embedding_map(q: str):
     """Score every image against a typed phrase — the Image map's search box.
 
     The same trick `labels.py` names clusters with, run the other way. CLIP put
-    captions and the photos they describe in one 512-d space, so one dot product
+    captions and the photos they describe in one 512-d space, so a dot product
     between a query vector and the library's cached image vectors is the whole
-    search: no index, no per-image model run, sub-millisecond over a few hundred
-    images.
+    search: no index, no per-image model run, and nothing to invalidate.
 
-    **Scores come back as z-scores, and that is the point.** A raw CLIP
-    image-text cosine sits in a narrow band around 0.2 whose *position* moves
-    with how the query was phrased, so "keep everything above 0.28" means
-    something different for every query and nothing at all to a user. Measured
-    in standard deviations above this query's own mean over this library, one
-    slider position means roughly one strictness whatever you type. The raw
-    cosine rides along anyway, because it is what makes the endpoint legible
-    from curl.
+    **What is ranked is not that cosine.** On its own it asks only how well the
+    query describes a photo, never whether something else describes it better,
+    and one vector summarizing a whole frame answers mostly about scene gestalt —
+    so "people" returns the people and then the macaques, which share the face
+    and the framing. `labels.zero_shot_logp` re-asks it as a choice between the
+    query and 850 other subjects, and the losing comparison is the one a bare
+    cosine never made. A library with no `label_vectors.npz` to compete against
+    falls back to the cosine, which is why that is still what `scores` carries.
+
+    **Scores come back as z-scores, and that is the point.** Neither quantity has
+    a knowable zero — a raw cosine sits in a narrow band whose *position* moves
+    with the phrasing, and a log-probability's floor moves with how crowded the
+    vocabulary is around the query — so "keep everything above 0.28" means
+    something different for every query and nothing at all to a user. Measured in
+    standard deviations above this query's own mean over this library, one slider
+    position means roughly one strictness whatever you type, and it means the
+    same strictness under either scoring: the two distributions have comparable
+    spread and skew, so the frontend's default needed no recalibration.
+
+    Three numbers per image, because they answer three questions. `z` is what the
+    Match slider filters on. `p` is the probability behind it, which is the one a
+    person can read — 0.64 for "mountain" against this library, 0.05 for
+    gibberish, where the cosine is ~0.27 for both. `score` is the raw cosine,
+    unchanged and still the endpoint's most legible number from curl; it is also
+    what `agent.STRONG_MATCH` is a floor on, so it may not quietly become
+    something else.
+
+    The rival matrix is what the search now costs: ~30 ms over a library of 1500
+    against the cosine's ~0.01, since it is 850 columns wide rather than one.
+    That is still far below `encode_query`'s seven transformer passes, which is
+    why neither is cached here and the debounce in the search box is the only
+    thing standing between a keystroke and this.
 
     Unlike `embedding_map`, this refuses rather than doing the slow thing
     itself: that endpoint embeds whatever it finds missing, but the equivalent
@@ -539,20 +562,28 @@ def search_embedding_map(q: str):
 
     # Both sides are unit length, so the dot product is the cosine.
     scores = stacked @ vec
-    mean = float(scores.mean())
-    std = float(scores.std())
+    # The quantity actually ranked, when there is a vocabulary to rank against.
+    # The z-score is taken over the *log* probability rather than `probs`: a
+    # softmax over 850 terms puts almost every image within a rounding error of
+    # zero, which has no spread to measure a threshold in, while its log is
+    # about as well spread as the cosine it replaces.
+    ranked = labels.zero_shot_logp(stacked, vec)
+    probs = np.exp(ranked) if ranked is not None else None
+    if ranked is None:
+        ranked = scores
+
+    mean = float(ranked.mean())
+    std = float(ranked.std())
     # A library of one image, or of identical ones, has no spread to measure
     # against; every z of 0 filters to "everything", which is the honest answer.
-    zs = (scores - mean) / std if std > 0 else np.zeros_like(scores)
-    return {
-        "query": query,
-        "mean": mean,
-        "std": std,
-        "scores": {
-            str(point["image_id"]): {"score": round(float(s), 4), "z": round(float(z), 3)}
-            for point, s, z in zip(points, scores, zs)
-        },
-    }
+    zs = (ranked - mean) / std if std > 0 else np.zeros_like(ranked)
+    out = {}
+    for index, (point, s, z) in enumerate(zip(points, scores, zs)):
+        entry = {"score": round(float(s), 4), "z": round(float(z), 3)}
+        if probs is not None:
+            entry["p"] = round(float(probs[index]), 4)
+        out[str(point["image_id"])] = entry
+    return {"query": query, "mean": mean, "std": std, "scores": out}
 
 
 @app.post("/api/text-model/prepare")

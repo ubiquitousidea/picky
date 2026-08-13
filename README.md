@@ -344,7 +344,7 @@ the preset is replayed against.
 | PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
 | DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
 | GET    | `/api/embedding-map` | the whole library as 3D points (`method`: `tsne`\|`pca`, `clusters`: 0 for an automatic count, else 2–20), plus named cluster centres. Embeds anything it finds missing, so it answers with or without a `prepare`; the fit itself is cached against the vectors that produced it |
-| GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine and a z-score over this query's own spread. 409s rather than downloading the text tower inside a GET |
+| GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine, the probability the phrase beats 850 rival subjects, and a z-score over this query's own spread. 409s rather than downloading the text tower inside a GET |
 | POST   | `/api/embedding-map/prepare` | start the background embedding pass (~335 MB of weights on a fresh install, then one forward pass per image); answers `done` synchronously when nothing is missing |
 | GET    | `/api/embedding-map/progress` | where that pass got to — `state`, `phase`, `done`/`total` |
 | POST   | `/api/text-model/prepare` | start fetching CLIP's text tower (254 MB), which only searching needs |

@@ -261,6 +261,28 @@ one place silently breaks another.
   image-to-image similarity still works while both go meaningless.
   `labels.label_clusters` and `main.search_embedding_map` therefore compare
   widths and return nothing rather than nonsense.
+- **Search ranks a zero-shot log-probability; the cosine it used to rank by is
+  still in the response, and may not quietly become something else.** A bare
+  cosine never asks whether some *other* subject explains a photo better, so
+  "people" returned the macaques too; `labels.zero_shot_logp` re-asks it as a
+  softmax over the query and the label vocabulary, which is what makes the
+  losing comparison happen. Three things ride on that split. The vocabulary is
+  now load-bearing for search and not only for cluster names, so
+  `label_vectors.npz` missing degrades search to the old cosine rather than
+  breaking it. `scores[].score` stays the raw cosine because
+  `agent.STRONG_MATCH` is a floor on it. And the z-score is taken over the log,
+  never over `p`, which is why the Match slider's default did not have to move —
+  the two distributions have comparable spread, where a softmax over 850 terms
+  is all rounding error.
+- **The cone is projected out for text-to-text comparisons and nowhere else**
+  (`labels._cone_axis`). CLIP's text vectors all lean along one shared
+  direction, so raw cosines between two of them run 0.82 ± 0.05 and cannot
+  separate a synonym from an unrelated word — which `zero_shot_logp` needs, to
+  strike restatements of the query out of its own rival set. Image-text scores
+  are compared across images against one fixed query, where that offset
+  cancels, so `label_clusters` does not decone and must not: its scores are
+  exposed as a confidence, and shifting them would change what every existing
+  label's number means.
 - **`server/text_embed.py` owns CLIP's text tower and the only tokenizer in the
   tree; `tools/build_label_vectors.py` owns the vocabulary and the npz.** The
   script imports the tower rather than holding its own, which is what makes a
