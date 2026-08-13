@@ -240,6 +240,24 @@ one place silently breaks another.
   render closure stayed cached — and file existence is the entire cache key. The
   skip is a 200 carrying `duplicate: true`, not a 409, which is what keeps
   `uploadFiles()` reporting it in the label instead of the failure alert.
+- **Detections are the second thing a re-frame stales, and `images.detected_at`
+  is what makes "found nothing" different from "never looked".** Boxes are
+  fractions of the *framed* image, exactly as the CLIP vector is of the framed
+  thumbnail, so the crop PUT clears both (`db.clear_embedding` +
+  `db.clear_detections`) and nothing else does. The stamp is not decoration: an
+  empty `detections` set is the common answer — COCO has eighty nouns and no
+  word for a macaque, a temple or a mountain — so without a column recording
+  that the pass happened, `detect_job` would re-run the model over every
+  landscape in the library on every sweep. Which is also the rule for readers: a
+  missing label means *not detected*, never *not present*.
+- **The detector and CLIP are a pair, and the Image map is where they compose.**
+  CLIP ranks a whole frame and knows about mood and weather; YOLO scores a
+  region and knows eighty things. Requiring `person` on top of a "people" search
+  drops 15 genuine false positives out of 17 — birds, cattle, a crosswalk
+  *sign*, a billboard reading "Meet our people" — at the cost of one photo whose
+  people are two pixels on a mountaintop. Neither filter does that alone, which
+  is the whole argument for paying for a second model; it is also why the tag
+  chips are a filter beside the search rather than a term folded into it.
 - **`images.embedding` is a column, not a file.** Image ids are rowids SQLite
   reuses, so an `<image_id>.npy` would outlive its image and be read back as its
   successor's position in the cloud. It embeds the *thumbnail*, so re-framing
@@ -294,16 +312,24 @@ one place silently breaks another.
   most sessions never type in the box, so `text_job.py` is triggered by the
   search box alone — never by opening the map — and `/api/embedding-map/search`
   409s instead of fetching a quarter-gigabyte inside a GET.
-- **Four ONNX models, three different normalizations.** SAM's constants are
-  applied to 0-255 pixels, CLIP's to 0-1 floats, and `depth.py`'s are plain
+- **Five ONNX models, four different normalizations.** SAM's constants are
+  applied to 0-255 pixels, CLIP's to 0-1 floats, `depth.py`'s are plain
   ImageNet over 0-1 floats — which `clipseg.py`'s also are, numerically, and
   are still written out there rather than imported: two checkpoints agreeing on
   their preprocessing is a coincidence, and sharing the array would make
-  re-pinning either one a silent change to the other. Crossing them yields
-  output that still looks like output — a plausible depth map, a well-spread
-  vector — and nothing downstream can detect it. `sam.py` owns `MODELS_DIR` and
-  `download_model`; `embed.py`, `depth.py` and `clipseg.py` all borrow them
-  rather than re-deriving the pinned-revision and atomic-write contract.
+  re-pinning either one a silent change to the other — and `detect.py`'s is no
+  normalization at all beyond 0-1, which is YOLO's, plus a letterbox no other
+  model here wants. Crossing any of them yields output that still looks like
+  output — a plausible depth map, a well-spread vector — and nothing downstream
+  can detect it. `sam.py` owns `MODELS_DIR` and `download_model`; `embed.py`,
+  `depth.py`, `clipseg.py` and `detect.py` all borrow them rather than
+  re-deriving the pinned-revision and atomic-write contract.
+- **`detect.py`'s pinned revision is load-bearing beyond reproducibility: that
+  export writes box coordinates normalized to the letterbox, where Ultralytics'
+  own writes them in 0..640.** Decode it the documented way and every box lands
+  in the top-left corner a fraction of a pixel wide, which is why `_boxes`
+  raises rather than trusting the numbers. It is also the only AGPL-3.0 weight
+  in the tree — everything else here is Apache or MIT.
 - **`clipseg.py` answers with a *location*, and SAM still draws every
   boundary.** Its 352×352 map is too coarse to be a mask, so `locate` reduces it
   to a point and a size — which is also what keeps "select by name" from being
@@ -315,15 +341,20 @@ one place silently breaks another.
   same subject, and it invents nothing, because an absent subject is missed by
   all four.
 - **`server/embed_job.py` is only ever an optimization; `server/text_job.py`,
-  `server/depth_job.py` and `server/clipseg_job.py` are not.** `GET
-  /api/embedding-map` still embeds whatever it finds missing, so the map is
-  correct if nobody prepared, if the job died, or if both run at once — keep it
-  that way, a prepare the map *required* would be a second source of truth.
-  Search, bokeh and naming an object have no such fallback by choice (see
-  above), which is exactly why the four are separate modules rather than phases
-  of one: each is triggered by the one gesture that needs it — opening the map,
-  typing a query, lighting the Bokeh button, pressing Find or calling
-  `select_object` — so nobody pays for a model they never use. The one thing
+  `server/depth_job.py`, `server/clipseg_job.py` and `server/detect_job.py` are
+  not.** `GET /api/embedding-map` still embeds whatever it finds missing, so the
+  map is correct if nobody prepared, if the job died, or if both run at once —
+  keep it that way, a prepare the map *required* would be a second source of
+  truth. Search, bokeh, naming an object and detection have no such fallback by
+  choice (see above), which is exactly why the five are separate modules rather
+  than phases of one: each is triggered by the one gesture that needs it —
+  opening the map, typing a query, lighting the Bokeh button, pressing Find or
+  calling `select_object` — so nobody pays for a model they never use.
+  `detect_job` is the one whose gesture it *shares* (the map's open starts both
+  it and `embed_job`), affordable only because 12.8 MB is an order of magnitude
+  under anything else here; what it must never grow is a detect-on-demand path,
+  since that would put a 40 ms model run inside a request that touches a
+  thousand images. The one thing
   two of them share is CLIP's tokenizer files, which is why
   `text_embed.ensure_tokenizer()` is separable from its 254 MB tower:
   `clipseg.py` needs the vocabulary and none of the graph, and the alternative
@@ -539,10 +570,10 @@ one place silently breaks another.
   Scores are keyed by `image_id`, which is what lets a filter survive a
   re-projection; the threshold is applied locally, so dragging Match costs a
   redraw where typing a query costs a request.
-- **All four of the map's filters are resolved in `applyEmbedFilter()`, the one
-  writer of `p.hidden` and of the status line.** Match, the edit chips and the
-  assistant's pinned set each ask their question of an image alone, so they
-  resolve together in one pass; Near asks one *about the pick* — a radius in the projected cube, exponential in
+- **All five of the map's filters are resolved in `applyEmbedFilter()`, the one
+  writer of `p.hidden` and of the status line.** Match, the edit chips, the tag
+  chips and the assistant's pinned set each ask their question of an image
+  alone, so they resolve together in one pass; Near asks one *about the pick* — a radius in the projected cube, exponential in
   the slider with the ends clipped to 0 and Infinity — so it runs second, over
   their survivors, and turns itself off when there is no pick. That order is why
   the pick is dropped *between* the passes rather than after them, and why
@@ -557,7 +588,15 @@ one place silently breaks another.
   been run through can only ever answer "nothing", so the row lists what there is
   to find and says how much of it there is. OR because the chips are how you
   *widen*; the empty set is `null`, so pressing the last lit chip again turns the
-  filter off rather than emptying the map.
+  filter off rather than emptying the map. The **tag** chips (`renderTagChips`,
+  fed by `list_images`' `labels` aggregate) are that control one row down. They
+  wrap as it does, and are ordered by count rather than alphabetically — with
+  most of COCO's eighty classes in play, alphabetical leads with "airplane 2"
+  and buries "person 435", and the count is half of what a chip says. The row's
+  `max-height` is a backstop against a library holding every class, not its
+  normal appearance. There is no `none` token to match the edit row's — "carries no effects" is a fact about the
+  library, but "contains no objects" would be a claim about a detector that
+  cannot see most things.
 - **The map opens on the image you are working on** (`state.imageId`), picked
   and centred by `centerOnSelection()` — which is `pivotOnSelection()`'s
   opposite, and needs no drawn frame behind it. That is what makes Orbit worth

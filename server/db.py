@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS images (
   name TEXT NOT NULL,
   created_at TEXT NOT NULL,
   crop TEXT,             -- JSON {angle, rect}; NULL = no framing at all
-  embedding BLOB         -- raw float32 CLIP vector; NULL = not embedded yet
+  embedding BLOB,        -- raw float32 CLIP vector; NULL = not embedded yet
+  detected_at TEXT       -- when YOLO last ran; NULL = never, which is not
+                         -- the same as "ran and found nothing"
 );
 CREATE TABLE IF NOT EXISTS nodes (
   id INTEGER PRIMARY KEY,
@@ -52,6 +54,20 @@ CREATE TABLE IF NOT EXISTS masks (
   created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS masks_image_name ON masks(image_id, name);
+-- One row per object YOLO found, in `images.detected_at`'s pass. Boxes are
+-- fractions of the *framed* image, like the CLIP vector is of the framed
+-- thumbnail, so re-cropping stales both together (see `clear_detections`).
+-- No score index: every query here is by image or by label, and the score is
+-- only ever read off a row already found.
+CREATE TABLE IF NOT EXISTS detections (
+  id INTEGER PRIMARY KEY,
+  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  score REAL NOT NULL,
+  x0 REAL NOT NULL, y0 REAL NOT NULL, x1 REAL NOT NULL, y1 REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS detections_image ON detections(image_id);
+CREATE INDEX IF NOT EXISTS detections_label ON detections(label);
 CREATE TABLE IF NOT EXISTS projections (
   method TEXT PRIMARY KEY,   -- one row per method: a new fit replaces the old
   fingerprint TEXT NOT NULL, -- hash of the vectors the fit was over
@@ -82,6 +98,8 @@ def init() -> None:
             conn.execute("ALTER TABLE images ADD COLUMN crop TEXT")
         if "embedding" not in image_cols:
             conn.execute("ALTER TABLE images ADD COLUMN embedding BLOB")
+        if "detected_at" not in image_cols:
+            conn.execute("ALTER TABLE images ADD COLUMN detected_at TEXT")
 
 
 def connect() -> sqlite3.Connection:
@@ -135,6 +153,12 @@ def image_dict(row: sqlite3.Row) -> dict:
     # the column, claim every image has no edits.
     if "effects" in d:
         d["effects"] = d["effects"].split(",") if d["effects"] else []
+    # Same rule, same reason: absent means the query did not ask. Note that an
+    # empty list here is genuinely ambiguous in a way `effects` is not — it
+    # covers both "detected nothing" and "never detected" — which is what
+    # `detected_at` is for, and why it is selected alongside.
+    if "labels" in d:
+        d["labels"] = sorted(d["labels"].split(",")) if d["labels"] else []
     return d
 
 
@@ -198,14 +222,24 @@ def list_images() -> list[dict]:
     endpoint the map would have to keep in step with this one. Every image's root
     node has `effect IS NULL` (see `create_image`), so the list is empty exactly
     when nothing has been done to the image.
+
+    `labels` is the same arrangement one table over: the set of COCO classes
+    `detect.py` found, feeding the map's tag filter. It rides here rather than in
+    its own endpoint for the reason `effects` does — the map already fetches this
+    list, and a second source for "what is in the library" is a second thing to
+    keep in step. `detected_at` comes with it because the two answer different
+    questions: an empty `labels` with a timestamp means the detector ran and
+    found none of its eighty nouns, and without one means it has never run.
     """
     with connect() as conn:
         rows = conn.execute(
-            """SELECT i.id, i.name, i.created_at, i.crop,
+            """SELECT i.id, i.name, i.created_at, i.crop, i.detected_at,
                       (SELECT id FROM nodes n WHERE n.image_id = i.id
                        AND n.parent_id IS NULL) AS root_node_id,
                       (SELECT group_concat(DISTINCT n.effect) FROM nodes n
-                       WHERE n.image_id = i.id AND n.effect IS NOT NULL) AS effects
+                       WHERE n.image_id = i.id AND n.effect IS NOT NULL) AS effects,
+                      (SELECT group_concat(DISTINCT d.label) FROM detections d
+                       WHERE d.image_id = i.id) AS labels
                FROM images i ORDER BY i.created_at DESC"""
         ).fetchall()
     return [image_dict(r) for r in rows]
@@ -214,7 +248,8 @@ def list_images() -> list[dict]:
 def get_image(image_id: int) -> dict | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT id, name, created_at, crop FROM images WHERE id = ?", (image_id,)
+            "SELECT id, name, created_at, crop, detected_at FROM images WHERE id = ?",
+            (image_id,),
         ).fetchone()
     return image_dict(row) if row else None
 
@@ -273,6 +308,97 @@ def clear_embedding(image_id: int) -> None:
         conn.execute(
             "UPDATE images SET embedding = NULL WHERE id = ?", (image_id,)
         )
+
+
+# ---------- Detected objects (see detect.py) ----------
+
+
+def set_detections(image_id: int, found: list[dict]) -> None:
+    """Replace an image's detections with `found` and stamp it as detected.
+
+    One transaction, and the delete is not conditional on `found` being
+    non-empty: a re-detection that finds nothing must leave nothing behind, or
+    the previous pass's boxes would outlive the pixels they were measured on.
+
+    The stamp is written even for an empty list — that is the whole point of the
+    column. `detect_job` selects on it, so an image the model has no nouns for
+    must not be retried on every pass.
+    """
+    with connect() as conn:
+        conn.execute("DELETE FROM detections WHERE image_id = ?", (image_id,))
+        conn.executemany(
+            """INSERT INTO detections (image_id, label, score, x0, y0, x1, y1)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (image_id, d["label"], d["score"], *d["box"])
+                for d in found
+            ],
+        )
+        conn.execute(
+            "UPDATE images SET detected_at = ? WHERE id = ?", (_now(), image_id)
+        )
+
+
+def clear_detections(image_id: int) -> None:
+    """Forget an image's boxes *and* its stamp, so the next pass re-detects it.
+
+    `clear_embedding`'s twin, called from the same place and for the same
+    reason: boxes are fractions of the framed image, so re-framing moves every
+    one of them and can bring objects into the frame or take them out. Dropping
+    the stamp as well as the rows is what makes the re-detection happen — rows
+    alone would read as "detected, found nothing".
+    """
+    with connect() as conn:
+        conn.execute("DELETE FROM detections WHERE image_id = ?", (image_id,))
+        conn.execute(
+            "UPDATE images SET detected_at = NULL WHERE id = ?", (image_id,)
+        )
+
+
+def get_detections(image_id: int) -> list[dict]:
+    """One image's boxes, strongest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT label, score, x0, y0, x1, y1 FROM detections
+               WHERE image_id = ? ORDER BY score DESC""",
+            (image_id,),
+        ).fetchall()
+    return [
+        {
+            "label": r["label"],
+            "score": r["score"],
+            "box": [r["x0"], r["y0"], r["x1"], r["y1"]],
+        }
+        for r in rows
+    ]
+
+
+def undetected_count() -> int:
+    """How many images the detector has never run over.
+
+    A count rather than `len(detected_image_ids())` because `detect_job`'s
+    progress is polled: this is one aggregate over an integer column, where the
+    set costs a row per image to build and throw away.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM images WHERE detected_at IS NULL"
+        ).fetchone()
+    return int(row["n"])
+
+
+def detected_image_ids() -> set[int]:
+    """Every image the detector has run over — one query, not one per image.
+
+    `get_embeddings`' shape, and `detect_job._pending` uses it the same way.
+    Reads the stamp rather than the rows, so an image with no objects in it
+    counts as done.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM images WHERE detected_at IS NOT NULL"
+        ).fetchall()
+    return {r["id"] for r in rows}
 
 
 # ---------- The fitted projection (see main._projected) ----------

@@ -3223,6 +3223,16 @@ const embedMap = {
   // OR'd: this is a filter you widen by lighting more chips. Resets on every
   // open, like the query — it is a thing you were looking for once.
   edits: null,
+  // The tag filter: a Set of COCO class names, or null for off — `edits`' shape
+  // exactly, OR'd for its reason, and resetting on every open for the query's.
+  //
+  // What fills it is `detect.py`, and the asymmetry with `edits` is worth
+  // keeping in mind: an effect chip's absence is a fact about the library, but
+  // a tag's absence is a fact about a *detector* with eighty nouns and no
+  // monkey among them. So these chips answer "which photos have a dog in them"
+  // and never "which photos have no animals" — which is also why there is no
+  // "none" token here to match the edit row's.
+  tags: null,
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
@@ -3403,6 +3413,8 @@ async function openEmbedMap(pin = null) {
   setNearSlider(1);
   // Same argument again for the edit chips, which hide even more than Near can.
   embedMap.edits = null;
+  // And for the tag chips, which are the same control one row down.
+  embedMap.tags = null;
   // And the strongest version of it for the assistant's pinned set: a map
   // reopened still showing the five photos a conversation two minutes ago
   // turned up is hiding the library for a reason nothing on screen gives, and
@@ -3422,6 +3434,13 @@ async function openEmbedMap(pin = null) {
   sizeEmbedCanvas();
   // centred on the image you are working on — see loadEmbedMap
   if (!(await prepareEmbedMap())) return;
+  // Started, never awaited. The tag chips are the one thing here that can
+  // arrive late without being wrong: a sweep still running just means fewer
+  // chips this open, where blocking the map on it would hold the whole library
+  // behind a model nobody has asked anything of yet. Nothing else in the app
+  // triggers it, so opening the map *is* the gesture that pays for detection —
+  // affordable only because those weights are 12.8 MB against the tower's 254.
+  prepareDetect();
   await loadEmbedMap(true);
   // Only now, and only on a map that loaded: prepareEmbedMap() leaves its
   // explanation in #embed-status when the vision model could not be had, and
@@ -3433,6 +3452,42 @@ async function openEmbedMap(pin = null) {
   if (pin) {
     embedMap.pinned = { query: pin.query, ids: new Set(pin.image_ids) };
     applyEmbedFilter();
+  }
+}
+
+// The detection pass, started when the map opens and never awaited by it.
+//
+// Deliberately quiet where prepareEmbedMap() is loud: that one owns the status
+// line because the map cannot draw until it finishes, and this one must not
+// touch it, because the map is already on screen and readable. A sweep in
+// progress costs the tag row some chips and nothing else.
+//
+// What it does have to do is come back when the sweep finishes: on a fresh
+// library every image is unlabelled, so the row that renders now would stay
+// empty for the whole session. Reloading is cheap — the projection is cached on
+// a fingerprint of the vectors, which detection does not touch — and it goes
+// through loadEmbedMap() so the pick, the filters and the chips are all
+// restored by the one function that knows how.
+async function prepareDetect() {
+  const seq = embedMap.seq;
+  const stale = () => seq !== embedMap.seq || !embedMap.open;
+  try {
+    let job = await api("/api/detect/prepare", { method: "POST" });
+    // Nothing was pending and nothing downloaded: the common case on every
+    // open after the first, and there is no reason to reload for it.
+    if (job.state !== "running") return;
+    while (job.state === "running") {
+      await new Promise((done) => setTimeout(done, EMBED_POLL_MS));
+      if (stale()) return;
+      job = await api("/api/detect/progress");
+    }
+    if (stale() || job.state === "error") return;
+    await loadEmbedMap(false);
+  } catch {
+    // Swallowed on purpose, and the only place in this file that does. Tags are
+    // an enhancement over a map that already works; a detector that cannot be
+    // downloaded must cost the person some chips, not an error where the
+    // library should be.
   }
 }
 
@@ -3522,6 +3577,7 @@ async function loadEmbedMap(center = false) {
     // get a chip. Before the pick below, which re-runs the filter the chips are
     // read by.
     renderEditChips();
+    renderTagChips();
     // The pick survives a re-fetch by image id, never by identity: these are
     // fresh objects, so the old one is no longer in `points` and the draw
     // loop's `p === embedMap.selected` would never match again. On open there
@@ -3658,6 +3714,58 @@ function renderEditChips() {
   }
 }
 
+// The tag chips, built from the library rather than from COCO's class list —
+// `renderEditChips`' argument exactly: a chip for an object nothing in the
+// library contains can only ever answer "nothing".
+//
+// Sorted by how many images carry the label, not alphabetically: with most of
+// the eighty classes in play, alphabetical order leads with "airplane 2" and
+// buries "person 435" in the middle. The count is half of what a chip says, so
+// ordering by it makes the row readable as a summary of the library and not
+// only as a set of buttons.
+function renderTagChips() {
+  const row = $("embed-tag-row");
+  row.textContent = "";
+  const counts = new Map();
+  for (const p of embedMap.points) {
+    for (const label of p.labels || []) counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  // Ties broken by name so the row is stable between two loads of one library.
+  const chips = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  row.hidden = !chips.length;
+  for (const [token, count] of chips) {
+    const btn = document.createElement("button");
+    // Explicitly not a submit button, for the edit chips' reason: this row is
+    // inside a <dialog>, where the default type closes the map on first press.
+    btn.type = "button";
+    btn.className = "embed-chip";
+    btn.classList.toggle("on", !!embedMap.tags && embedMap.tags.has(token));
+    btn.textContent = `${token} ${count}`;
+    btn.onclick = () => toggleTagToken(token);
+    row.append(btn);
+  }
+}
+
+function toggleTagToken(token) {
+  const set = new Set(embedMap.tags || []);
+  if (!set.delete(token)) set.add(token);
+  // Empty is off, not "an empty union matches nothing" — pressing the last lit
+  // chip a second time has to show the library, not blank the map.
+  embedMap.tags = set.size ? set : null;
+  renderTagChips();
+  applyEmbedFilter();
+}
+
+// Whether one image carries any lit tag. OR, like matchesEdits and for its
+// reason: the chips are how you widen. Asking for the photos containing both a
+// dog *and* a bicycle is a question about one photo, not about a library.
+function matchesTags(p) {
+  for (const token of embedMap.tags) {
+    if ((p.labels || []).includes(token)) return true;
+  }
+  return false;
+}
+
 function toggleEditToken(token) {
   const set = new Set(embedMap.edits || []);
   if (!set.delete(token)) set.add(token);
@@ -3677,6 +3785,7 @@ function embedFiltering() {
   return !!(
     embedMap.scores ||
     embedMap.edits ||
+    embedMap.tags ||
     embedMap.pinned ||
     (embedMap.selected && embedNearRadius(embedMap.nearT) !== Infinity)
   );
@@ -3701,11 +3810,16 @@ function matchesEdits(p) {
 // re-run this and nothing else, so they are instant the way Size is, where a new
 // query costs a request the way Groups does.
 //
-// The four filters compose, and are not symmetric. The search, the edit chips
-// and the assistant's pinned set each ask a question of an image on its own, so
-// they resolve together in one pass; Near asks one *about the pick*, so it is
-// applied second, over the survivors, and turns itself off when there is no
-// pick to measure from.
+// The five filters compose, and are not symmetric. The search, the edit chips,
+// the tag chips and the assistant's pinned set each ask a question of an image
+// on its own, so they resolve together in one pass; Near asks one *about the
+// pick*, so it is applied second, over the survivors, and turns itself off when
+// there is no pick to measure from.
+//
+// Search and tags are the pair worth composing deliberately: CLIP ranks the
+// whole frame and the detector scores a region, so "people" with the `person`
+// chip lit is the query with its false positives — the macaques, the empty
+// landscapes — already gone, and neither filter alone does that.
 function applyEmbedFilter() {
   $("embed-match-row").hidden = !embedMap.scores;
   // The pin's own control, written here with the Match row rather than
@@ -3721,6 +3835,7 @@ function applyEmbedFilter() {
     p.hidden =
       (!!embedMap.scores && (!entry || entry.z < embedMap.matchZ)) ||
       (!!embedMap.edits && !matchesEdits(p)) ||
+      (!!embedMap.tags && !matchesTags(p)) ||
       (!!embedMap.pinned && !embedMap.pinned.ids.has(p.image_id));
   }
   // A pick that just went invisible would otherwise leave the card floating
@@ -3745,7 +3860,13 @@ function applyEmbedFilter() {
   }
   markEmbedDirty();
 
-  if (!embedMap.scores && !embedMap.edits && !embedMap.pinned && !near) {
+  if (
+    !embedMap.scores &&
+    !embedMap.edits &&
+    !embedMap.tags &&
+    !embedMap.pinned &&
+    !near
+  ) {
     $("embed-status").textContent = embedIdleStatus();
     return;
   }
@@ -3760,6 +3881,9 @@ function applyEmbedFilter() {
   if (embedMap.pinned) clauses.push(`are what the assistant found for “${embedMap.pinned.query}”`);
   if (embedMap.scores) clauses.push(`match “${embedMap.query}”`);
   if (embedMap.edits) clauses.push(`have ${[...embedMap.edits].map(editPhrase).join(" or ")}`);
+  // "contain", not "have": these say something about what is in the picture,
+  // where the edit chips say something about what was done to it.
+  if (embedMap.tags) clauses.push(`contain a ${[...embedMap.tags].join(" or ")}`);
   if (near) clauses.push(`are near ${anchor.name}`);
   // The pin goes first in the precedence for the same reason it is the only
   // filter with a button of its own: every other one names a control the person
@@ -3769,7 +3893,7 @@ function applyEmbedFilter() {
     ? "press the assistant's chip to show the library again"
     : embedMap.scores
       ? "drag Match to widen · clear the box to show all"
-      : embedMap.edits
+      : embedMap.edits || embedMap.tags
         ? "press a lit chip to clear it"
         : "drag Near to widen · pick another image to move the circle";
   // Two clauses read "a and b", more than two "a, b and c" — the second

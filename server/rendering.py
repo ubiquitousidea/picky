@@ -10,7 +10,7 @@ from PIL import Image, ImageFilter
 
 import json
 
-from . import db, embed, sam
+from . import db, detect, embed, sam
 from .effects import (
     EFFECTS,
     apply_blend,
@@ -257,6 +257,34 @@ def embed_image(image_id: int, root_node_id: int) -> np.ndarray:
     vec = embed.compute_embedding(img)
     db.set_embedding(image_id, vec.tobytes())
     return vec
+
+
+# ---------- Detected objects (the Image map's tag filter) ----------
+
+
+def detect_image(image_id: int, root_node_id: int) -> list[dict]:
+    """Detect an image's objects and store them, returning them.
+
+    Reads the framed *output* rather than the thumbnail `embed_image` uses, and
+    the difference is the whole reason detection is the slower of the two. CLIP
+    looks at 224px and a 320px thumb already exceeds that; YOLO looks at 640 and
+    a thumb would be an upscale, which costs exactly the small distant objects a
+    detector is worth having for. So this decodes the original — but only down
+    to `detect.DECODE_HINT`, since libjpeg can scale during the DCT and the
+    frame is bound for a 640 square regardless.
+
+    Framed, though, like the thumbnail is: the boxes have to describe the photo
+    as it is shown, or a viewer would draw them over a crop they do not match.
+    That is what `db.clear_detections` in the crop endpoint is for.
+    """
+    im = Image.open(render_output(root_node_id))
+    # Before load(), which is when the hint takes effect — this is `mean_color`'s
+    # trick, and here it is the difference between a 4-minute pass over the
+    # library and a 25-minute one.
+    im.draft("RGB", (detect.DECODE_HINT, detect.DECODE_HINT))
+    found = detect.detect(np.asarray(im.convert("RGB")))
+    db.set_detections(image_id, found)
+    return found
 
 
 # The point cloud paints each image in its own average color, which is what

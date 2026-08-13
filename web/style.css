@@ -1002,6 +1002,29 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   gap: 0.3rem;
 }
 #embed-edit-row[hidden] { display: none; } /* the id rule above beats UA [hidden] */
+/* The tag row wraps, like the edit row above it — a library reaches most of
+   COCO's 80 classes, and 70-odd chips on one line is a scrollbar you have to
+   drag past the tail of to find anything. Wrapped they are all on screen at
+   once, which is what a filter row is for.
+   The height is capped only as a backstop against a pathological header, and
+   the cap is deliberately far above what a real library reaches: all 80 classes
+   wrap to five lines at a narrow window, about 120px, against the 40vh here.
+   A cap tight enough to bite would be the horizontal scrollbar again, turned
+   ninety degrees — the first version of this used 6.5rem and clipped the last
+   chip, which is exactly the thing wrapping was meant to stop. */
+#embed-tag-row {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+#embed-tag-row[hidden] { display: none; }
+/* Chips size to their text; without this flex stretches them to fill the last
+   line of the wrap, and one chip on its own row becomes header-wide. */
+#embed-tag-row .embed-chip { flex: 0 0 auto; }
 .embed-chip {
   background: var(--panel-2);
   color: var(--muted);

@@ -20,6 +20,8 @@ from . import (
     db,
     depth,
     depth_job,
+    detect,
+    detect_job,
     embed_job,
     labels,
     rendering,
@@ -199,7 +201,29 @@ async def upload_image(file: UploadFile):
     image, created = db.create_image(file.filename or "untitled.jpg")
     if created:
         rendering.original_path(image["id"]).write_bytes(data)
+        _detect_on_import(image["id"], image["root_node_id"])
     return {**image, "duplicate": not created}
+
+
+def _detect_on_import(image_id: int, root_node_id: int) -> None:
+    """Label a freshly imported image, if that costs nothing but the ~40 ms.
+
+    Deliberately conditional on the weights already being on disk. Downloading
+    12.8 MB inside an upload would make the first import of a session mysteriously
+    slow, and `detect_job` exists precisely to sweep whatever this skips — so the
+    weak version here is free and the strong version is somebody else's job.
+
+    Never allowed to fail an upload. The bytes are already written and the row
+    already exists; labels are metadata *about* the user's photo, and a detector
+    that chokes on one frame must not be able to reject it from the library.
+    Leaving the image unstamped is what sends it to the next sweep.
+    """
+    if not detect.ready():
+        return
+    try:
+        rendering.detect_image(image_id, root_node_id)
+    except Exception as exc:
+        print(f"picky: could not detect in new image {image_id}: {exc}")
 
 
 @app.get("/api/images")
@@ -379,6 +403,11 @@ def _collect_embeddings(images: list[dict]):
                 # request the frontend would have to keep in step, and it is
                 # free here: `list_images` already selected it.
                 "effects": image["effects"],
+                # Likewise, and for the tag filter — the map's fifth. Riding on
+                # the points rather than fetched apart from them is what lets
+                # `applyEmbedFilter` resolve every per-image question in one
+                # pass over the cloud it already has.
+                "labels": image["labels"],
             }
         )
     return vectors, points
@@ -669,6 +698,55 @@ def embedding_map_progress():
     return embed_job.snapshot()
 
 
+@app.post("/api/detect/prepare")
+def prepare_detect():
+    """Start the background detection pass, and report where it already is.
+
+    `prepare_embedding_map`'s arrangement, with one difference that matters: the
+    map's pass is a cache warmer, and this one is the only thing that ever
+    writes a label. Nothing detects on demand — see `detect_job`'s docstring for
+    why a GET must not — so an image this has not reached has no tags, and the
+    tag filter simply does not offer it.
+
+    Triggered by opening the Image map, alongside the embedding pass, since that
+    is where tags are used. The 12.8 MB is the smallest download in the app by an
+    order of magnitude, which is what makes it affordable on a gesture this
+    common; every other model here is gated on the one action that needs it.
+    """
+    return detect_job.start()
+
+
+@app.get("/api/detect/progress")
+def detect_progress():
+    """Where the pass from `prepare` got to. Safe to call at any time; carries
+    `pending`, the number of images with no labels yet, so a caller can tell a
+    sweep that has never run from a library with nothing in it to find."""
+    return detect_job.snapshot()
+
+
+@app.get("/api/images/{image_id}/detections")
+def image_detections(image_id: int):
+    """One image's detected objects, strongest first.
+
+    Boxes are fractions of the framed image, so a caller multiplies by whatever
+    size it is drawing at and never has to know which render it came from.
+
+    `detected` is the honest half of the answer: an empty list under `false`
+    means nobody has looked, and under `true` means the detector looked and
+    found none of its eighty nouns. Absent COCO classes are the common case —
+    the model has no word for a macaque, a temple or a mountain — so a consumer
+    must read a label's absence as "not detected", never as "not present".
+    """
+    image = db.get_image(image_id)
+    if not image:
+        raise HTTPException(404, "image not found")
+    return {
+        "image_id": image_id,
+        "detected": image["detected_at"] is not None,
+        "detections": db.get_detections(image_id),
+    }
+
+
 @app.get("/api/images/{image_id}")
 def get_image(image_id: int):
     image = db.get_image(image_id)
@@ -696,6 +774,11 @@ def set_crop(image_id: int, body: CropUpdate):
     # crop to one detail and the photo is semantically a different photo. This is
     # the only edge that stales an embedding — a delete takes it with the row.
     db.clear_embedding(image_id)
+    # And the same edge, for the same reason, stales every box: they are
+    # fractions of the framed image, so re-framing moves all of them and can
+    # take an object out of the picture entirely. Dropping the stamp with them
+    # is what puts the image back in `detect_job`'s queue.
+    db.clear_detections(image_id)
     return _image_response(image)
 
 

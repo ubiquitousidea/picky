@@ -151,7 +151,17 @@ restarts.
   button, which makes the map a way to navigate a large library by eye. A row of
   chips filters by *edit* rather than by subject — **Edited**, **Untouched**, and
   one per kind of effect the library actually contains, each with its count;
-  lighting several widens the filter rather than narrowing it. **PCA** is stable,
+  lighting several widens the filter rather than narrowing it. Below it a second
+  row filters by what is *in* the picture, from a pass of
+  [YOLOv8](https://docs.ultralytics.com/models/yolov8/) over the library: a chip
+  per object it found, commonest first. Its vocabulary is COCO's 80 everyday
+  things, so it is precise about a person, a dog or a bicycle and has no word at
+  all for a macaque or a temple — an object with no chip is one the detector
+  cannot name, not one your library lacks. The two rows compose with the search
+  box, which is where they earn their keep: searching *people* finds the people
+  and also some macaques and empty landscapes, because CLIP reads the whole
+  frame, and lighting **person** removes them because the detector scores a
+  region. **PCA** is stable,
   so adding an image nudges the map rather than reshuffling it; **t-SNE** draws
   tighter clumps but its layout is not comparable between runs. Points are
   painted in each photo's average color. Model weights (~335 MB) download on
@@ -193,12 +203,17 @@ Model weights are fetched to `data/models/` from revision-pinned Hugging Face
 URLs, each on the first gesture that needs it and never before: segmentation
 (~45 MB) when you click to segment, text-prompted segmentation (~139 MB) when
 you press **Find** to name an object, depth (~99 MB) when you press **Bokeh**,
-CLIP's vision tower (~335 MB) when you open the Image map, and its text tower
-(254 MB) only if you search there. To supply your own ONNX exports instead,
-point the matching env var at an absolute path — `PICKY_SAM_ENCODER`,
-`PICKY_SAM_DECODER`, `PICKY_CLIPSEG_MODEL`, `PICKY_DEPTH_MODEL`,
-`PICKY_CLIP_MODEL`, or `PICKY_CLIP_TEXT_MODEL`. Nothing else in the app
-requires any of the downloads.
+CLIP's vision tower (~335 MB) and YOLOv8n (~12.8 MB) when you open the Image
+map, and CLIP's text tower (254 MB) only if you search there. To supply your own
+ONNX exports instead, point the matching env var at an absolute path —
+`PICKY_SAM_ENCODER`, `PICKY_SAM_DECODER`, `PICKY_CLIPSEG_MODEL`,
+`PICKY_DEPTH_MODEL`, `PICKY_CLIP_MODEL`, `PICKY_CLIP_TEXT_MODEL`, or
+`PICKY_YOLO_MODEL`. Nothing else in the app requires any of the downloads.
+
+The detector's weights are the one exception to this project's licensing:
+YOLOv8n is Ultralytics', under **AGPL-3.0**, where every other model here is
+Apache-2.0 or MIT. That is worth reading before distributing Picky; running it
+locally is unaffected.
 
 ## Architecture
 
@@ -347,6 +362,9 @@ the preset is replayed against.
 | GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine, the probability the phrase beats 850 rival subjects, and a z-score over this query's own spread. 409s rather than downloading the text tower inside a GET |
 | POST   | `/api/embedding-map/prepare` | start the background embedding pass (~335 MB of weights on a fresh install, then one forward pass per image); answers `done` synchronously when nothing is missing |
 | GET    | `/api/embedding-map/progress` | where that pass got to — `state`, `phase`, `done`/`total` |
+| POST   | `/api/detect/prepare` | start the background object-detection pass (12.8 MB of weights on a fresh install, then ~40 ms per image); answers `done` synchronously when every image is already labelled |
+| GET    | `/api/detect/progress` | where that pass got to — `state`, `phase`, `done`/`total`, plus `ready` for weights an earlier run fetched and `pending` for images still unlabelled |
+| GET    | `/api/images/{id}/detections` | the objects found in one image — `label`, `score`, and a `box` in fractions of the framed image — plus `detected`, which tells "found nothing" apart from "never looked" |
 | POST   | `/api/text-model/prepare` | start fetching CLIP's text tower (254 MB), which only searching needs |
 | GET    | `/api/text-model/progress` | where that download got to, including `ready` for a tower an earlier run already fetched |
 | POST   | `/api/depth-model/prepare` | start fetching the depth model (99 MB), which only Bokeh needs |

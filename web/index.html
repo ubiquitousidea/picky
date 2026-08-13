@@ -173,6 +173,10 @@
            something actually carries. Its own line in the wrapping header: the
            chips are a set to read across, not one more control to squeeze in. -->
       <div id="embed-edit-row" hidden title="Show only the images carrying a given kind of edit"></div>
+      <!-- The same row one line down, filled from what the object detector
+           found. Wraps like the edit row, so every class the library contains is
+           on screen at once; commonest first, so the useful ones lead. -->
+      <div id="embed-tag-row" hidden title="Show only the images containing a given object. Detected from a fixed vocabulary of 80 everyday things, so an object with no chip is one the detector has no word for — not one the library lacks"></div>
     </div>
     <div id="embed-stage">
       <canvas id="embed-canvas"></canvas>
