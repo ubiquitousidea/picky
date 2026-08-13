@@ -355,6 +355,18 @@ one place silently breaks another.
   handle), and it is named after the words, because a `mask_id` is all the model
   gets while the person has a thumbnail. An object that cannot be named is still
   a whole-frame edit the model is told to own up to.
+- **The agent can open a view, not only navigate to one.** `turn.focus` is one
+  photo; `turn.map` is a set of them, and the browser answers it by opening the
+  Image map filtered to exactly those ids (`show_photos` → `openEmbedMap(pin)`).
+  Ids and not the query they were found with: the map has to show the photos the
+  transcript directly above it just named, and replaying the words would let
+  Match hide some of them — the log and the cloud disagreeing about what was
+  found is the whole thing this buys. That pin is also the only filter in the
+  map nobody set by hand, which is why it is the only one carrying its own
+  button (`#embed-pinned`) and why `openEmbedMap` clears it on every open. The
+  cost is honest: a fourth filter in `applyEmbedFilter()`. What it saves is a
+  second copy of the search in the browser and, with it, the 254 MB text tower
+  on a path where nobody typed.
 - **A name buys a mask or a number, and bokeh's focus is the number.** `focus`
   is a reading on one node's normalized depth, which is why the panel fills it
   in with a picker rather than a typed value — so with `select_object` as the
@@ -505,10 +517,10 @@ one place silently breaks another.
   Scores are keyed by `image_id`, which is what lets a filter survive a
   re-projection; the threshold is applied locally, so dragging Match costs a
   redraw where typing a query costs a request.
-- **All three of the map's filters are resolved in `applyEmbedFilter()`, the one
-  writer of `p.hidden` and of the status line.** Match and the edit chips each
-  ask their question of an image alone, so they resolve together in one pass;
-  Near asks one *about the pick* — a radius in the projected cube, exponential in
+- **All four of the map's filters are resolved in `applyEmbedFilter()`, the one
+  writer of `p.hidden` and of the status line.** Match, the edit chips and the
+  assistant's pinned set each ask their question of an image alone, so they
+  resolve together in one pass; Near asks one *about the pick* — a radius in the projected cube, exponential in
   the slider with the ends clipped to 0 and Infinity — so it runs second, over
   their survivors, and turns itself off when there is no pick. That order is why
   the pick is dropped *between* the passes rather than after them, and why

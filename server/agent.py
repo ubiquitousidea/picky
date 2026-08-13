@@ -189,6 +189,10 @@ photo *looks* like. If it comes back unsure, say what it found and ask, rather \
 than editing. If the thing cannot be named — a corner, a spot, one of several \
 identical objects — apply to the whole frame and say plainly that you did, and \
 that they can click it themselves with the Select control.
+- Several photos are a map, not a list. When more than one photo answers what \
+they asked for, call `show_photos` with the ids `find_photos` gave you, best \
+first — they get the whole library laid out with those photos lit up in it, \
+which reading five filenames aloud is not. One photo is still `show_photo`.
 - Deleting is not something you do. The delete tools only describe what would \
 go; the person confirms with a button. Stop and say what you queued.
 
@@ -277,6 +281,40 @@ TOOLS = [
                 },
             },
             "required": ["image_id"],
+        },
+    },
+    {
+        "name": "show_photos",
+        "description": (
+            "Show several photos at once, by opening the 3D Image map with "
+            "exactly these photos lit up in it. This is the answer to 'show me "
+            "photos of X' when more than one photo fits — a list of filenames "
+            "in the log is not the same thing as seeing them.\n\n"
+            "Pass the image_ids find_photos returned, best first. Use "
+            "show_photo instead when one photo is the answer. The map shows "
+            "precisely the photos you name and nothing else, so unlike a "
+            "search you may say how many."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "The photos to light up, best match first. The first "
+                        "one is put on screen behind the map."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "What you searched for, in the person's words. It "
+                        "labels the button that clears the filter."
+                    ),
+                },
+            },
+            "required": ["image_ids", "description"],
         },
     },
     {
@@ -486,11 +524,20 @@ class _Turn:
     the model finished. `pending` is a destructive action waiting on a button.
     `steps` is the transcript the row prints, so the person can see what was
     done to their library rather than trusting a summary of it.
+
+    `map` is the other half of `focus`: `focus` is one photo to navigate to,
+    this is a set of photos to open the Image map filtered to. It carries the
+    *ids* and not the words they were found with, because the map has to show
+    what the transcript directly above it just named — a query replayed there
+    would answer a slightly adjacent question, and the map's Match slider could
+    then disagree with the log. The words ride along only to label the chip that
+    turns the filter off.
     """
 
     def __init__(self, context: dict):
         self.context = context
         self.focus: dict | None = None
+        self.map: dict | None = None
         self.pending: dict | None = None
         self.steps: list[dict] = []
 
@@ -633,6 +680,55 @@ def _show_photo(args: dict, turn: _Turn) -> tuple[str, str]:
             }
         ),
         f"showed {image['name']} · {_chain(node)}",
+    )
+
+
+def _show_photos(args: dict, turn: _Turn) -> tuple[str, str]:
+    """Several photos at once — the Image map, filtered to exactly these ids.
+
+    The plural of `_show_photo` and not a variation on `_find_photos`: searching
+    is what produced the ids, this only says which of them to light up. The
+    browser pins the cloud to the list rather than re-running the words, so the
+    map cannot show a different set from the one the model just named in the
+    log — see `_Turn`.
+    """
+    description = str(args.get("description") or "").strip()
+    if not description:
+        raise _ToolError("description must not be empty")
+
+    raw = args.get("image_ids") or []
+    if not isinstance(raw, list):
+        raise _ToolError("image_ids must be a list of photo ids")
+    ids, seen = [], set()
+    for value in raw:
+        image_id = int(value)
+        if image_id not in seen:
+            seen.add(image_id)
+            ids.append(image_id)
+    if not ids:
+        raise _ToolError("image_ids must name at least one photo")
+    # The ceiling `find_photos`' `limit` already has, since that is where these
+    # came from: a map lit up with the whole library is the unfiltered map.
+    ids = ids[:10]
+
+    # `_node_of` for the existence check every write does, so an id the model
+    # invented comes back as a sentence it can recover from rather than as a
+    # cloud with a hole in it.
+    roots = [_node_of(image_id, None) for image_id in ids]
+    names = [db.get_image(image_id)["name"] for image_id in ids]
+
+    turn.map = {"query": description, "image_ids": ids}
+    # The best match goes on screen behind the map — but not when it is already
+    # the open photo: `_node_of` resolves to the *original*, so focusing it
+    # would drag the person off the edited node they were looking at to answer
+    # a question about the library. Same photo, no move; the map centres on
+    # `state.imageId`, which is that photo either way.
+    if ids[0] != turn.context.get("image_id"):
+        turn.focus = {"image_id": ids[0], "node_id": roots[0]["id"]}
+
+    return (
+        json.dumps({"opened": "the Image map", "query": description, "showing": names}),
+        f"showed {len(ids)} photos for “{description}” in the Image map",
     )
 
 
@@ -1062,6 +1158,7 @@ def _delete_photo(args: dict, turn: _Turn) -> tuple[str, str]:
 HANDLERS = {
     "find_photos": _find_photos,
     "show_photo": _show_photo,
+    "show_photos": _show_photos,
     "list_photo_nodes": _list_photo_nodes,
     "select_object": _select_object,
     "measure_focus": _measure_focus,
@@ -1136,8 +1233,9 @@ def run_turn(prompt: str, history: list, context: dict) -> dict:
     """One request from the box, played out to the end.
 
     Returns the reply, the transcript, the updated history for the client to
-    hold, where to navigate, any destructive action awaiting a button, and the
-    round-by-round record of what actually went to the API.
+    hold, where to navigate, what to open the Image map on, any destructive
+    action awaiting a button, and the round-by-round record of what actually
+    went to the API.
     """
     turn = _Turn(context)
     messages = _trim([dict(m) for m in history]) + [{"role": "user", "content": prompt}]
@@ -1217,6 +1315,7 @@ def run_turn(prompt: str, history: list, context: dict) -> dict:
         "steps": turn.steps,
         "history": messages,
         "focus": turn.focus,
+        "map": turn.map,
         "pending": turn.pending,
         "wire": wire,
     }

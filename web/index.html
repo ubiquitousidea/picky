@@ -131,6 +131,12 @@
       <h2>Image map</h2>
       <input id="embed-search" type="search" placeholder="Search…" autocomplete="off"
              title="Show only the images that match a description. The first search downloads a 254 MB text model.">
+      <!-- The assistant's filter and its off switch in one: shown, labelled and
+           hidden by applyEmbedFilter(), which owns what the header says about
+           what is hidden. Explicitly type="button" for the edit chips' reason —
+           inside a <dialog> the default would close the map on the first press. -->
+      <button id="embed-pinned" class="embed-chip on" type="button" hidden
+              title="Showing only the photos the assistant found. Press to show the whole library again."></button>
       <label id="embed-match-row" hidden title="How strong a match to keep, in standard deviations above this query's mean score across the library">
         Match
         <input id="embed-match" type="range" min="0.5" max="3" step="0.1" value="1.2">

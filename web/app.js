@@ -3198,6 +3198,17 @@ const embedMap = {
   matchZ: 1.2,
   searchTimer: null,
   searchSeq: 0,
+  // What the assistant found, when a turn opened the map: `{query, ids: Set}`,
+  // or null for off, the same off state `edits` has. Ids and not a query
+  // because the map has to show the photos the log directly above it just
+  // named — re-running the words would answer a slightly different question,
+  // and Match could then hide photos the assistant said it had found.
+  //
+  // It is also the one filter in here nobody set by hand, which is why it is
+  // the only one that ships with its own visible button (`#embed-pinned`): the
+  // others are the control you already pressed, this one has to say what it is
+  // and how to be rid of it.
+  pinned: null,
   // The Near filter's slider position, 0..1 — an exponent, not a radius (see
   // embedNearRadius), and 1 is the whole travel's worth of "off". Resets on
   // every open, like the query and unlike matchZ: hiding all but a
@@ -3373,7 +3384,9 @@ function pickEmbedPoint(point) {
   applyEmbedFilter();
 }
 
-async function openEmbedMap() {
+// `pin` is `{query, image_ids}` from an agent turn's `map`, or nothing at all
+// when a person pressed the header button — see runAgent().
+async function openEmbedMap(pin = null) {
   embedMap.open = true;
   embedMap.selected = null;
   // yaw/pitch persist across opens on purpose, but the framing does not: a map
@@ -3390,6 +3403,13 @@ async function openEmbedMap() {
   setNearSlider(1);
   // Same argument again for the edit chips, which hide even more than Near can.
   embedMap.edits = null;
+  // And the strongest version of it for the assistant's pinned set: a map
+  // reopened still showing the five photos a conversation two minutes ago
+  // turned up is hiding the library for a reason nothing on screen gives, and
+  // this is the one filter the person never chose. Cleared unconditionally
+  // here and re-applied below, so one place still decides what an opened map
+  // looks like and `pin` is an explicit override rather than leftover state.
+  embedMap.pinned = null;
   // The two checkboxes are the other direction: their flags outlive the open, so
   // the markup has to be told what they are. Without this the box and the flag
   // are two sources of truth that agree only until you toggle one.
@@ -3401,7 +3421,19 @@ async function openEmbedMap() {
   // sized only now: a closed <dialog> has a zero-size bounding rect
   sizeEmbedCanvas();
   // centred on the image you are working on — see loadEmbedMap
-  if (await prepareEmbedMap()) await loadEmbedMap(true);
+  if (!(await prepareEmbedMap())) return;
+  await loadEmbedMap(true);
+  // Only now, and only on a map that loaded: prepareEmbedMap() leaves its
+  // explanation in #embed-status when the vision model could not be had, and
+  // applyEmbedFilter() is the sole writer of that line — filtering over a
+  // failed prepare would paint "0 of 0" over the sentence saying what went
+  // wrong. Ids and nothing else, so this never touches the search box, which
+  // is what keeps "only the search box fetches the 254 MB text tower" true of
+  // a map the assistant opened.
+  if (pin) {
+    embedMap.pinned = { query: pin.query, ids: new Set(pin.image_ids) };
+    applyEmbedFilter();
+  }
 }
 
 // The embedding pass runs on a thread of the server's, and this polls it so the
@@ -3645,6 +3677,7 @@ function embedFiltering() {
   return !!(
     embedMap.scores ||
     embedMap.edits ||
+    embedMap.pinned ||
     (embedMap.selected && embedNearRadius(embedMap.nearT) !== Infinity)
   );
 }
@@ -3668,17 +3701,27 @@ function matchesEdits(p) {
 // re-run this and nothing else, so they are instant the way Size is, where a new
 // query costs a request the way Groups does.
 //
-// The three filters compose, and are not symmetric. The search and the edit
-// chips each ask a question of an image on its own, so they resolve together in
-// one pass; Near asks one *about the pick*, so it is applied second, over the
-// survivors, and turns itself off when there is no pick to measure from.
+// The four filters compose, and are not symmetric. The search, the edit chips
+// and the assistant's pinned set each ask a question of an image on its own, so
+// they resolve together in one pass; Near asks one *about the pick*, so it is
+// applied second, over the survivors, and turns itself off when there is no
+// pick to measure from.
 function applyEmbedFilter() {
   $("embed-match-row").hidden = !embedMap.scores;
+  // The pin's own control, written here with the Match row rather than
+  // wherever the pin is set: this function owns what the header says about
+  // what is hidden, exactly as it owns the status line below.
+  $("embed-pinned").hidden = !embedMap.pinned;
+  if (embedMap.pinned) {
+    $("embed-pinned").textContent =
+      `Assistant: “${embedMap.pinned.query}” ${embedMap.pinned.ids.size}`;
+  }
   for (const p of embedMap.points) {
     const entry = embedMap.scores && embedMap.scores[p.image_id];
     p.hidden =
       (!!embedMap.scores && (!entry || entry.z < embedMap.matchZ)) ||
-      (!!embedMap.edits && !matchesEdits(p));
+      (!!embedMap.edits && !matchesEdits(p)) ||
+      (!!embedMap.pinned && !embedMap.pinned.ids.has(p.image_id));
   }
   // A pick that just went invisible would otherwise leave the card floating
   // over a point nobody can see, with Open still wired to it. It has to happen
@@ -3702,7 +3745,7 @@ function applyEmbedFilter() {
   }
   markEmbedDirty();
 
-  if (!embedMap.scores && !embedMap.edits && !near) {
+  if (!embedMap.scores && !embedMap.edits && !embedMap.pinned && !near) {
     $("embed-status").textContent = embedIdleStatus();
     return;
   }
@@ -3714,17 +3757,24 @@ function applyEmbedFilter() {
   // null pick. The trailing hint is by precedence instead — whichever filter is
   // hardest to notice you left on is the one worth telling you how to clear.
   const clauses = [];
+  if (embedMap.pinned) clauses.push(`are what the assistant found for “${embedMap.pinned.query}”`);
   if (embedMap.scores) clauses.push(`match “${embedMap.query}”`);
   if (embedMap.edits) clauses.push(`have ${[...embedMap.edits].map(editPhrase).join(" or ")}`);
   if (near) clauses.push(`are near ${anchor.name}`);
-  const hint = embedMap.scores
-    ? "drag Match to widen · clear the box to show all"
-    : embedMap.edits
-      ? "press a lit chip to clear it"
-      : "drag Near to widen · pick another image to move the circle";
-  // Two clauses read "a and b", three "a, b and c" — the second spelling is only
-  // reachable now that there are three filters, and "a and b and c" was the
-  // sentence that made it obvious a list had grown out of a ternary.
+  // The pin goes first in the precedence for the same reason it is the only
+  // filter with a button of its own: every other one names a control the person
+  // reached for, so it is the one they are least likely to work out they can
+  // switch off.
+  const hint = embedMap.pinned
+    ? "press the assistant's chip to show the library again"
+    : embedMap.scores
+      ? "drag Match to widen · clear the box to show all"
+      : embedMap.edits
+        ? "press a lit chip to clear it"
+        : "drag Near to widen · pick another image to move the circle";
+  // Two clauses read "a and b", more than two "a, b and c" — the second
+  // spelling became reachable with the third filter, and "a and b and c" was
+  // the sentence that made it obvious a list had grown out of a ternary.
   const list =
     clauses.length > 2
       ? `${clauses.slice(0, -1).join(", ")} and ${clauses[clauses.length - 1]}`
@@ -3741,6 +3791,15 @@ function clearEmbedSearch() {
   // Not a loop clearing `p.hidden` here: Near may still be filtering, and
   // revealing the whole library because a *query* ended would show images the
   // other filter says are out. applyEmbedFilter() owns that flag.
+  applyEmbedFilter();
+}
+
+// The assistant's filter, dismissed. Shaped like clearEmbedSearch() and for its
+// reason: `p.hidden` is not cleared here, because the chips or Near may still
+// be filtering and revealing the whole library would show images they say are
+// out. applyEmbedFilter() owns that flag.
+function clearEmbedPin() {
+  embedMap.pinned = null;
   applyEmbedFilter();
 }
 
@@ -4315,7 +4374,11 @@ function initEmbedMap() {
     await selectImage(point.image_id);
     await refreshGallery();
   };
-  $("embed-btn").onclick = openEmbedMap;
+  // Wrapped, not passed: openEmbedMap takes a pin now, and a bare handler would
+  // hand it the click event — a map opened filtered to whatever `image_ids` a
+  // PointerEvent has, which is nothing, so an empty cloud.
+  $("embed-btn").onclick = () => openEmbedMap();
+  $("embed-pinned").onclick = clearEmbedPin;
   $("embed-close-btn").onclick = closeEmbedMap;
   $("embed-modal").addEventListener("close", () => {
     if (embedMap.open) closeEmbedMap();
@@ -4512,6 +4575,14 @@ async function runAgent() {
     // presets together, so the row does not need to know about any of them.
     if (res.focus) await selectImage(res.focus.image_id, res.focus.node_id);
     if (res.pending) renderAgentPending(res.pending);
+    // Last of the three, and after both on purpose. It is a modal, so the steps
+    // and the reply above have to be in the log *before* it opens to be there
+    // when it closes; renderAgentPending is synchronous DOM while this awaits
+    // seconds of I/O, and a confirm button appended under a backdrop that has
+    // already taken the screen is a button nobody sees. It centres on
+    // state.imageId, which res.focus just set — so the cloud frames the photo
+    // the turn landed on.
+    if (res.map) await openEmbedMap(res.map);
   } catch (err) {
     // Into the log, never an alert(): alert() blocks, and this is a control you
     // press over and over.
