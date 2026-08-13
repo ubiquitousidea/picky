@@ -161,7 +161,11 @@ restarts.
   box, which is where they earn their keep: searching *people* finds the people
   and also some macaques and empty landscapes, because CLIP reads the whole
   frame, and lighting **person** removes them because the detector scores a
-  region. **PCA** is stable,
+  region. Type a word that *names* one of the 80 classes — *people*, *dogs*,
+  *a cat*, *bike* — and its chip lights automatically, with the status line
+  saying so; press it to search without it. A word the detector has no class
+  for lights nothing, and a chip you press yourself is never overridden by a
+  later search. **PCA** is stable,
   so adding an image nudges the map rather than reshuffling it; **t-SNE** draws
   tighter clumps but its layout is not comparable between runs. Points are
   painted in each photo's average color. Model weights (~335 MB) download on
@@ -359,7 +363,7 @@ the preset is replayed against.
 | PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
 | DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
 | GET    | `/api/embedding-map` | the whole library as 3D points (`method`: `tsne`\|`pca`, `clusters`: 0 for an automatic count, else 2–20), plus named cluster centres. Embeds anything it finds missing, so it answers with or without a `prepare`; the fit itself is cached against the vectors that produced it |
-| GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine, the probability the phrase beats 850 rival subjects, and a z-score over this query's own spread. 409s rather than downloading the text tower inside a GET |
+| GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine, the probability the phrase beats 850 rival subjects, and a z-score over this query's own spread; plus `tag`, the COCO class the phrase names, if any. 409s rather than downloading the text tower inside a GET |
 | POST   | `/api/embedding-map/prepare` | start the background embedding pass (~335 MB of weights on a fresh install, then one forward pass per image); answers `done` synchronously when nothing is missing |
 | GET    | `/api/embedding-map/progress` | where that pass got to — `state`, `phase`, `done`/`total` |
 | POST   | `/api/detect/prepare` | start the background object-detection pass (12.8 MB of weights on a fresh install, then ~40 ms per image); answers `done` synchronously when every image is already labelled |

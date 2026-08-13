@@ -258,6 +258,10 @@ one place silently breaks another.
   people are two pixels on a mountaintop. Neither filter does that alone, which
   is the whole argument for paying for a second model; it is also why the tag
   chips are a filter beside the search rather than a term folded into it.
+  Typing a class name lights the chip for you (`autoLightTag`), but that is a
+  shortcut *to* the visible control, not a hidden term in the ranking — a boost
+  folded into the score would make search sharply better for eighty words and
+  identical for everything else, with nothing on screen saying which happened.
 - **`images.embedding` is a column, not a file.** Image ids are rowids SQLite
   reuses, so an `<image_id>.npy` would outlive its image and be read back as its
   successor's position in the cloud. It embeds the *thumbnail*, so re-framing
@@ -594,7 +598,20 @@ one place silently breaks another.
   most of COCO's eighty classes in play, alphabetical leads with "airplane 2"
   and buries "person 435", and the count is half of what a chip says. The row's
   `max-height` is a backstop against a library holding every class, not its
-  normal appearance. There is no `none` token to match the edit row's — "carries no effects" is a fact about the
+  normal appearance.
+- **A query that *names* a class lights its chip, and `embedMap.autoTag` records
+  that the search did it rather than a person** (`autoLightTag`). That one
+  distinction is the whole feature: a later query may replace or extinguish the
+  chip it lit, and may never touch a row someone has pressed — `toggleTagToken`
+  nulls `autoTag`, and from then on the row is the person's until they clear it.
+  `clearEmbedSearch` puts out an auto chip and leaves a hand-lit one, for the
+  mirror of that reason. Two further guards: it refuses to light a chip no image
+  carries, since `person` on an unswept library hides all of it, and the hint
+  ranks an auto-lit tag above the search itself, because with the pin it is one
+  of only two filters that can be on without anyone having pressed anything.
+  The matching is `detect.class_for_query` and is deliberately literal — a
+  filter *hides photos*, so it must fire for a reason the person can
+  reconstruct. There is no `none` token to match the edit row's — "carries no effects" is a fact about the
   library, but "contains no objects" would be a claim about a detector that
   cannot see most things.
 - **The map opens on the image you are working on** (`state.imageId`), picked

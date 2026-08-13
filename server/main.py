@@ -538,6 +538,12 @@ def search_embedding_map(q: str):
     same strictness under either scoring: the two distributions have comparable
     spread and skew, so the frontend's default needed no recalibration.
 
+    `tag` is the other half of the answer, and is not a score at all: the COCO
+    class the phrase *names*, for the map to light its tag chip from. It is
+    deliberately literal (see `detect.class_for_query`) — the detector sharpens
+    a query only for the eighty things it knows, and a filter that hides photos
+    has to fire for a reason the person can reconstruct.
+
     Three numbers per image, because they answer three questions. `z` is what the
     Match slider filters on. `p` is the probability behind it, which is the one a
     person can read — 0.64 for "mountain" against this library, 0.05 for
@@ -612,7 +618,18 @@ def search_embedding_map(q: str):
         if probs is not None:
             entry["p"] = round(float(probs[index]), 4)
         out[str(point["image_id"])] = entry
-    return {"query": query, "mean": mean, "std": std, "scores": out}
+    return {
+        "query": query,
+        "mean": mean,
+        "std": std,
+        # The COCO class this phrase *names*, if it names one — what the map
+        # lights its tag chip from. Answered here rather than in the browser so
+        # `detect.CLASS_ALIASES` stays the one place that knows "people" means
+        # `person`, and it rides on the search response because a query is the
+        # only thing that ever asks the question.
+        "tag": detect.class_for_query(query),
+        "scores": out,
+    }
 
 
 @app.post("/api/text-model/prepare")

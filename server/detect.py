@@ -111,6 +111,81 @@ COCO_CLASSES = [
 ]
 
 
+# Words that name a COCO class without being one. Deliberately a written list
+# and not a similarity, which is the obvious alternative and was measured before
+# this was written: CLIP puts "man" 0.681 from `person` and "woman" 0.646, so
+# every threshold that fires for one fails the other, and "vehicle" sits at
+# 0.785 from `car` alone when it means four classes at once. A phrase does worse
+# still — "people walking" lands at 0.209 and would never fire. So this answers
+# the narrow question it is named for, "does this phrase *name* a class", and
+# leaves the fuzzy one to the chips, which are right there to be pressed.
+#
+# Anything not here simply does not auto-light, which is the safe failure: the
+# search is unchanged and the person presses a chip, exactly as before.
+CLASS_ALIASES = {
+    "people": "person", "human": "person", "humans": "person",
+    "man": "person", "men": "person", "woman": "person", "women": "person",
+    "child": "person", "children": "person", "kid": "person",
+    "boy": "person", "girl": "person", "guy": "person",
+    "puppy": "dog", "kitten": "cat", "kitty": "cat",
+    "bike": "bicycle", "motorbike": "motorcycle", "automobile": "car",
+    "plane": "airplane", "aeroplane": "airplane",
+    "phone": "cell phone", "mobile": "cell phone", "television": "tv",
+    "sofa": "couch", "houseplant": "potted plant", "pushbike": "bicycle",
+}
+
+# Stripped from the front before matching, so "a dog" and "my cat" still name a
+# class. Not a general stopword list — these are the words that precede a noun
+# someone is searching for.
+_LEADING = ("a ", "an ", "the ", "my ", "some ")
+
+_CLASS_SET = set(COCO_CLASSES)
+
+
+def _singular(word: str) -> str | None:
+    """English plural undone far enough for eighty concrete nouns.
+
+    Not a stemmer: `buses` -> `bus` and `berries` -> `berry` is the whole job,
+    over a fixed vocabulary that contains no irregular plurals at all.
+    """
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return word[:-2]
+    if word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return None
+
+
+def class_for_query(text: str) -> str | None:
+    """The COCO class a typed phrase *names*, or None if it names none.
+
+    Exact, after lowercasing, collapsing whitespace, dropping a leading article
+    and undoing a plural — plus `CLASS_ALIASES` for the words that name a class
+    without being one. "dogs", "a dog" and "puppy" all answer `dog`; "animal",
+    "pet" and "something furry" all answer None.
+
+    The point of being this literal is that the caller lights a filter with the
+    answer, and a filter is a thing that *hides photos*. A rule someone can hold
+    in their head — it fired because I typed the word — is worth more here than
+    one that catches more cases and occasionally hides a third of the library
+    for a reason nobody can reconstruct.
+    """
+    phrase = " ".join(text.lower().split())
+    for lead in _LEADING:
+        if phrase.startswith(lead):
+            phrase = phrase[len(lead):]
+            break
+    for candidate in (phrase, _singular(phrase)):
+        if candidate is None:
+            continue
+        if candidate in _CLASS_SET:
+            return candidate
+        if candidate in CLASS_ALIASES:
+            return CLASS_ALIASES[candidate]
+    return None
+
+
 def model_path() -> Path:
     """Where the weights live — env override, else `data/models/`.
 

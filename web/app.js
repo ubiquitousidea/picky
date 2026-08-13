@@ -3233,6 +3233,12 @@ const embedMap = {
   // and never "which photos have no animals" — which is also why there is no
   // "none" token here to match the edit row's.
   tags: null,
+  // The one token in `tags` that the *search* lit rather than a person, or null.
+  // Not a second copy of the filter — `tags` stays the only thing read when
+  // filtering — but the record of who set it, which is what lets a later query
+  // replace its own chip while never touching one that was pressed. See
+  // autoLightTag().
+  autoTag: null,
   // `open` is the sentinel that keeps closeEmbedMap() from recursing when Esc
   // fires the dialog's `close` event, the same idiom #edit-modal uses.
   open: false,
@@ -3415,6 +3421,7 @@ async function openEmbedMap(pin = null) {
   embedMap.edits = null;
   // And for the tag chips, which are the same control one row down.
   embedMap.tags = null;
+  embedMap.autoTag = null;
   // And the strongest version of it for the assistant's pinned set: a map
   // reopened still showing the five photos a conversation two minutes ago
   // turned up is hiding the library for a reason nothing on screen gives, and
@@ -3647,6 +3654,7 @@ async function runEmbedSearch() {
     const data = await api(`/api/embedding-map/search?q=${encodeURIComponent(query)}`);
     if (stale()) return;
     embedMap.scores = data.scores;
+    autoLightTag(data.tag);
     applyEmbedFilter();
   } catch (err) {
     if (stale()) return;
@@ -3752,8 +3760,39 @@ function toggleTagToken(token) {
   // Empty is off, not "an empty union matches nothing" — pressing the last lit
   // chip a second time has to show the library, not blank the map.
   embedMap.tags = set.size ? set : null;
+  // Touching the row by hand takes it over: from here the search may no longer
+  // relight or clear a chip, because the person has said what they want. See
+  // autoLightTag() for the other side of that bargain.
+  embedMap.autoTag = null;
   renderTagChips();
   applyEmbedFilter();
+}
+
+// Light the tag chip a query named, if it named one — the search box's shortcut
+// into the row below it, for the query the row exists to sharpen.
+//
+// The whole difficulty is *not stomping a person's own filter*, so the rule is
+// narrow: this may only touch the row while the row is either empty or holding
+// exactly what this last put there. Press any chip by hand and `autoTag` goes
+// null in toggleTagToken(), and from then on the row is yours until you clear
+// it — a search that silently relit its own chip over a set you had curated
+// would be the map hiding photos for a reason nothing on screen gives, which is
+// the thing every filter here is written to avoid.
+//
+// It also refuses to light a chip no image can answer. `person` on a library
+// nobody has run the detector over hides *everything*, and a blank map is a
+// worse answer than an unsharpened search.
+function autoLightTag(token) {
+  const owned =
+    !embedMap.tags ||
+    (embedMap.autoTag &&
+      embedMap.tags.size === 1 &&
+      embedMap.tags.has(embedMap.autoTag));
+  if (!owned) return;
+  const known = token && embedMap.points.some((p) => (p.labels || []).includes(token));
+  embedMap.autoTag = known ? token : null;
+  embedMap.tags = known ? new Set([token]) : null;
+  renderTagChips();
 }
 
 // Whether one image carries any lit tag. OR, like matchesEdits and for its
@@ -3889,13 +3928,19 @@ function applyEmbedFilter() {
   // filter with a button of its own: every other one names a control the person
   // reached for, so it is the one they are least likely to work out they can
   // switch off.
+  // An auto-lit tag outranks even the search in this precedence, and is second
+  // only to the assistant's pin: every other filter here names a control the
+  // person reached for, and these two are the only ones that can be on without
+  // anyone having pressed anything.
   const hint = embedMap.pinned
     ? "press the assistant's chip to show the library again"
-    : embedMap.scores
-      ? "drag Match to widen · clear the box to show all"
-      : embedMap.edits || embedMap.tags
-        ? "press a lit chip to clear it"
-        : "drag Near to widen · pick another image to move the circle";
+    : embedMap.autoTag
+      ? `“${embedMap.autoTag}” was lit by your search · press it to search without it`
+      : embedMap.scores
+        ? "drag Match to widen · clear the box to show all"
+        : embedMap.edits || embedMap.tags
+          ? "press a lit chip to clear it"
+          : "drag Near to widen · pick another image to move the circle";
   // Two clauses read "a and b", more than two "a, b and c" — the second
   // spelling became reachable with the third filter, and "a and b and c" was
   // the sentence that made it obvious a list had grown out of a ternary.
@@ -3912,6 +3957,15 @@ function clearEmbedSearch() {
   embedMap.scores = null;
   embedMap.searchSeq++; // abandon an in-flight search, download poll included
   clearTimeout(embedMap.searchTimer);
+  // A chip the *search* lit goes out with the search that lit it — it was never
+  // pressed, so leaving it on would hide most of the library with nothing left
+  // on screen explaining why. A chip pressed by hand survives, for the mirror
+  // of that reason: it was chosen, and ending a query is not unchoosing it.
+  if (embedMap.autoTag) {
+    embedMap.tags = null;
+    embedMap.autoTag = null;
+    renderTagChips();
+  }
   // Not a loop clearing `p.hidden` here: Near may still be filtering, and
   // revealing the whole library because a *query* ended would show images the
   // other filter says are out. applyEmbedFilter() owns that flag.
