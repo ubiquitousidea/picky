@@ -973,7 +973,7 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
 #embed-search::placeholder { color: var(--muted); }
 /* The sprite size slider, sitting with the other header chips. Green like the
    map's own heading, where a param slider would be orange. */
-#embed-size-row, #embed-cluster-row, #embed-match-row, #embed-near-row,
+#embed-size-row, #embed-match-row, #embed-near-row,
 #embed-orbit-row, #embed-spin-row {
   display: flex;
   align-items: center;
@@ -985,7 +985,6 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
    attribute — which the id rule above beats, so it needs saying. */
 #embed-match-row[hidden] { display: none; } /* the id rule above beats UA [hidden] */
 #embed-size { width: 6rem; accent-color: var(--rb-green); }
-#embed-clusters { width: 5rem; accent-color: var(--rb-green); }
 #embed-match { width: 5rem; accent-color: var(--rb-green); }
 #embed-near { width: 5rem; accent-color: var(--rb-green); }
 /* the map's two checkboxes; green like the sliders they sit beside */
@@ -1042,13 +1041,8 @@ dialog::backdrop { background: rgba(20, 22, 27, 0.7); }
   border-color: var(--rb-green);
   color: var(--text);
 }
-/* Fixed width and tabular digits: the readout sits left of the method picker,
-   and letting 2 -> 20 shove it along makes the whole header twitch on a drag. */
-#embed-cluster-count {
-  width: 1.2rem;
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
-}
+/* Fixed width and tabular digits on both readouts: they sit mid-header, and
+   letting a value change its own width makes the whole row twitch on a drag. */
 #embed-match-num {
   width: 1.6rem; /* "0.5" to "3.0" — one decimal always shown */
   font-variant-numeric: tabular-nums;

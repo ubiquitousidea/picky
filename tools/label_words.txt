@@ -1,4 +1,7 @@
-# Subject vocabulary for the Image map's cluster labels.
+# Subject vocabulary: the rival subjects a search query is scored against.
+#
+# See server/labels.py — a photo ranks for "people" only by beating every
+# term in here, which is what keeps the macaques out of that result.
 #
 # One term per line; `#` comments and blank lines are ignored. Terms are merged
 # with the 365 Places365 scene categories (downloaded by

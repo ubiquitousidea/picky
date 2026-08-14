@@ -1,17 +1,23 @@
-"""The label vocabulary: what the Image map's clusters are named with, and what
-its search box measures a typed query against.
+"""The label vocabulary: the field of alternatives a typed query is judged
+against.
 
 CLIP was trained to put a caption and the photo it describes in the *same* 512-d
-space, so the nearest label to a group of photos is a description of what they
-have in common. That is the whole trick — no captioning model, one dot product.
+space, so a dot product between a phrase and a photo is a statement about
+whether one describes the other. A single such dot product ranks the library but
+never asks whether some *other* subject explains a photo better, which is how a
+macaque came to score about as well against "people" as a person did.
+`zero_shot_logp` asks that question by running the query against ~850 stored
+phrases as rivals — the same matrix product, read as a classification rather
+than a lookup, which is CLIP's strongest mode where the bare cosine is its
+weakest.
 
-The vocabulary has a second job, and it is not naming anything. A bare cosine
-against one query ranks the library but never asks whether some *other* subject
-explains a photo better, so a macaque scores about as well against "people" as a
-person does. `zero_shot_logp` asks that question by running the query against the
-vocabulary as a field of alternatives — the same rows, the same matrix product,
-read as a classification rather than a lookup. See it for why that is CLIP's
-strongest mode and this one's is its weakest.
+**This module used to name the Image map's clusters, and that is gone.** The
+k-means groups were real, but a nearest-label lookup answers with *something*
+for every centroid whether or not it fits, and the assignment was forced to be
+distinct, so a library with two kinds of landscape named the second after its
+own runner-up. The vocabulary survives because the harder question — not "what
+is this group" but "does this phrase beat every other phrase" — is the one it
+turned out to be good at.
 
 The text vectors are precomputed, and this module still never encodes anything.
 `tools/build_label_vectors.py` encodes a fixed vocabulary of ~850 scenes and
@@ -19,22 +25,22 @@ subjects offline and writes `label_vectors.npz` next to this file; adding a word
 means editing `tools/label_words.txt` and re-running that script — nothing here
 reads it, and nothing here loads a model.
 
-The tower that script runs is `text_embed.py`, which the Image map's search box
-made a runtime concern: a typed query is not drawn from any fixed vocabulary, so
-it has to be encoded on the spot. That does not change the bargain here. The
-vocabulary is fixed and comparing 850 rows is a matrix product, so labelling
-stays a table lookup and stays correct on a machine that has never downloaded
-the text model at all.
+The tower that script runs is `text_embed.py`, which the search box made a
+runtime concern: a typed query is not drawn from any fixed vocabulary, so it has
+to be encoded on the spot. The rivals it is scored against are not, which is why
+they stay precomputed — 850 phrases is a matrix product against a file, not 850
+forward passes on every keystroke.
 
 **The joint space is a precondition, not a given.** `embed.py` deliberately
 accepts either CLIP export: a projection export's 512-d `image_embeds`, which is
 the shared image/text space, or a bare vision export's 768-d `pooler_output`,
 which is not in *any* text space at all. Image-to-image similarity is fine under
-both, which is why `embed.py` treats the width as data — but labelling is only
-meaningful under the first. A 768-d cache compared against 512-d labels would
-not raise; it would be a shape error if we were lucky and silent nonsense if the
-widths ever coincided. So the width is checked, and a mismatch yields no labels
-rather than wrong ones: the map still draws, it just says nothing.
+both, which is why `embed.py` treats the width as data — but comparing a photo
+to a *phrase* is only meaningful under the first. A 768-d cache scored against
+512-d rivals would not raise; it would be a shape error if we were lucky and
+silent nonsense if the widths ever coincided. So the width is checked, and a
+mismatch yields no rivals rather than wrong ones: search falls back to the bare
+cosine it used before any of this existed.
 """
 
 import functools
@@ -69,12 +75,12 @@ LOGIT_SCALE = 100.0
 def vocabulary():
     """`(names, unit float32 (L, D))`, or None if there is no usable file.
 
-    Cached for the process: it is ~800 KB on disk and immutable, and the map
-    re-reads it on every request and every drag of the cluster slider.
+    Cached for the process: it is ~800 KB on disk and immutable, and every
+    keystroke in the search box reads it.
 
     Missing or unreadable is not an error. The file is generated, not authored,
-    so a checkout that has never run the build script still serves a working
-    Image map — one without labels.
+    so a checkout that has never run the build script still searches — just on
+    the bare cosine, with nothing for a query to outscore.
     """
     if not VECTORS_PATH.is_file():
         return None
@@ -97,12 +103,11 @@ def _cone_axis() -> np.ndarray | None:
     between two of them and so carries no information about either. Averaging the
     vocabulary estimates it, and `_decone` projects it out.
 
-    Nothing else needs this. Image-text cosines are compared *across images*
-    against one fixed query, where a constant offset cancels; it is only
-    text-to-text, comparing one query against 850 different terms, that the cone
-    dominates. That is why `label_clusters` below does not decone and must not:
-    its scores are already exposed as a confidence, and shifting them would
-    change what every existing label's number means.
+    Only the synonym test needs this, and nothing else should reach for it.
+    Image-text cosines are compared *across images* against one fixed query,
+    where a constant offset cancels and deconing would change every score
+    without changing any ranking; it is only text-to-text, one query against 850
+    different terms, that the cone dominates.
     """
     vocab = vocabulary()
     if vocab is None:
@@ -152,9 +157,8 @@ def zero_shot_logp(vectors: np.ndarray, query: np.ndarray) -> np.ndarray | None:
         return None
     _, terms = vocab
     if terms.shape[1] != vectors.shape[1] or terms.shape[1] != query.shape[0]:
-        # Not the joint space — this module's docstring explains the whole trap,
-        # and this is `label_clusters`' answer to it: say nothing rather than
-        # something wrong, and let the caller fall back to a plain cosine.
+        # Not the joint space — see the note on it below. Say nothing rather
+        # than something wrong, and let the caller fall back to a plain cosine.
         print(
             f"picky: query is {query.shape[0]}-d and labels are {terms.shape[1]}-d "
             f"but embeddings are {vectors.shape[1]}-d; skipping distractor scoring"
@@ -171,48 +175,3 @@ def zero_shot_logp(vectors: np.ndarray, query: np.ndarray) -> np.ndarray | None:
     # unit length everywhere here, so every dot product is a cosine.
     logits = LOGIT_SCALE * np.hstack([(vectors @ query)[:, None], vectors @ rivals.T])
     return logits[:, 0] - np.logaddexp.reduce(logits, axis=1)
-
-
-def label_clusters(centroids: np.ndarray) -> list[dict]:
-    """The best distinct label for each cluster centroid, in row order.
-
-    Centroids must be unit length and in the same space as the labels; both
-    conditions are the caller's (`main._cluster`) to meet.
-
-    Assignment is greedy and *exclusive*: the strongest cluster/label pair in
-    the whole matrix is taken first, then the next over the clusters and labels
-    still free. Independent argmaxes would be simpler and worse — neighbouring
-    clusters of one library tend to share a nearest label, so a photographer
-    with two kinds of landscape gets "mountain" twice and learns nothing about
-    either. Forcing distinct labels makes the second cluster name its own runner
-    up, which is exactly the distinction being asked about.
-    """
-    vocab = vocabulary()
-    blank = [{"label": None, "score": 0.0} for _ in centroids]
-    if vocab is None or len(centroids) == 0:
-        return blank
-    names, vectors = vocab
-    if vectors.shape[1] != centroids.shape[1]:
-        # Not the joint space — see this module's docstring.
-        print(
-            f"picky: labels are {vectors.shape[1]}-d but embeddings are "
-            f"{centroids.shape[1]}-d; skipping cluster labels"
-        )
-        return blank
-
-    # Both sides are unit length, so the dot product is the cosine.
-    scores = centroids @ vectors.T
-    remaining = scores.copy()
-    out = blank
-    for _ in range(min(len(centroids), len(names))):
-        flat = int(np.argmax(remaining))
-        cluster, label = divmod(flat, remaining.shape[1])
-        out[cluster] = {
-            "label": names[label],
-            "score": round(float(scores[cluster, label]), 4),
-        }
-        # Strike the row and the column: this cluster is named, and no other
-        # cluster may take this label.
-        remaining[cluster, :] = -np.inf
-        remaining[:, label] = -np.inf
-    return out

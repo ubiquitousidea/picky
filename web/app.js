@@ -3166,16 +3166,6 @@ const embedMap = {
   // the framing — it is a reading preference for a library of a given density,
   // not part of where you happen to be looking.
   spriteScale: 1,
-  // Groups of similar images, each named by the nearest CLIP text label the
-  // server could find (see server/labels.py). Positions are in the same
-  // normalized cube as the points, so they project through the same closure.
-  clusters: [],
-  // How many groups to ask for. 0 means "you choose", which is what the server
-  // does from the library size — so the slider is initialized from the first
-  // response rather than duplicating that formula here, and only pins a value
-  // once you actually drag it.
-  clusterCount: 0,
-  clusterTimer: null,
   // Thumbnails to draw at each point, keyed by URL (see embedSprite). Kept
   // across opens: a baked sprite is immutable for its key, so a reopened map
   // should be instant rather than re-fetching a library it already has.
@@ -3276,19 +3266,6 @@ function embedNearRadius(t) {
   if (t <= 0) return 0; // only the pick itself, which is at distance 0
   if (t >= 1) return Infinity; // off
   return EMBED_NEAR_MIN * Math.pow(EMBED_NEAR_MAX / EMBED_NEAR_MIN, t);
-}
-
-// One hue per cluster, spun by the golden angle so that however many groups
-// there are, adjacent ids land far apart on the wheel and no two of a dozen
-// collide. Derived rather than sent: the server's job is to say which group a
-// point is in, not what colour to paint it.
-function clusterColor(index, alpha = 1) {
-  return `hsla(${(index * 137.508) % 360}, 62%, 62%, ${alpha})`;
-}
-
-function setClusterSlider(count) {
-  $("embed-clusters").value = count;
-  $("embed-cluster-count").textContent = count;
 }
 
 // The readout says the radius, not the slider position — the position is an
@@ -3563,23 +3540,16 @@ function sizeEmbedCanvas() {
 
 // `center` says the coordinates the view is framed on have just changed — the
 // map is opening, or the projection was swapped — so the framing has to be
-// rebuilt around the pick. A re-fetch that leaves the layout alone (the cluster
-// slider) passes false, or a drag would yank the view out from under itself.
+// rebuilt around the pick. A re-fetch that leaves the layout alone passes
+// false — prepareDetect() does, when a sweep finishes and the tags need
+// picking up — or the view would be yanked out from under whoever is reading
+// it.
 async function loadEmbedMap(center = false) {
   const seq = ++embedMap.seq;
   try {
-    const data = await api(
-      `/api/embedding-map?method=${embedMap.method}&clusters=${embedMap.clusterCount}`,
-    );
+    const data = await api(`/api/embedding-map?method=${embedMap.method}`);
     if (seq !== embedMap.seq || !embedMap.open) return; // stale or closed meanwhile
     embedMap.points = data.points;
-    embedMap.clusters = data.clusters;
-    // Adopt the count the server picked, so the slider shows the truth from the
-    // first frame. Only while `clusterCount` is still 0 — past that the slider
-    // is what asked for this number, and writing it back would fight a drag.
-    if (!embedMap.clusterCount && data.clusters.length) {
-      setClusterSlider(data.clusters.length);
-    }
     // Built from the points, so only kinds of edit the library actually holds
     // get a chip. Before the pick below, which re-runs the filter the chips are
     // read by.
@@ -3815,11 +3785,10 @@ function toggleEditToken(token) {
   applyEmbedFilter();
 }
 
-// Whether anything is hiding points at all — the question the cluster pills and
-// the status line both used to ask as `embedMap.scores`, which was the same
-// question only while the search was the only filter that could empty a group.
-// Near's radius is not consulted here: it does nothing without a pick, which is
-// exactly the condition below.
+// Whether anything is hiding points at all — the question the status line asks,
+// and one that used to be spelled `embedMap.scores` back when the search was the
+// only filter there was. Near's radius is not consulted here: it does nothing
+// without a pick, which is exactly the condition below.
 function embedFiltering() {
   return !!(
     embedMap.scores ||
@@ -3989,7 +3958,6 @@ function closeEmbedMap() {
   stopEmbedLoop();
   embedMap.seq++; // abandon any in-flight fetch
   embedMap.searchSeq++; // including a search, and any model download it was polling
-  clearTimeout(embedMap.clusterTimer); // and any re-fetch a drag left pending
   clearTimeout(embedMap.searchTimer);
   $("embed-modal").close();
 }
@@ -4196,12 +4164,10 @@ function drawEmbedMap() {
     const selected = p === embedMap.selected;
     const sprite = embedSprite(p);
     const dim = selected ? 0 : fade(p.sz); // the pick never dims
-    // A library too small to group (or one served by an older backend) has no
-    // cluster on its points, and keeps the hairline it always had.
-    const edge =
-      p.cluster == null
-        ? "rgba(20, 22, 27, 0.65)"
-        : clusterColor(p.cluster, 1 - dim * 1.4);
+    // One hairline for every thumbnail. This used to carry the point's cluster
+    // hue; with the groups gone there is nothing for a frame to encode, and a
+    // thumbnail already says what it is a picture of.
+    const edge = "rgba(20, 22, 27, 0.65)";
     if (sprite) {
       // half-extents, cached for the hit test: what you click is the box you saw
       const k = size / Math.max(sprite.width, sprite.height);
@@ -4238,112 +4204,8 @@ function drawEmbedMap() {
       ctx.stroke();
     }
   }
-
-  drawEmbedLabels(ctx, project, dpr, fade);
 }
 
-// One text label per cluster, floated over the cloud where its images are.
-//
-// A separate pass, after every sprite, and deliberately not depth-sorted in
-// with them: a label drawn in its own depth order disappears behind whatever
-// happens to be nearer, and in a dense collage that is most of them — which
-// would hide exactly the labels sitting on the busiest, most worth naming part
-// of the map. So a label is never *occluded*, but it still recedes: it shares
-// the sprites' `fade` curve, so a group at the back of the cloud is exactly as
-// far back as its own pictures.
-//
-// Note this fades by transparency where the sprites use a wash of the
-// background colour, which above is called out as the wrong thing to do. The
-// reason it inverts here is the same reason the pass exists: a wash preserves
-// overlap as a depth cue, and these never overlap anything. With occlusion
-// given up, alpha is the only depth cue a label has left.
-function drawEmbedLabels(ctx, project, dpr, fade) {
-  const font = 13 * dpr;
-  ctx.font = `600 ${font}px system-ui, sans-serif`;
-  ctx.textBaseline = "middle";
-  const padX = 8 * dpr;
-  const padY = 5 * dpr;
-  const lineHeight = font + padY * 2;
-
-  // While anything is filtering, count what each group still has showing. The
-  // groups themselves are deliberately not refetched — they describe the
-  // library, and recomputing k-means per keystroke would make the labels dance —
-  // but a bare count beside a filtered cloud claims pictures that are not there.
-  const shown = embedFiltering()
-    ? embedMap.points.reduce((counts, p) => {
-        if (!p.hidden && p.cluster != null) counts[p.cluster] = (counts[p.cluster] || 0) + 1;
-        return counts;
-      }, {})
-    : null;
-
-  // Nearest last, so that where two labels genuinely cannot both be placed the
-  // one in front is the one on top — the same rule the sprites follow.
-  //
-  // A group with nothing left showing drops out entirely rather than reading
-  // "0/44": the filter exists to reduce the cloud to what matched, and a dozen
-  // pills labelling empty space is most of what there would be left to look at.
-  const ordered = embedMap.clusters
-    .filter((c) => c.label && (!shown || shown[c.id]))
-    .map((c) => ({ ...c, p: project(c.x, c.y, c.z) }))
-    .sort((a, b) => a.p[2] - b.p[2]);
-
-  const placed = [];
-  for (const cluster of ordered) {
-    const suffix = shown
-      ? ` · ${shown[cluster.id] || 0}/${cluster.count}`
-      : ` · ${cluster.count}`;
-    const textW = ctx.measureText(cluster.label).width;
-    const w = textW + ctx.measureText(suffix).width + padX * 2;
-    const h = lineHeight;
-    const [x, home] = cluster.p;
-    // Nudge off anything already placed rather than solving a layout: a label
-    // that moved a line still points at its own group, and the alternative is a
-    // constraint solver for a dozen boxes that move every frame anyway.
-    //
-    // Offsets alternate below/above the true centre and grow — 0, +1, -1, +2 —
-    // so a crowd opens outwards from where the group actually is instead of
-    // sliding one way and pulling the last label a long way south. Bounded, so
-    // a genuine pile-up (twenty groups over a tight t-SNE) degrades to overlap
-    // rather than marching labels off the canvas.
-    const step = lineHeight + 2 * dpr;
-    let y = home;
-    for (let tries = 0; tries < 12; tries++) {
-      y = home + Math.ceil(tries / 2) * step * (tries % 2 ? 1 : -1);
-      const clash = placed.some(
-        (b) =>
-          Math.abs(b.x - x) < (b.w + w) / 2 && Math.abs(b.y - y) < (b.h + h) / 2,
-      );
-      if (!clash) break;
-    }
-    placed.push({ x, y, w, h });
-
-    const left = x - w / 2;
-    const top = y - h / 2;
-    // `fade` tops out at a 0.5 wash, so the furthest label is drawn at half
-    // opacity — receding without becoming a thing you have to squint at.
-    ctx.globalAlpha = 1 - fade(cluster.p[2]);
-    // A pill, not bare text: `fillText` over a collage of photographs is
-    // unreadable about half the time, and which half changes as the cloud spins.
-    ctx.beginPath();
-    ctx.roundRect(left, top, w, h, h / 2);
-    ctx.fillStyle = "rgba(20, 22, 27, 0.82)";
-    ctx.fill();
-    ctx.strokeStyle = clusterColor(cluster.id);
-    ctx.lineWidth = 1.5 * dpr;
-    ctx.stroke();
-
-    ctx.fillStyle = "#e6e9ef";
-    ctx.fillText(cluster.label, left + padX, y + 0.5 * dpr);
-    ctx.fillStyle = "rgba(230, 233, 239, 0.45)";
-    ctx.fillText(suffix, left + padX + textW, y + 0.5 * dpr);
-  }
-  // The context is shared with the next frame's sprites, which assume 1.
-  ctx.globalAlpha = 1;
-}
-
-// Hit testing runs against the extents the last frame *drew* (`hw`/`hh`), not
-// against a tolerance, so a click lands on the picture under the cursor however
-// far the view is zoomed.
 function embedPointAt(x, y) {
   let best = null;
   for (const p of embedMap.points) {
@@ -4487,19 +4349,9 @@ function initEmbedMap() {
     embedMap.spriteScale = Number(e.target.value);
     markEmbedDirty();
   };
-  // Unlike Size, this one costs a request — a different k is a different
-  // k-means fit — so the readout tracks the drag while the fetch waits for it
-  // to settle. `loadEmbedMap`'s own seq guard makes a late response harmless;
-  // the debounce is only there to stop a slow drag firing twenty of them.
-  $("embed-clusters").oninput = (e) => {
-    embedMap.clusterCount = Number(e.target.value);
-    setClusterSlider(embedMap.clusterCount);
-    clearTimeout(embedMap.clusterTimer);
-    embedMap.clusterTimer = setTimeout(loadEmbedMap, 150);
-  };
-  // Debounced, like the cluster slider and for the same reason — but note what
-  // is *not* debounced: emptying the box restores the whole library at once,
-  // since waiting a beat to undo a filter reads as a stuck UI.
+  // Debounced, because each query costs a request — but note what is *not*
+  // debounced: emptying the box restores the whole library at once, since
+  // waiting a beat to undo a filter reads as a stuck UI.
   $("embed-search").oninput = (e) => {
     clearTimeout(embedMap.searchTimer);
     if (!e.target.value.trim()) return clearEmbedSearch();

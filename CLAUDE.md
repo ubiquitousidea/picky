@@ -274,24 +274,22 @@ one place silently breaks another.
   call. Two things ride in the hash beside the vectors — the image ids, and a
   `_PROJECTION_VERSION` to bump when `_project`'s arithmetic changes, since
   nothing migrates a cached fit any more than it migrates a node's params.
-  Clustering stays uncached: it is tens of milliseconds, and it depends on
-  `clusters`, which is a slider.
-- **Cluster labels and search both need the *joint* 512-d space, which
-  `embed.py` does not promise.** `server/label_vectors.npz` and
-  `text_embed.encode_query` alike are only comparable to an `image_embeds`
-  (projection) export — swap in a bare vision export's 768-d `pooler_output` and
-  image-to-image similarity still works while both go meaningless.
-  `labels.label_clusters` and `main.search_embedding_map` therefore compare
-  widths and return nothing rather than nonsense.
+- **Search needs the *joint* 512-d space, which `embed.py` does not promise.**
+  `server/label_vectors.npz` and `text_embed.encode_query` alike are only
+  comparable to an `image_embeds` (projection) export — swap in a bare vision
+  export's 768-d `pooler_output` and image-to-image similarity still works while
+  comparing a photo to a phrase goes meaningless. `labels.zero_shot_logp` and
+  `main.search_embedding_map` therefore compare widths and fall back to the bare
+  cosine rather than returning nonsense.
 - **Search ranks a zero-shot log-probability; the cosine it used to rank by is
   still in the response, and may not quietly become something else.** A bare
   cosine never asks whether some *other* subject explains a photo better, so
   "people" returned the macaques too; `labels.zero_shot_logp` re-asks it as a
   softmax over the query and the label vocabulary, which is what makes the
   losing comparison happen. Three things ride on that split. The vocabulary is
-  now load-bearing for search and not only for cluster names, so
-  `label_vectors.npz` missing degrades search to the old cosine rather than
-  breaking it. `scores[].score` stays the raw cosine because
+  what search is scored against — since the Image map's clusters were removed it
+  is the *only* thing it is for — so `label_vectors.npz` missing degrades search
+  to the old cosine rather than breaking it. `scores[].score` stays the raw cosine because
   `agent.STRONG_MATCH` is a floor on it. And the z-score is taken over the log,
   never over `p`, which is why the Match slider's default did not have to move —
   the two distributions have comparable spread, where a softmax over 850 terms
@@ -301,17 +299,16 @@ one place silently breaks another.
   direction, so raw cosines between two of them run 0.82 ± 0.05 and cannot
   separate a synonym from an unrelated word — which `zero_shot_logp` needs, to
   strike restatements of the query out of its own rival set. Image-text scores
-  are compared across images against one fixed query, where that offset
-  cancels, so `label_clusters` does not decone and must not: its scores are
-  exposed as a confidence, and shifting them would change what every existing
-  label's number means.
+  are compared across images against one fixed query, where that offset cancels
+  and deconing would move every score without moving any ranking — so nothing on
+  that path reaches for it.
 - **`server/text_embed.py` owns CLIP's text tower and the only tokenizer in the
   tree; `tools/build_label_vectors.py` owns the vocabulary and the npz.** The
   script imports the tower rather than holding its own, which is what makes a
   typed query that happens to be a vocabulary word land on the exact vector the
   npz stores for it. The npz is still built *only* by that script — nothing
   under `server/` writes it, and re-running it is still the only way a new word
-  reaches the cluster labels.
+  joins the field a query has to beat.
 - **The text tower is downloaded only when someone searches.** It is 254 MB and
   most sessions never type in the box, so `text_job.py` is triggered by the
   search box alone — never by opening the map — and `/api/embedding-map/search`
@@ -584,8 +581,7 @@ one place silently breaks another.
   `clearEmbedSearch()` delegates here instead of clearing `hidden` itself: ending
   a query must not reveal what the other filters say is out. Anything else asking
   "is the cloud filtered" asks `embedFiltering()`, never `embedMap.scores` — the
-  two were the same question only while search was the only filter, and the
-  cluster pills' counts were the thing that quietly stopped being true.
+  two were the same question only while search was the only filter there was.
 - **The edit filter's tokens are effect names plus `any`/`none`, OR'd, and its
   chips are built from the library rather than the registry** (`renderEditChips`,
   fed by `list_images`' `effects` aggregate). A chip for an effect nothing has

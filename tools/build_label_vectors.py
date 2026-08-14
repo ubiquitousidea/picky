@@ -15,16 +15,23 @@ searches, and this script is one of its two callers.
 
 Sharing it is not incidental. `text_embed.encode_terms` applies the same seven
 prompt templates either way, so a query that happens to *be* a vocabulary word
-lands on the exact vector this script wrote for it — the search box and the
-cluster labels cannot come to disagree about what "beach" means.
+lands on the exact vector this script wrote for it — a phrase cannot mean one
+thing when typed and another when stored.
 
-What makes labelling possible at all is that the vision export in
-`data/models/` is a *projection* export: its output is `image_embeds (b, 512)`,
-CLIP's joint image/text space, which `rendering.embed_image` stores unit-length.
-The text tower's `text_embeds` lands in that same 512-d space, so a stored image
-vector and a label vector are comparable by plain dot product. Swap the vision
+What the npz is *for* is `labels.zero_shot_logp`: the rival subjects a typed
+query has to beat before search will rank a photo highly, which is what stops
+"people" returning the macaques. It used to name the Image map's clusters as
+well, and that feature is gone — a nearest-label lookup answers with something
+for every group whether or not it fits. Adding a word here still changes what
+search considers, so this list is not vestigial.
+
+What makes any of it possible is that the vision export in `data/models/` is a
+*projection* export: its output is `image_embeds (b, 512)`, CLIP's joint
+image/text space, which `rendering.embed_image` stores unit-length. The text
+tower's `text_embeds` lands in that same 512-d space, so a stored image vector
+and a vocabulary vector are comparable by plain dot product. Swap the vision
 model for a bare `CLIPVisionModel` (768-d `pooler_output`) and that stops being
-true — see `server/labels.py`, which detects it by width and declines to label.
+true — see `server/labels.py`, which detects it by width and declines to score.
 
 Run:
     .venv/bin/python tools/build_label_vectors.py
