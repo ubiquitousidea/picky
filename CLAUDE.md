@@ -610,6 +610,21 @@ one place silently breaks another.
   reconstruct. There is no `none` token to match the edit row's — "carries no effects" is a fact about the
   library, but "contains no objects" would be a claim about a detector that
   cannot see most things.
+- **The map's canvas has two coordinate systems, and both ways of keeping them
+  in step are load-bearing.** The backing store is at device resolution while
+  the element is sized in CSS percentages, so everything drawn and every hit
+  test lives in backing-store pixels and pointer coordinates are scaled in.
+  `sizeEmbedCanvas()` is the only writer of that store and is idempotent; it is
+  called from `openEmbedMap`, from a `ResizeObserver` on the canvas, and —
+  crucially — from `loadEmbedMap` right after the chip rows render, because that
+  is when the header *grows* and the stage shrinks under a canvas already sized
+  against the empty one. The observer alone is not enough: it delivers during
+  the rendering steps, so it is a frame late at best and never fires in a
+  document that is not being rendered. Separately, `embedCanvasPoint()` derives
+  its scale from `canvas.width / rect.width` rather than assuming
+  `devicePixelRatio` — the same number only while the two agree, and the gap is
+  not cosmetic: a stale store both flattens every thumbnail and puts every click
+  tens of pixels above where it was aimed, which is one bug wearing two faces.
 - **The map opens on the image you are working on** (`state.imageId`), picked
   and centred by `centerOnSelection()` — which is `pivotOnSelection()`'s
   opposite, and needs no drawn frame behind it. That is what makes Orbit worth

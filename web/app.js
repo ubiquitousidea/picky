@@ -3526,16 +3526,42 @@ function embedJobText(job) {
 function sizeEmbedCanvas() {
   const canvas = $("embed-canvas");
   const rect = canvas.getBoundingClientRect();
+  // A closed dialog measures 0x0, and a 0-wide backing store is both useless to
+  // draw into and a division by zero in embedCanvasPoint(). Reopening calls
+  // this again, so skipping costs nothing.
+  if (!rect.width || !rect.height) return;
   const dpr = window.devicePixelRatio || 1;
   // A backing store at device resolution, unlike the cluster canvas's fixed
   // 268x268 — at this size a 1x buffer is visibly soft. Everything downstream
   // (drawing and hit testing alike) therefore works in backing-store pixels,
   // and pointer coordinates are scaled into them on the way in.
-  canvas.width = Math.round(rect.width * dpr);
-  canvas.height = Math.round(rect.height * dpr);
+  const w = Math.round(rect.width * dpr);
+  const h = Math.round(rect.height * dpr);
+  if (canvas.width === w && canvas.height === h) return; // and do not clear it
+  canvas.width = w;
+  canvas.height = h;
   // Assigning width/height also clears the backing store, so a still map would
   // otherwise sit on a blank canvas until something else happened to it.
   markEmbedDirty();
+}
+
+// A pointer event in backing-store pixels — the space the whole map is measured
+// in, and the one `embedPointAt` tests against.
+//
+// The scale is read off the canvas rather than assumed to be `devicePixelRatio`.
+// Those are the same number only while the backing store matches its CSS box,
+// and it does not always: the box shrinks the moment the header grows a row,
+// while the backing store follows a frame later (see the ResizeObserver in
+// initEmbedMap). Deriving it makes every gesture correct during that window
+// instead of merely soon after it — and a stale ratio here is not subtle, it is
+// a click that picks the photo above the one you aimed at.
+function embedCanvasPoint(e) {
+  const canvas = $("embed-canvas");
+  const rect = canvas.getBoundingClientRect();
+  return [
+    (e.clientX - rect.left) * (canvas.width / rect.width),
+    (e.clientY - rect.top) * (canvas.height / rect.height),
+  ];
 }
 
 // `center` says the coordinates the view is framed on have just changed — the
@@ -3555,6 +3581,13 @@ async function loadEmbedMap(center = false) {
     // read by.
     renderEditChips();
     renderTagChips();
+    // Both rows are being filled for the first time here, and the tag row wraps
+    // to several lines — so the header just grew and the stage just shrank under
+    // a canvas that openEmbedMap() sized against the empty one. Resize it now,
+    // synchronously, rather than leaving it to the ResizeObserver: that fires a
+    // frame later at best, and never at all if the document is not being
+    // rendered. Idempotent, so the observer doing it again costs nothing.
+    sizeEmbedCanvas();
     // The pick survives a re-fetch by image id, never by identity: these are
     // fresh objects, so the old one is no longer in `points` and the draw
     // loop's `p === embedMap.selected` would never match again. On open there
@@ -4276,9 +4309,7 @@ function initEmbedMap() {
     // fallback. A pan drag keeps the pivot it has either way: panning slides the
     // whole cloud, pivot included.
     if (!panning && !(embedMap.orbit && pivotOnSelection())) {
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      setEmbedPivot((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr);
+      setEmbedPivot(...embedCanvasPoint(e));
     }
     lastX = downX = e.clientX;
     lastY = downY = e.clientY;
@@ -4316,10 +4347,7 @@ function initEmbedMap() {
       e.clientX < rect.left || e.clientX > rect.right ||
       e.clientY < rect.top || e.clientY > rect.bottom
     ) return;
-    const dpr = window.devicePixelRatio || 1;
-    pickEmbedPoint(
-      embedPointAt((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr)
-    );
+    pickEmbedPoint(embedPointAt(...embedCanvasPoint(e)));
   });
   canvas.addEventListener("dblclick", () => setEmbedSpin(!embedMap.spin));
   // The preview panel's initZoom() arithmetic, in backing-store pixels against
@@ -4329,10 +4357,9 @@ function initEmbedMap() {
     (e) => {
       e.preventDefault();
       const next = Math.min(16, Math.max(1, embedMap.zoom * wheelZoomFactor(e)));
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const cx = (e.clientX - rect.left) * dpr - canvas.width / 2;
-      const cy = (e.clientY - rect.top) * dpr - canvas.height / 2;
+      const [px, py] = embedCanvasPoint(e);
+      const cx = px - canvas.width / 2;
+      const cy = py - canvas.height / 2;
       const k = next / embedMap.zoom;
       embedMap.panX = cx - (cx - embedMap.panX) * k;
       embedMap.panY = cy - (cy - embedMap.panY) * k;
@@ -4413,10 +4440,26 @@ function initEmbedMap() {
   $("embed-modal").addEventListener("close", () => {
     if (embedMap.open) closeEmbedMap();
   });
-  // the cloud is sized from its rendered box, so a resized window needs a resize
-  window.addEventListener("resize", () => {
+  // The cloud is sized from its rendered box, so anything that changes that box
+  // has to resize the backing store with it. A window `resize` listener covers
+  // only the obvious cause and missed the one that actually bit: the header
+  // *grows* after the map opens. openEmbedMap() sizes the canvas the moment the
+  // dialog is shown, and only later does loadEmbedMap() fill the tag row, which
+  // wraps to several lines and takes ~110px of stage height with it. The canvas
+  // kept the taller backing store and the browser squashed it into the shorter
+  // box, so every thumbnail was drawn slightly flat — and every click was tested
+  // against coordinates that no longer matched what was on screen, which is why
+  // picking a photo meant aiming below it.
+  //
+  // Observing the element is the fix that cannot go stale: it fires for the
+  // chips arriving, for a window resize, for a header that wraps at a narrow
+  // width, and for whatever grows the header next. `sizeEmbedCanvas` is a no-op
+  // when the size is unchanged, so the observer's initial call is free and
+  // nothing here can loop — the canvas is sized in CSS percentages, so writing
+  // its backing store never feeds back into layout.
+  new ResizeObserver(() => {
     if (embedMap.open) sizeEmbedCanvas();
-  });
+  }).observe($("embed-canvas"));
 }
 
 // ---------- Upload / delete ----------
