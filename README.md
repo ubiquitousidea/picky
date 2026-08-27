@@ -101,6 +101,19 @@ restarts.
   *a person* find the same subject. It works in the edit dialog too, where
   clicking cannot, so you can change which object an existing effect is limited
   to. Model weights (~139 MB) download the first time you press **Find**.
+- **Two models can read the words, and a radio beside the box picks which.**
+  *CLIPSeg + MobileSAM* is the pair described above: locate, then trace. **SAM
+  3** is one model that does both — and finds **every** instance rather than
+  the best one, so *bird* over a flock comes back as a single mask covering all
+  seventy-six of them, which the older pair cannot express at any setting. Its
+  boundaries are cleaner too: MobileSAM's distilled encoder partitions
+  attention into windows, and those edges can print faintly through a mask.
+  What you pay is time — a SAM 3 query takes a few seconds on a photo it has
+  not seen and about a second after that, against tens of milliseconds for a
+  click — so the choice stays in front of you rather than being made once in a
+  settings screen. It is remembered between sessions. Unlike every other model
+  here, SAM 3's weights cannot be downloaded automatically; see **SAM 3
+  weights** below.
 - **Saved masks** — **selecting an object and applying an effect saves that
   object automatically**, whether you clicked it or named it, freezing its
   pixels to disk as a durable mask rather than a pick that has to be
@@ -214,10 +227,127 @@ ONNX exports instead, point the matching env var at an absolute path —
 `PICKY_DEPTH_MODEL`, `PICKY_CLIP_MODEL`, `PICKY_CLIP_TEXT_MODEL`, or
 `PICKY_YOLO_MODEL`. Nothing else in the app requires any of the downloads.
 
-The detector's weights are the one exception to this project's licensing:
-YOLOv8n is Ultralytics', under **AGPL-3.0**, where every other model here is
-Apache-2.0 or MIT. That is worth reading before distributing Picky; running it
-locally is unaffected.
+**SAM 3 is the exception: it cannot fetch itself.** Meta publishes PyTorch
+weights and no ONNX export, behind a gate a human approves, so there is no URL
+for the app to pin. Until you run the export below, choosing SAM 3 in the
+selection row answers with the command to run rather than a progress bar, and
+the other backend keeps working. See **SAM 3 weights**.
+
+Two of the models carry licences worth reading before distributing Picky;
+running it locally is unaffected. YOLOv8n is Ultralytics', under **AGPL-3.0**.
+SAM 3's weights are under Meta's own **SAM License**, which also governs
+redistributing anything you export from them. Everything else here is
+Apache-2.0 or MIT.
+
+## SAM 3 weights
+
+Every other model in Picky downloads itself on first use. SAM 3 cannot, for two
+reasons that are both upstream's: Meta publishes **PyTorch weights and no ONNX
+export**, and the weights sit behind a gate that a person at Meta approves by
+hand. So the graphs are built once, locally, by a script — after which SAM 3
+behaves like any other model here.
+
+Until then nothing is broken: picking SAM 3 in the selection row reports the
+command to run, and CLIPSeg + MobileSAM keeps working.
+
+### 1. Get access
+
+Accept the licence at <https://huggingface.co/facebook/sam3> and fill in the
+form (name, date of birth, country, affiliation, job title). Approval is
+**manual and not instant** — expect to wait. Then create a Hugging Face access
+token and put it in `.env` at the repo root:
+
+```sh
+PICKY_HF_TOKEN=hf_...
+```
+
+Check that the gate has actually opened before exporting — a token that
+authenticates fine still gets `403` on the files until someone approves you:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -L \
+  -H "Authorization: Bearer $(sed -n 's/^PICKY_HF_TOKEN=//p' .env)" \
+  https://huggingface.co/facebook/sam3/resolve/main/config.json
+```
+
+`200` means you are through; `403` means the request is still pending. (The
+token is read out of `.env` rather than the environment because that is where
+the app reads it from too — nothing exports it into your shell.)
+
+### 2. Export the ONNX graphs
+
+The export needs PyTorch, which the **server does not** — that is why it is not
+in `requirements.txt`. Install it, run the script, and take it back out:
+
+```sh
+.venv/bin/pip install torch torchvision transformers onnx
+.venv/bin/python tools/export_sam3_onnx.py
+.venv/bin/pip uninstall -y torch torchvision transformers onnx
+```
+
+The script pulls the checkpoint from a pinned revision of `facebook/sam3`
+(~3.4 GB, cached by Hugging Face under `~/.cache/huggingface`) and writes four
+files into `data/models/`:
+
+| file | size | what it is |
+|---|---|---|
+| `sam3_image_encoder.onnx` | 1.7 GB | 454M params; depends only on the pixels |
+| `sam3_language_encoder.onnx` | 1.3 GB | 354M params; depends only on the words |
+| `sam3_decoder.onnx` | 92 MB | ~32M params; the only part that runs every query |
+| `sam3_fixture.npz` | 1.9 MB | a correctness fixture — see below |
+
+Budget about **4 GB in `data/models/`** on top of the ~900 MB the other five
+models occupy, plus the Hugging Face cache, which you can delete afterwards.
+Exporting takes under a minute once the download finishes; it needs no GPU.
+
+To keep the graphs somewhere else, point `PICKY_SAM3_IMAGE_ENCODER`,
+`PICKY_SAM3_LANGUAGE_ENCODER` and `PICKY_SAM3_DECODER` at absolute paths, as
+with the other models.
+
+### 3. Check it
+
+```sh
+.venv/bin/python -c 'from server import sam3; print(sam3.self_check())'
+```
+
+This is worth running rather than skipping. Every way this model can be wired
+up wrong is *silent* — a mistaken resize filter, normalization constant or
+padding token all return a mask with a perfectly plausible boundary, and no
+error. So the exporter saves a fixture (one real photo's preprocessed pixels,
+its token ids, and the logits PyTorch produced from them) and this replays it
+through onnxruntime. Expect `ok: True`, token ids matching exactly, and logits
+within a few ten-thousandths:
+
+```
+{'source': '10.jpg', 'query': 'a photo', 'tokens_match': True,
+ 'pixel_max_diff': 0.0078, 'logit_max_diff': 0.0006, 'box_max_diff': 0.0003,
+ 'instances': {'onnx': 1, 'torch': 1}, 'ok': True}
+```
+
+`pixel_max_diff` is expected to be about `0.008`, one 8-bit level: the server
+resizes with Pillow where Meta's processor uses torchvision, and that gap was
+measured at 99.4–99.9% mask agreement — the closest of four filters tried, and
+notably closer than bicubic or Lanczos. Anything much larger means the
+preprocessing has drifted.
+
+### What it costs at runtime
+
+The three graphs load lazily and stay resident, about **3 GB of RAM** once you
+have used SAM 3 in a session. Timings on a 24 MP photo, CPU only:
+
+| | |
+|---|---|
+| first query on a photo | ~4.8 s |
+| another query on the same photo | ~0.7 s |
+| the same query on another photo | ~4.8 s |
+
+The image encoder's output is cached per node in memory (three nodes; ~117 MB
+each, which is why it is not written to disk) and the text encoder's per query
+string, so a repeat question skips 807M of the model's 840M parameters. If that
+is too heavy, the lever is a smaller checkpoint — Meta's distilled `sam3.1-tiny`
+or the community EfficientSAM3 at ~90M params — rather than a different
+implementation of this one; neither had a usable ONNX export when this was
+written.
 
 ## Architecture
 
@@ -229,6 +359,7 @@ server/
   rendering.py  node render pipeline with per-node JPEG cache
   sam.py        MobileSAM via onnxruntime: click a point, get a mask
   clipseg.py    CLIPSeg via onnxruntime: a phrase in, the place it means out
+  sam3.py       SAM 3 via onnxruntime: a phrase in, every instance of it out
   depth.py      Depth Anything V2 via onnxruntime: a photo in, relative depth out
 web/
   index.html, app.js, style.css   vanilla JS single-page frontend
@@ -260,7 +391,7 @@ effect to a fresh pick saves it that way first, so the object outlives the
 click — a click is only meaningful on the node it was made on, and applying an
 effect moves you off that node.
 
-**Naming an object produces a click.** CLIPSeg answers with a 352 × 352 heat
+**Naming an object produces a click — when CLIPSeg reads it.** CLIPSeg answers with a 352 × 352 heat
 map, which is far too coarse to be a mask — so the server does not use it as
 one. It smooths the map, takes its peak as a point, measures how much of the
 frame the hot region covers, and asks SAM which of its candidate masks at that
@@ -272,6 +403,26 @@ this rests on is that the code choosing the level and the code re-decoding it
 later rank SAM's candidates through the same helper; if those two orderings
 drifted apart, a saved selection would quietly resolve to a different mask than
 the one you were shown.
+
+**SAM 3 answers with pixels, so it takes the other route.** There is no point
+and level that would re-derive its boundary, and handing one back would throw
+away the mask the model exists to produce — so the server freezes those pixels
+into a saved mask on the spot and returns its id. That is still not a third
+kind of selection: what the browser stores is the same *saved mask* reference a
+hand-saved pick produces, which is why the outline, invert, stacking and preset
+replay all work on it unchanged. Two consequences follow. The level dropdown
+goes inert, because there are no candidate masks left to re-rank. And a SAM 3
+query *writes* where a CLIPSeg one does not — the mask appears in the strip
+whether or not you go on to use it — which is also why the assistant's
+depth-measuring tool stays pinned to CLIPSeg: a tool that reports a number
+should not leave a mask behind.
+
+Its masks come out at 288 × 288 and are scaled to the frame, which sounds
+coarse and is the same order as MobileSAM's 256. What matters more than the
+number is *when* the threshold is applied: the logits are upscaled first and cut
+at full size, so an edge lands between pixels instead of on a grid. Cutting
+first and enlarging the result is what produces staircased masks, and both
+backends here deliberately do it the same way round.
 
 Two details are worth knowing if you change it. The model is pinned to its
 *quantized* export, a quarter the size of the float one, on the argument that
@@ -347,7 +498,7 @@ the preset is replayed against.
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
 | POST   | `/api/nodes/{id}/mask` | outline PNG for a selection — `points` segmented on the fly, or `masks` (saved ids) read back, plus an optional `invert`; persists nothing but the node's cached embedding |
-| POST   | `/api/nodes/{id}/select-text` | find a named object (`query`) in a node's pixels, answering with the `x`, `y` and `level` a click would have produced, plus the `score`, the `coverage` the resulting mask has, and `confident`. Stores nothing; 409s rather than downloading the model inside the request |
+| POST   | `/api/nodes/{id}/select-text` | find a named object (`query`) in a node's pixels, with `method` choosing the model. `clipseg` answers with the `x`, `y` and `level` a click would have produced and stores nothing. `sam3` (the default) answers with pixels no click would reproduce, so it freezes them into a saved mask and returns its `mask_id` plus the `instances` count — nothing is banked when the match is weak. Both carry `score`, `coverage` and `confident`, and both 409 rather than fetching a model inside the request |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
 | GET    | `/api/nodes/{id}/depth-at` | the depth under one pixel (`x`, `y`) on bokeh's own normalized scale — what click-to-focus reads a `focus` value off; stores nothing |
@@ -375,6 +526,8 @@ the preset is replayed against.
 | GET    | `/api/depth-model/progress` | where that download got to |
 | POST   | `/api/select-model/prepare` | start fetching the text-prompted segmentation model (139 MB), which only naming an object needs |
 | GET    | `/api/select-model/progress` | where that download got to, including `ready` for a model an earlier run already fetched |
+| POST   | `/api/sam3-model/prepare` | whether SAM 3 can run. Downloads nothing — there is nothing to download — so it answers `done`, or `error` carrying the export command |
+| GET    | `/api/sam3-model/progress` | the same answer, pollable; always terminal |
 | GET    | `/api/agent` | whether an `ANTHROPIC_API_KEY` is configured, and which model the command row would talk to; the frontend hides the row when it is not |
 | POST   | `/api/agent` | run one turn (`prompt`, the browser's own `history`, and the `image_id`/`node_id` on screen). Answers with the `reply`, the `steps` it took, the updated `history`, a `focus` to navigate to, a `pending` action awaiting confirmation, and the `wire` record of the API calls the turn actually made |
 | GET    | `/api/stats` | library counts and disk usage |
