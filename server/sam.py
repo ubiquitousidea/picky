@@ -42,6 +42,7 @@ import functools
 import hashlib
 import os
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -90,6 +91,33 @@ def _model_path(kind: str) -> Path:
     return path
 
 
+def _auth_header(url: str) -> dict[str, str]:
+    """`Authorization` for a Hugging Face URL, when `PICKY_HF_TOKEN` is set.
+
+    Every model this tree ships is a *public* repo fetched with no credential at
+    all, and that stays true — this exists for gated weights (SAM 3's are behind
+    Meta's manual approval) and for a private mirror of files with no public URL.
+
+    The host check is the point, not decoration. A token is a bearer credential:
+    attached to whatever `_HF_URL` happens to say, one edit pointing a constant
+    at another host would hand that host the user's account. Scoping it to the
+    issuer means the only place the token can ever go is the place it came from,
+    and the scheme check means it cannot go there in the clear. `endswith` is on
+    a dot-prefixed suffix so `huggingface.co.evil.com` is a different host, which
+    is the whole reason to compare a parsed hostname rather than the URL text.
+    """
+    token = os.environ.get("PICKY_HF_TOKEN")
+    if not token:
+        return {}
+    parts = urllib.parse.urlparse(url)
+    host = parts.hostname or ""
+    if parts.scheme != "https":
+        return {}
+    if host != "huggingface.co" and not host.endswith(".huggingface.co"):
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
 def download_model(url: str, dest: Path, on_progress=None) -> None:
     """Fetch to a tmp file and os.replace() into place, so a crashed download
     never leaves a truncated model where the existence check would trust it.
@@ -104,12 +132,18 @@ def download_model(url: str, dest: Path, on_progress=None) -> None:
     when the server sends no Content-Length. This is what lets the Image map's
     prepare job say *which* minute of the first run you are in; nothing else
     passes a callback, and the default keeps these downloads silent.
+
+    Credentials ride along from the environment rather than from a parameter
+    (`_auth_header`), so no caller has to know whether its repo is gated: the
+    shipped five are public and send nothing, and adding a gated model does not
+    mean threading a token through five call sites that will never use one.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     digest = hashlib.sha256()
+    request = urllib.request.Request(url, headers=_auth_header(url))
     try:
-        with os.fdopen(fd, "wb") as out, urllib.request.urlopen(url, timeout=60) as resp:
+        with os.fdopen(fd, "wb") as out, urllib.request.urlopen(request, timeout=60) as resp:
             length = resp.headers.get("Content-Length")
             total = int(length) if length and length.isdigit() else None
             done = 0

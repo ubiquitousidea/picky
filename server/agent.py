@@ -780,12 +780,32 @@ def _list_photo_nodes(args: dict, turn: _Turn) -> tuple[str, str]:
     return json.dumps(nodes), f"listed {len(nodes)} version(s)"
 
 
-def _locate(args: dict) -> tuple[dict, str, dict]:
+def _locate(args: dict, method: str | None = None) -> tuple[dict, str, dict]:
     """The words → `main.select_text` half both naming tools start with.
 
-    Shared so the CLIPSeg gate is worded once: `select_object` goes on to freeze
-    a mask, `measure_focus` to sample a depth, and neither should be the place
-    that knows what a 409 from that endpoint means.
+    Shared so the gate is worded once: `select_object` goes on to freeze a mask,
+    `measure_focus` to sample a depth, and neither should be the place that
+    knows what a 409 from that endpoint means. Sharing it is also what keeps the
+    two agreeing about what a name *finds* — the invariant that stopped "focus
+    on the cat" resolving to everything but the cat.
+
+    `method` is the caller's, never the model's: which segmenter runs is a
+    cost/quality trade, and a tool argument for it would be one more thing for
+    the model to get wrong on somebody's behalf. `select_object` leaves it None
+    and takes the endpoint's default, because it wants the best boundary
+    available; `measure_focus` pins CLIPSeg, for two reasons that point the same
+    way. It needs a *point* and nothing else, so the 3.4 GB of encoders SAM 3
+    would run to produce one are all waste — and, decisively, `select_text`'s
+    SAM 3 path banks a mask, which a tool documented to write nothing must not
+    do. A depth reading that littered the mask strip would be a worse bug than
+    any disagreement between the two models about where a cat is.
+
+    That pinning is the one seam in "the two agree on what a name finds". They
+    still agree about the *object* — both run the same CLIPSeg locate over the
+    same node — and only a SAM 3 `select_object` can now resolve a name to a
+    boundary CLIPSeg would have centred differently. Depth varies smoothly
+    across an object, so the reading survives that; what would not survive is
+    the two finding different objects, which nothing here can cause.
     """
     from . import main
 
@@ -795,13 +815,24 @@ def _locate(args: dict) -> tuple[dict, str, dict]:
         raise _ToolError("description must not be empty")
     node = _node_of(image_id, args.get("node_id"))
 
+    request = main.SelectTextRequest(
+        **{"query": description, **({"method": method} if method else {})}
+    )
     try:
-        found = main.select_text(node["id"], main.SelectTextRequest(query=description))
+        found = main.select_text(node["id"], request)
     except HTTPException as exc:
         if exc.status_code == 409:
-            # Naming an object is the one gesture that fetches this model, and
-            # this is that gesture — start it and say so, rather than holding the
-            # request open for a 139 MB download.
+            # Naming an object is the one gesture that readies these models, and
+            # this is that gesture. *Which* model has to come from the request,
+            # not from a guess: starting `clipseg_job` because SAM 3 was missing
+            # would fetch 139 MB nobody asked for and still not fix the thing
+            # that failed.
+            if request.method == "sam3":
+                # An export somebody has to run, so there is no job to start and
+                # no percentage to report. "Try again shortly" would be a lie —
+                # nothing is in progress. The endpoint's own message carries the
+                # command, so pass it through rather than restating it.
+                raise _ToolError(str(exc.detail))
             job = clipseg_job.start()
             pct = int(100 * job["done"] / job["total"]) if job.get("total") else 0
             raise _ToolError(
@@ -849,31 +880,39 @@ def _select_object(args: dict, turn: _Turn) -> tuple[str, str]:
             f"no confident match for “{description}”",
         )
 
-    spec = {
-        "points": [{"x": found["x"], "y": found["y"], "level": found["level"]}],
-        "invert": False,
-    }
-    # The description is the name, because a mask the model made is one the
-    # person has to recognise in a strip of thumbnails. Names are unique per
-    # image and `create_mask` takes a given one literally, so collisions are
-    # numbered here — `_auto_mask_name`'s arrangement, one caller along.
+    # The description is the name either way, because a mask the model made is
+    # one the person has to recognise in a strip of thumbnails.
     name = description[:60]
-    for attempt in range(1, 6):
-        try:
-            mask = main.create_mask(
-                image_id,
-                main.MaskCreate(
-                    name=name if attempt == 1 else f"{name} {attempt}",
-                    node_id=node["id"],
-                    selection=spec,
-                ),
-            )
-            break
-        except HTTPException as exc:
-            if exc.status_code != 409 or attempt == 5:
-                raise _ToolError(str(exc.detail))
-    else:  # unreachable: every pass either breaks or raises. Belt to that brace.
-        raise _ToolError(f"could not name a mask after '{name}'")
+    if found.get("mask_id") is not None:
+        # SAM 3 froze its own pixels on the way through — no point-and-level
+        # would reproduce them, so `select_text` had to bank there or lose them.
+        # It named the mask after the same words and numbered its own
+        # collisions, which is why there is no retry loop on this branch.
+        mask = found["mask"]
+    else:
+        spec = {
+            "points": [{"x": found["x"], "y": found["y"], "level": found["level"]}],
+            "invert": False,
+        }
+        # Names are unique per image and `create_mask` takes a given one
+        # literally, so collisions are numbered here — `_auto_mask_name`'s
+        # arrangement, one caller along.
+        for attempt in range(1, 6):
+            try:
+                mask = main.create_mask(
+                    image_id,
+                    main.MaskCreate(
+                        name=name if attempt == 1 else f"{name} {attempt}",
+                        node_id=node["id"],
+                        selection=spec,
+                    ),
+                )
+                break
+            except HTTPException as exc:
+                if exc.status_code != 409 or attempt == 5:
+                    raise _ToolError(str(exc.detail))
+        else:  # unreachable: every pass breaks or raises. Belt to that brace.
+            raise _ToolError(f"could not name a mask after '{name}'")
 
     # Last write wins, so an apply_effect after this moves it on again. Set here
     # so that selecting *without* editing still puts the photo on screen — and
@@ -922,7 +961,9 @@ def _measure_focus(args: dict, turn: _Turn) -> tuple[str, str]:
     """
     from . import main
 
-    node, description, found = _locate(args)
+    # CLIPSeg explicitly: this needs a point, not a boundary, and `select_text`'s
+    # SAM 3 path writes a mask on the way to producing one. See `_locate`.
+    node, description, found = _locate(args, method="clipseg")
 
     if not found["confident"]:
         # No number at all, rather than a plausible one measured at a point

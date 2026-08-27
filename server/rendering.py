@@ -3,6 +3,7 @@
 import io
 import os
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -319,6 +320,7 @@ def embedding_path(node_id: int) -> Path:
     return db.RENDERS_DIR / f"{node_id}.embedding.npy"
 
 
+
 def node_embedding(node_id: int) -> np.ndarray:
     """The SAM image-encoder embedding of a node's rendered pixels, cached on
     disk like renders and cluster data (file existence is the cache key).
@@ -342,6 +344,53 @@ def node_embedding(node_id: int) -> np.ndarray:
         Path(tmp).unlink(missing_ok=True)
         raise
     return embedding
+
+
+# How many nodes' SAM 3 features to hold. Small on purpose — see below.
+_SAM3_CACHE = 3
+_sam3_features: "OrderedDict[int, dict]" = OrderedDict()
+
+
+def sam3_features(node_id: int) -> dict[str, np.ndarray]:
+    """SAM 3's image-encoder output for a node, cached **in process**.
+
+    The encoder is the expensive third of `sam3.segment` (~2.6s of the ~4.5s a
+    cold query costs) and depends only on the pixels, so holding its output
+    makes a second question about the same photo ~0.4s instead. That much is
+    `node_embedding`'s trade exactly.
+
+    What is *not* like `node_embedding` is where it lives. MobileSAM's embedding
+    is 4 MB and goes on disk beside the render; SAM 3's four tensors are **~117
+    MB per node** — `fpn_0` alone is 256x288x288 float32 — so the same treatment
+    would put tens of gigabytes under `data/renders/` for a library anyone
+    actually used this on. That is not a cache, it is a leak with a sweep
+    attached.
+
+    So this follows `depth.depth_map` instead, which caches in process for the
+    same reason and which CLAUDE.md already records as the precedent. The
+    consequences are all things not to do elsewhere: **no file kind under
+    `renders/`**, so `delete_render_files` and `storage_stats` need no clause,
+    and nothing can be left stale on disk by a missed sweep. It is keyed by node
+    id and a node's pixels never change — a PATCH creates a new render but
+    `delete_render_files` is what invalidates it, so drop the entry there too
+    rather than trusting the id to stay meaningful.
+
+    Bounded at three because the bound is memory, not disk: three nodes is
+    ~350 MB on top of the 3.4 GB of sessions, and the working set for "ask
+    several things about the photo in front of me" is one.
+    """
+    from . import sam3  # imported here for `locate_object`'s reason, one size up
+
+    cached = _sam3_features.get(node_id)
+    if cached is not None:
+        _sam3_features.move_to_end(node_id)
+        return cached
+    img = np.asarray(Image.open(render_node(node_id)).convert("RGB"))
+    features = sam3.encode_image(img)
+    _sam3_features[node_id] = features
+    while len(_sam3_features) > _SAM3_CACHE:
+        _sam3_features.popitem(last=False)
+    return features
 
 
 def compute_mask(node_id: int | None, selection: dict) -> np.ndarray:
@@ -426,6 +475,68 @@ def locate_object(node_id: int, query: str) -> dict:
         # what the selection will actually cover, not what CLIPSeg guessed
         "coverage": round(pixels / (w * h), 4),
         "confident": found["confident"],
+    }
+
+
+def locate_object_sam3(node_id: int, query: str) -> dict:
+    """`locate_object`'s answer to the same question, from one model instead of
+    two — and as *pixels* rather than as a click.
+
+    That difference is the whole reason this is a second function and not a
+    branch inside the first. CLIPSeg finds a place and MobileSAM draws the
+    boundary there, so the answer compresses to `{x, y, level}` and re-decodes
+    later; SAM 3 draws the boundary itself, and there is no point-and-level that
+    would reproduce it. Handing this mask back through the `{points: [...]}`
+    shape would re-derive a MobileSAM mask and throw away the one improvement
+    the model is here for.
+
+    So this returns the mask, and `main.select_text` freezes it into a saved
+    mask — the shape that stores pixels. Nothing new is added to
+    `effects.validate_selection`: there are still exactly two selection shapes,
+    and a SAM 3 answer is the same `{masks: [id]}` a hand-saved selection is.
+
+    Unlike `locate_object` this does **not** draft the decode down. CLIPSeg
+    squashes to 352 and MobileSAM to 1024, so drafting there throws away nothing;
+    here the mask comes back at the encoder's own resolution and every pixel of
+    input resolution is a pixel of boundary accuracy.
+
+    Returns `locate_object`'s keys plus `mask` and `instances`, so callers that
+    only want the metadata can share code with the CLIPSeg path — `x` and `y`
+    are the best instance's centroid, which is what lets `agent.measure_focus`
+    take a depth reading from an answer that is otherwise mask-shaped.
+    """
+    from . import sam3  # imported here for `locate_object`'s reason, one size up
+
+    with Image.open(render_node(node_id)) as im:
+        w, h = im.size
+        img = np.asarray(im.convert("RGB"))
+
+    found = sam3.segment(sam3_features(node_id), sam3.encode_text(query), h, w)
+    mask = found["mask"]
+    if mask.shape != (h, w):
+        # The encoder works at its own square resolution and the masks are
+        # resized back out of it, so a mismatch here means the resize used the
+        # drafted or the padded dimensions rather than the node's. Refuse it:
+        # `compute_mask` unions by `|`, which would broadcast a wrong-shaped
+        # mask into a plausible-looking one rather than failing.
+        raise ValueError(
+            f"SAM 3 mask is {mask.shape[1]}×{mask.shape[0]}, node is {w}×{h}"
+        )
+    # Coerced at the boundary, not trusted: these come off numpy arrays, and a
+    # numpy int64 travels fine through every expression here and then fails to
+    # serialize in the response — a 500 from the JSON encoder, a long way from
+    # the line that produced it.
+    return {
+        "x": int(found["x"]),
+        "y": int(found["y"]),
+        # There is no level: the pixels are the answer. The key is absent rather
+        # than None so a caller that reads it is a KeyError here instead of a
+        # silently unlevelled click somewhere downstream.
+        "score": round(float(found["score"]), 4),
+        "coverage": round(int(mask.sum()) / (w * h), 4),
+        "confident": bool(found["score"] >= sam3.MATCH_FLOOR),
+        "instances": len(found["instances"]),
+        "mask": mask,
     }
 
 
@@ -600,6 +711,10 @@ def delete_render_files(node_ids: list[int]) -> None:
         thumb_path(node_id).unlink(missing_ok=True)
         clusters_path(node_id).unlink(missing_ok=True)
         embedding_path(node_id).unlink(missing_ok=True)
+        # Not a file: SAM 3's features are held in memory (see `sam3_features`),
+        # but they are keyed by node id just the same, so an edited node has to
+        # forget them here or the next query answers from the old pixels.
+        _sam3_features.pop(node_id, None)
 
 
 def _totals(paths) -> dict:
@@ -643,6 +758,9 @@ def storage_stats() -> dict:
         # the framed output stage — regenerable from the renders plus the crop
         "outputs": _totals(outputs),
         "clusters": _totals(clusters),
-        # SAM image embeddings, ~4 MB apiece — big enough to deserve a line
+        # SAM image embeddings, ~4 MB apiece — big enough to deserve a line.
+        # SAM 3's are not here on purpose: at ~117 MB a node they are held in
+        # memory rather than written down (see `sam3_features`), so there is no
+        # file kind to count.
         "embeddings": _totals(embeddings),
     }

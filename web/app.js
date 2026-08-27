@@ -2154,6 +2154,32 @@ function selSummary(sel) {
 // session rather than on every Find.
 let selectReady = false;
 
+// Which model reads a typed object name. Sticky across sessions like
+// `picky:filmstrip`, and defaulting to SAM 3 — it answers with a real boundary
+// and with *every* instance, where CLIPSeg finds one place and MobileSAM guesses
+// an outline at it. The two are worth keeping side by side because the trade is
+// not one-way: SAM 3 is three orders of magnitude more expensive per query, so
+// on a machine where that is too slow the older pair is the working answer, not
+// a fallback.
+let selectBackend = localStorage.getItem("picky:selectBackend") || "sam3";
+
+function setSelectBackend(name) {
+  selectBackend = name;
+  localStorage.setItem("picky:selectBackend", name);
+}
+
+// What the last search said, kept out here so it survives the control being
+// rebuilt. A SAM 3 find banks a mask, which means refreshing the strip, which
+// means `renderSelectControls()` throws away the very span the message is in —
+// so the message has to live somewhere the rebuild reads back. `maskBusy` is
+// module-level for the same shape of reason.
+let selectNote = "";
+
+// Bumped per built control so the backend radios get a unique `name`. Two of
+// these can be on screen at once — the bar's and the edit modal's — and radios
+// sharing a name share a checked state across the whole document.
+let controlSeq = 0;
+
 // Fetch the model behind "name an object", reporting progress through `say`.
 //
 // Unlike prepareDepthModel() this reports into the caller's own line rather
@@ -2183,6 +2209,27 @@ async function prepareSelectModel(say) {
     return false;
   }
   selectReady = true;
+  return true;
+}
+
+// SAM 3's counterpart, and it prepares nothing — the graphs are exported by
+// hand because Meta ships no ONNX and gates the weights, so there is no download
+// to start and no progress to poll. What comes back is one of two terminal
+// answers, and the useful half is the error: it carries the command to run.
+//
+// No `sam3Ready` latch to match `selectReady`. That one exists to skip a
+// round-trip on every Find after the first, and is safe because a downloaded
+// model stays downloaded; here the answer can change while the app is open — the
+// export is something the user runs in a terminal beside it — and a latched
+// "no" would need a reload to clear.
+async function prepareSam3Model(say) {
+  try {
+    const job = await api("/api/sam3-model/prepare", { method: "POST" });
+    if (!job.ready) throw new Error(job.error || "not available");
+  } catch (err) {
+    say(err.message);
+    return false;
+  }
   return true;
 }
 
@@ -2216,6 +2263,7 @@ function appendSelectionControls(
   // rebuilding the control is exactly when a previously armed picker becomes
   // invalid: its commit closure now writes into a detached row
   disarmPick();
+  controlSeq += 1;
 
   const row = document.createElement("div");
   row.className = "param-row";
@@ -2255,11 +2303,55 @@ function appendSelectionControls(
   const findRow = document.createElement("div");
   findRow.className = "sel-row";
   findRow.append(query, find);
+
+  // Which model reads the words. A radio and not a preference buried in a
+  // dialog, because the two differ by orders of magnitude in what a Find costs
+  // and by a lot in what comes back — that is a choice to make per query, next
+  // to the box you type in, not once in a settings screen.
+  //
+  // Deliberately *not* hidden when SAM 3 is unexported: this row is where the
+  // instruction to export it gets surfaced, and a control that vanishes when
+  // its subject is missing cannot explain its own absence.
+  const backendRow = document.createElement("div");
+  backendRow.className = "sel-row sel-backend";
+  const backends = [
+    ["sam3", "SAM 3", "One model, real boundaries, finds every instance. Slow."],
+    ["clipseg", "CLIPSeg + MobileSAM", "Locate then outline. Fast, one instance."],
+  ];
+  const backendInputs = [];
+  for (const [value, label, title] of backends) {
+    const wrap = document.createElement("label");
+    wrap.title = title;
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    // Scoped per control instance: the bar and the edit modal can both be built,
+    // and one shared name would make the two rows fight over one checked state.
+    radio.name = `sel-backend-${controlSeq}`;
+    radio.value = value;
+    radio.checked = selectBackend === value;
+    radio.onchange = () => {
+      if (!radio.checked) return;
+      setSelectBackend(value);
+      // The last search's verdict was about the other model — leaving it up
+      // under a newly-lit radio reads as this one's answer.
+      say("");
+    };
+    wrap.append(radio, document.createTextNode(label));
+    backendRow.appendChild(wrap);
+    backendInputs.push(radio);
+  }
   // What the search found, in words: the outline says *where*, this says how
   // sure. Inline rather than an alert, which would block a control you press
   // repeatedly, and empty most of the time — `:empty` hides it.
   const note = document.createElement("span");
   note.className = "sel-note";
+  // Seeded from the module-level copy so a message survives the rebuild a SAM 3
+  // find triggers; `say` is the only writer of either, so the two cannot drift.
+  note.textContent = selectNote;
+  const say = (message) => {
+    selectNote = message;
+    note.textContent = message;
+  };
 
   const level = document.createElement("select");
   level.className = "sel-level";
@@ -2278,7 +2370,7 @@ function appendSelectionControls(
   optRow.className = "sel-row";
   optRow.append(level, invertLabel);
 
-  row.append(coords, pickRow, findRow, optRow);
+  row.append(coords, pickRow, findRow, backendRow, optRow);
 
   // Save, then the saved objects themselves — the order the workflow runs in:
   // pick an object, use it (which banks it), repeat, then tick the ones this
@@ -2301,7 +2393,7 @@ function appendSelectionControls(
   const current = () => store.value;
   const commit = (sel) => {
     // every path through here supersedes whatever the last search reported
-    note.textContent = "";
+    say("");
     store.value = sel;
     store.nodeId = sel ? sourceNodeId : null;
     store.imageId = sel ? state.imageId : null;
@@ -2391,15 +2483,48 @@ function appendSelectionControls(
     if (!text || finding || sourceNodeId === null) return;
     finding = true;
     render(current()); // the row goes busy the same way it comes back
-    const say = (message) => (note.textContent = message);
+    const backend = selectBackend;
     try {
       say(`Looking for “${text}”…`);
-      if (!(await prepareSelectModel(say))) return;
+      const ready =
+        backend === "sam3"
+          ? await prepareSam3Model(say)
+          : await prepareSelectModel(say);
+      if (!ready) return;
       const found = await api(`/api/nodes/${sourceNodeId}/select-text`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: text }),
+        body: JSON.stringify({ query: text, method: backend }),
       });
+      const covers = `${(found.coverage * 100).toFixed(1)}% of the frame`;
+
+      if (backend === "sam3") {
+        if (!found.confident) {
+          // Nothing was banked, so there is nothing to commit and the previous
+          // selection stands. Saying so beats replacing a good selection with a
+          // bad one on the strength of a phrase the model did not recognise.
+          say(`No confident match for “${text}” — try CLIPSeg, or other words.`);
+          return;
+        }
+        // The pixels are already frozen server-side, so this is the saved-mask
+        // shape from the start — `bankSelection()` will find nothing left to do
+        // at Apply. Appending rather than re-fetching for bankSelection()'s
+        // reason: the row arrives in the response, and a GET here would be a
+        // second source of truth for something we were just told.
+        state.masks = [...state.masks, found.mask];
+        clearOverlayCache();
+        commit({ masks: [found.mask_id], invert: invert.checked });
+        const many =
+          found.instances > 1 ? ` — ${found.instances} of them` : "";
+        say(`Found “${text}”${many}, ${covers}. Saved as a mask.`);
+        // The strip has a chip to grow, which means rebuilding this control out
+        // from under us. Safe only because it is the last thing done with it:
+        // `finally` below repaints a detached row, and `say` writes through to
+        // the module-level copy the new control seeds itself from.
+        await refreshMasks();
+        return;
+      }
+
       // The server's level rather than the dropdown's, which `render()` then
       // pushes into the control: it was chosen to match how much of the frame
       // the phrase covers, and that is the whole of how "the sky" and "a cloud"
@@ -2408,7 +2533,6 @@ function appendSelectionControls(
         points: [{ x: found.x, y: found.y, level: found.level }],
         invert: invert.checked,
       });
-      const covers = `${(found.coverage * 100).toFixed(1)}% of the frame`;
       say(
         found.confident
           ? `Found “${text}” — ${covers}.`
@@ -2434,6 +2558,14 @@ function appendSelectionControls(
     // stays live in the edit modal — showModal() making the image inert is the
     // whole of why that one is disabled there.
     query.disabled = find.disabled = finding || sourceNodeId === null;
+    // The radios go with the box they steer — mid-search they would change
+    // which model the *next* Find uses while the note still described this one.
+    // Re-checked from the flag rather than trusted, since the edit modal's copy
+    // of this control writes the same one.
+    for (const radio of backendInputs) {
+      radio.disabled = finding || sourceNodeId === null;
+      radio.checked = selectBackend === radio.value;
+    }
     // a frozen mask has no candidate masks left to re-rank
     level.value = points.length === 1 ? points[0].level : "auto";
     level.disabled = points.length !== 1;

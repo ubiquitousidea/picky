@@ -165,14 +165,41 @@ one place silently breaks another.
   (via `effects.validate_selection`), so exactly one shape ever leaves the
   database; nothing migrates them in place.
 - **Naming an object produces a click, not a third shape.** `POST
-  /api/nodes/{id}/select-text` answers with the `{x, y, level}` a person would
-  have picked (`rendering.locate_object` → `clipseg.locate` for the place,
-  `sam.level_for_area` for which candidate mask at it), and the frontend commits
-  that as an ordinary points selection. So nothing downstream — the overlay,
-  banking, presets, `_portable_selection` — can tell a sentence from a finger,
-  and no CLIPSeg pixel is ever stored or displayed. What makes the point
+  /api/nodes/{id}/select-text` with `method: "clipseg"` answers with the `{x, y, level}` a
+  person would have picked (`rendering.locate_object` → `clipseg.locate` for the
+  place, `sam.level_for_area` for which candidate mask at it), and the frontend
+  commits that as an ordinary points selection. So nothing downstream — the
+  overlay, banking, presets, `_portable_selection` — can tell a sentence from a
+  finger, and no CLIPSeg pixel is ever stored or displayed. What makes the point
   re-decode to the mask that was measured is that `sam.level_for_area` and
   `decode_mask` rank candidates through one `_ranked`.
+- **The other backend answers with pixels, and that is why it *writes*.**
+  `method=sam3` runs one model instead of two (`rendering.locate_object_sam3` →
+  `sam3.segment`), and there is no point-and-level that would re-derive its
+  boundary — so `select_text` freezes it through `main._bank_mask` and returns a
+  `mask_id`, where the CLIPSeg branch returns coordinates and touches nothing.
+  Still not a third shape: what comes back is the `{masks: [id]}` a hand-saved
+  selection already was. Three consequences to keep in step. `bankSelection()`
+  no-ops on it, having nothing left to bank. The `level` dropdown goes inert on
+  its own, since `render()` already disables it for a masks selection. And a
+  SAM 3 query leaves a mask behind whether or not the caller uses it, which is
+  why `agent._measure_focus` pins `method="clipseg"` — a tool documented to
+  write nothing must not bank one to read a depth.
+- **SAM 3's image features are cached in memory, not on disk**, which is the one
+  place it departs from `node_embedding`'s pattern rather than following it. Its
+  four tensors are ~117 MB a node against MobileSAM's 4 MB, so `data/renders/`
+  is the wrong home — `rendering.sam3_features` is a bounded LRU, the precedent
+  being `depth.depth_map` for the same reason. So there is no file kind to sweep
+  or count; what `delete_render_files` does instead is *evict the entry*, since
+  the key is still a node id and an edited node must not answer from old pixels.
+  The decoder consumes only `fpn_0`, `fpn_1`, `fpn_2` and `pos_2` — `forward`
+  slices the rest away and the exporter prunes them — so caching the encoder's
+  other four outputs would double that for tensors no graph has an input for.
+- **Which backend runs is the person's choice, never a fallback.** The radio in
+  the selection row (`picky:selectBackend`, defaulting to `sam3`) is the only
+  writer; a 409 names the other model rather than quietly switching to it, since
+  one phrase silently answered by two models is two different masks with nothing
+  on screen saying which ran.
 - **A click selection is banked into a saved mask by the frontend**
   (`bankSelection()`, called from `applyEffect`/`applyPreset`), not by
   `create_node`. From the server the store would still hold the points, so every
@@ -217,7 +244,10 @@ one place silently breaks another.
   through and which short-circuits when the crop is the identity. Keeping it
   outside the tree is what keeps the same-dimensions invariant true, and means
   **no saved mask is ever warped**. `.out.jpg` must be excluded by name in
-  `storage_stats` and swept in `delete_render_files`.
+  `storage_stats` and swept in `delete_render_files` — as must every other file
+  kind keyed by node id: `.thumb.jpg`, `.clusters.json` and `.embedding.npy`.
+  Forgetting the sweep is silent and permanent, because node ids are rowids
+  SQLite reuses, so a stale cache file is read back as its successor's.
 - **Bokeh's optical axis is the centre of the node's own pixels**, which the
   crop then moves. Both `_swirl_mean` and `_vignette` measure from there, so
   re-framing slides the swirl's centre and the vignette's centre off-centre in
@@ -313,24 +343,47 @@ one place silently breaks another.
   most sessions never type in the box, so `text_job.py` is triggered by the
   search box alone — never by opening the map — and `/api/embedding-map/search`
   409s instead of fetching a quarter-gigabyte inside a GET.
-- **Five ONNX models, four different normalizations.** SAM's constants are
+- **Six ONNX models, five different normalizations.** SAM's constants are
   applied to 0-255 pixels, CLIP's to 0-1 floats, `depth.py`'s are plain
   ImageNet over 0-1 floats — which `clipseg.py`'s also are, numerically, and
   are still written out there rather than imported: two checkpoints agreeing on
   their preprocessing is a coincidence, and sharing the array would make
   re-pinning either one a silent change to the other — and `detect.py`'s is no
   normalization at all beyond 0-1, which is YOLO's, plus a letterbox no other
-  model here wants. Crossing any of them yields output that still looks like
-  output — a plausible depth map, a well-spread vector — and nothing downstream
-  can detect it. `sam.py` owns `MODELS_DIR` and `download_model`; `embed.py`,
-  `depth.py`, `clipseg.py` and `detect.py` all borrow them rather than
-  re-deriving the pinned-revision and atomic-write contract.
+  model here wants — and `sam3.py`'s is the fifth, at its own 1008 square rather
+  than SAM 1's 1024. Crossing any of them yields output that still looks like
+  output — a plausible depth map, a well-spread vector, a mask with a boundary —
+  and nothing downstream can detect it. `sam.py`
+  owns `MODELS_DIR` and `download_model`; `embed.py`, `depth.py`, `clipseg.py`,
+  `detect.py` and `sam3.py` all borrow them rather than re-deriving the
+  pinned-revision and atomic-write contract. `download_model` is also the one
+  place a credential is attached (`_auth_header`, from `PICKY_HF_TOKEN`), scoped
+  to `huggingface.co` over https so pointing a URL constant elsewhere cannot
+  hand the user's account to another host.
+- **SAM 3 is the one model that cannot fetch itself.** Meta publishes PyTorch
+  weights, no ONNX, behind a gate a human approves, so the graphs come from
+  `tools/export_sam3_onnx.py` run once by hand — which is why `sam3.ensure_model`
+  raises the export command instead of downloading, why `sam3_job` has no
+  `download` phase and no thread, and why its 409 says "not exported" where every
+  other model's says "still downloading". Do not add a fetch path: there is no
+  URL to fetch, and the gate is not something a request can clear.
+- **`sam3.self_check()` is what keeps that export honest, and it is not
+  optional.** The exporter writes a fixture beside the graphs — one real photo's
+  preprocessed pixels, its token ids, and the logits PyTorch produced from them —
+  because every way this module can be wrong is silent: a wrong resize filter, a
+  wrong normalization or a wrong pad token all return a mask with a plausible
+  boundary. Three real bugs were caught this way and none would have raised. The
+  graphs are exported and run at **fixed** shapes (1008², 32 tokens), which is
+  what makes the tracer's baked-in constants safe; adding a dynamic axis would
+  quietly invalidate that, and the fixture is what would tell you.
 - **`detect.py`'s pinned revision is load-bearing beyond reproducibility: that
   export writes box coordinates normalized to the letterbox, where Ultralytics'
   own writes them in 0..640.** Decode it the documented way and every box lands
   in the top-left corner a fraction of a pixel wide, which is why `_boxes`
-  raises rather than trusting the numbers. It is also the only AGPL-3.0 weight
-  in the tree — everything else here is Apache or MIT.
+  raises rather than trusting the numbers. Its weights are also AGPL-3.0, which
+  used to make them the tree's only encumbered ones; SAM 3's are Meta's **SAM
+  License**, so there are now two licences to read before this app is
+  distributed, and everything else here is still Apache or MIT.
 - **`clipseg.py` answers with a *location*, and SAM still draws every
   boundary.** Its 352×352 map is too coarse to be a mask, so `locate` reduces it
   to a point and a size — which is also what keeps "select by name" from being
@@ -342,15 +395,15 @@ one place silently breaks another.
   same subject, and it invents nothing, because an absent subject is missed by
   all four.
 - **`server/embed_job.py` is only ever an optimization; `server/text_job.py`,
-  `server/depth_job.py`, `server/clipseg_job.py` and `server/detect_job.py` are
-  not.** `GET /api/embedding-map` still embeds whatever it finds missing, so the
+  `server/depth_job.py`, `server/clipseg_job.py`, `server/detect_job.py` and
+  `server/sam3_job.py` are not.** `GET /api/embedding-map` still embeds whatever it finds missing, so the
   map is correct if nobody prepared, if the job died, or if both run at once —
   keep it that way, a prepare the map *required* would be a second source of
   truth. Search, bokeh, naming an object and detection have no such fallback by
-  choice (see above), which is exactly why the five are separate modules rather
+  choice (see above), which is exactly why the six are separate modules rather
   than phases of one: each is triggered by the one gesture that needs it —
-  opening the map, typing a query, lighting the Bokeh button, pressing Find or
-  calling `select_object` — so nobody pays for a model they never use.
+  opening the map, typing a query, lighting the Bokeh button, pressing Find
+  under either backend, or calling `select_object` — so nobody pays for a model they never use.
   `detect_job` is the one whose gesture it *shares* (the map's open starts both
   it and `embed_job`), affordable only because 12.8 MB is an order of magnitude
   under anything else here; what it must never grow is a detect-on-demand path,
@@ -407,7 +460,9 @@ one place silently breaks another.
   (`bankSelection` exists because a live click selection would be re-banked on
   every Apply; a tool call happens once and its result must be a durable
   handle), and it is named after the words, because a `mask_id` is all the model
-  gets while the person has a thumbnail. An object that cannot be named is still
+  gets while the person has a thumbnail. Under `method=sam3` the banking has
+  already happened inside `select_text`, so `_select_object` reads the `mask_id`
+  off the result and skips its own naming loop — one branch, not two paths. An object that cannot be named is still
   a whole-frame edit the model is told to own up to.
 - **The agent can open a view, not only navigate to one.** `turn.focus` is one
   photo; `turn.map` is a set of them, and the browser answers it by opening the

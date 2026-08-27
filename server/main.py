@@ -25,6 +25,8 @@ from . import (
     embed_job,
     labels,
     rendering,
+    sam3,
+    sam3_job,
     text_embed,
     text_job,
 )
@@ -78,12 +80,30 @@ class MaskRequest(BaseModel):
     level: str = "auto"
 
 
+# The two models that can answer a phrase, and what each answers *with*.
+# "clipseg" locates and MobileSAM draws, so the answer is a click; "sam3"
+# segments directly, so the answer is a saved mask. Everything downstream of
+# `select_text` already handles both, because both are selection shapes the app
+# has always had — see `effects.validate_selection`.
+SELECT_METHODS = ("sam3", "clipseg")
+
+
 class SelectTextRequest(BaseModel):
-    """The words, and nothing else. What they resolve *against* is the node in
-    the path — the same node a click would have been made on, since the point
-    that comes back is in that node's pixel space."""
+    """The words, and which model reads them. What they resolve *against* is the
+    node in the path — the same node a click would have been made on, since a
+    point that comes back is in that node's pixel space, and a mask is at its
+    dimensions.
+
+    `method` is the user's, not a server preference: the two backends differ by
+    orders of magnitude in cost and by a lot in what they can express, and which
+    trade is right is not something this endpoint can know. It defaults to
+    `sam3` because that is the better answer when it is available; when it is
+    not, the answer is a 409 naming the other one, never a silent downgrade — a
+    query that quietly changed models would give two different masks for one
+    phrase with nothing on screen saying which ran."""
 
     query: str
+    method: str = "sam3"
 
 
 class MaskCreate(BaseModel):
@@ -599,6 +619,29 @@ def select_model_progress():
     return clipseg_job.snapshot()
 
 
+@app.post("/api/sam3-model/prepare")
+def prepare_sam3_model():
+    """Report whether SAM 3 can run, in the shape the other prepare endpoints
+    answer in.
+
+    It prepares nothing, and cannot: there is no ONNX export published and the
+    weights are gated behind manual approval, so the graphs arrive from
+    `tools/export_sam3_onnx.py` and never from a request. What this buys by
+    existing anyway is that the browser's prepare-then-poll loop is one loop —
+    the alternative is the selection row knowing that one of its two backends
+    answers a different question, which is knowledge that belongs in one place
+    and this is it. `sam3_job.start()` says the same thing about why.
+    """
+    return sam3_job.start()
+
+
+@app.get("/api/sam3-model/progress")
+def sam3_model_progress():
+    """`select-model/progress`'s counterpart. Always terminal — SAM 3 is either
+    exported or it is not, and there is no in-between state to poll through."""
+    return sam3_job.snapshot()
+
+
 @app.post("/api/depth-model/prepare")
 def prepare_depth_model():
     """Start fetching the depth model, and report where it already is.
@@ -919,20 +962,36 @@ def get_mask(node_id: int, body: MaskRequest):
 def select_text(node_id: int, body: SelectTextRequest):
     """Name an object instead of clicking one.
 
-    The click picker's counterpart, and deliberately not a third kind of
-    selection: this answers with the *point* a person would have clicked, so
-    what the caller does with it — post it back to `/mask`, apply an effect
-    through it, bank it into a saved mask — is the code that was already there.
-    A selection on disk cannot say whether a finger or a sentence produced it.
+    The click picker's counterpart, in one of two shapes depending on which
+    model reads the words — and *both* shapes are ones the app already had, so
+    this is still not a third kind of selection:
+
+    - `clipseg` answers with the **point** a person would have clicked, which
+      the caller posts back to `/mask`, applies an effect through, or banks. A
+      selection on disk cannot say whether a finger or a sentence produced it.
+    - `sam3` answers with **pixels**, which no point would reproduce, so they
+      are frozen here into a saved mask and the caller gets a `mask_id`. That is
+      the same `{masks: [id]}` a hand-saved selection is.
+
+    The asymmetry is worth naming: the SAM 3 path *writes* where the CLIPSeg
+    path is read-only. It has to — a mask that exists only in a response body is
+    not a handle anything can be applied through, and re-segmenting to recover
+    it would cost the encoder pass again. So a SAM 3 query leaves a mask behind
+    even if the caller does nothing with it, and the mask grid is where it shows
+    up. `bankSelection()` then no-ops on it, having nothing left to bank.
 
     Refuses rather than downloading, for `search_embedding_map`'s reason: a
     409 says the state is wrong rather than the server unwell, and it is the
-    caller's own `POST /api/select-model/prepare` that fixes it.
+    caller's own prepare endpoint that fixes it. The two backends fail
+    differently and the message has to say which — CLIPSeg's is a download that
+    has not happened, SAM 3's is an export nobody has run, and only one of those
+    is fixed by waiting.
 
-    A low-scoring match is *not* a refusal — the point comes back with
-    `confident: false`, because the person can see the outline the moment it
-    lands and a query for something that is there but oddly worded deserves an
-    answer. `clipseg.MATCH_FLOOR` explains where the number comes from.
+    A low-scoring match is *not* a refusal on either path — the answer comes
+    back with `confident: false`, because the person can see the outline the
+    moment it lands and a query for something that is there but oddly worded
+    deserves an answer. `clipseg.MATCH_FLOOR` and `sam3.MATCH_FLOOR` explain
+    where the two numbers come from.
     """
     node = db.get_node(node_id)
     if node is None:
@@ -940,12 +999,44 @@ def select_text(node_id: int, body: SelectTextRequest):
     query = body.query.strip()
     if not query:
         raise HTTPException(400, "query must not be empty")
-    if not clipseg.ready():
-        raise HTTPException(409, "the object model is not downloaded yet")
+    if body.method not in SELECT_METHODS:
+        raise HTTPException(400, f"method must be one of {', '.join(SELECT_METHODS)}")
+
+    if body.method == "clipseg":
+        if not clipseg.ready():
+            raise HTTPException(409, "the object model is not downloaded yet")
+        try:
+            return rendering.locate_object(node_id, query)
+        except Exception as exc:
+            raise HTTPException(500, f"finding the object failed: {exc}")
+
+    if not sam3.ready():
+        raise HTTPException(409, sam3.EXPORT_HINT)
     try:
-        return rendering.locate_object(node_id, query)
+        found = rendering.locate_object_sam3(node_id, query)
     except Exception as exc:
         raise HTTPException(500, f"finding the object failed: {exc}")
+
+    mask = found.pop("mask")
+    if not found["confident"]:
+        # Nothing is banked for a match this weak, so there is no mask id to
+        # return — but the numbers still come back, because the caller decides
+        # what to do about it. The browser re-asks with `clipseg`; the agent
+        # says it could not find the thing. Neither wants a mask in the grid
+        # named after a phrase that found nothing.
+        return {**found, "mask_id": None}
+
+    # The spec stored beside the pixels is a click, not the thing that made
+    # them: SAM 3's mask has no point-and-level that would re-derive it. It is
+    # provenance for `_portable_selection`, which is what lets a preset built on
+    # this replay on another image — degrading to a MobileSAM re-decode there
+    # rather than dropping the step. See `_bank_mask`.
+    spec = {"points": [{"x": found["x"], "y": found["y"], "level": "auto"}],
+            "invert": False}
+    saved = _bank_mask(
+        node["image_id"], node_id, spec, mask, query[:60], suffix_on_collision=True
+    )
+    return {**found, "mask_id": saved["id"], "mask": saved}
 
 
 @app.get("/api/nodes/{node_id}/clusters")
@@ -1056,6 +1147,57 @@ def _auto_mask_name(image_id: int) -> str:
 AUTO_NAME_TRIES = 5
 
 
+def _bank_mask(
+    image_id: int,
+    node_id: int,
+    spec: dict,
+    mask,
+    name: str | None = None,
+    suffix_on_collision: bool = False,
+) -> dict:
+    """Freeze pixels into a saved mask: name it, write the row, write the PNG.
+
+    Split out of `create_mask` because there are now two ways to arrive with a
+    mask in hand. That endpoint computes its pixels *from* the spec; the SAM 3
+    branch of `select_text` is handed pixels no spec would reproduce. What must
+    not be duplicated is everything after that — the name collision handling and
+    the row-then-file ordering with its unwind, which is what keeps a row from
+    ever pointing at a missing PNG.
+
+    `suffix_on_collision` is the third naming mode. A caller-supplied name is
+    normally taken literally and 409s if it is taken, because the person typed
+    it and silently saving something else would be a lie; but a name derived
+    from a *query* ("the dog", asked twice) has no such contract, and numbering
+    it beats refusing. `spec` is stored alongside as the mask's provenance —
+    `_portable_selection` degrades a preset back to it — so for the SAM 3 path
+    it is a click spec that only approximates the frozen pixels. That is the
+    documented cost of making one replayable across images.
+    """
+    height, width = mask.shape
+    tries = 1 if (name is not None and not suffix_on_collision) else AUTO_NAME_TRIES
+    for attempt in range(tries):
+        if name is None:
+            chosen = _auto_mask_name(image_id)
+        else:
+            chosen = name if attempt == 0 else f"{name} {attempt + 1}"
+        try:
+            saved = db.create_mask(image_id, chosen, node_id, spec, width, height)
+            break
+        except sqlite3.IntegrityError:
+            if attempt == tries - 1:
+                raise HTTPException(
+                    409, f"a mask named '{chosen}' already exists for this image"
+                )
+    # row first so the file is named by the id; unwind it if the write fails,
+    # so a row can never point at a missing PNG
+    try:
+        rendering.save_mask(saved["id"], mask)
+    except Exception as exc:
+        db.delete_mask(saved["id"])
+        raise HTTPException(500, f"saving the mask failed: {exc}")
+    return {**saved, "used_by": 0}
+
+
 @app.post("/api/images/{image_id}/masks")
 def create_mask(image_id: int, body: MaskCreate):
     if db.get_image(image_id) is None:
@@ -1079,27 +1221,7 @@ def create_mask(image_id: int, body: MaskCreate):
     except Exception as exc:
         raise HTTPException(500, f"segmentation failed: {exc}")
 
-    height, width = mask.shape
-    # a caller-supplied name is taken literally and collides once; an auto-name
-    # re-derives and retries, since losing the race just means picking again
-    for attempt in range(AUTO_NAME_TRIES if name is None else 1):
-        chosen = name if name is not None else _auto_mask_name(image_id)
-        try:
-            saved = db.create_mask(image_id, chosen, body.node_id, spec, width, height)
-            break
-        except sqlite3.IntegrityError:
-            if name is not None or attempt == AUTO_NAME_TRIES - 1:
-                raise HTTPException(
-                    409, f"a mask named '{chosen}' already exists for this image"
-                )
-    # row first so the file is named by the id; unwind it if the write fails,
-    # so a row can never point at a missing PNG
-    try:
-        rendering.save_mask(saved["id"], mask)
-    except Exception as exc:
-        db.delete_mask(saved["id"])
-        raise HTTPException(500, f"saving the mask failed: {exc}")
-    return {**saved, "used_by": 0}
+    return _bank_mask(image_id, body.node_id, spec, mask, name)
 
 
 @app.patch("/api/masks/{mask_id}")

@@ -565,6 +565,21 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 }
 .sel-invert input { accent-color: var(--rb-teal); }
 
+/* Which model reads a typed name. Scoped to .param-row for .sel-invert's
+   reason: `.param-row label` would otherwise paint these yellow and spread
+   them out, and here there are two side by side where invert is one. */
+.param-row .sel-backend label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text);
+  white-space: nowrap;
+}
+.sel-backend input { accent-color: var(--rb-teal); }
+.sel-backend label:has(input:disabled) { opacity: 0.5; }
+
 /* Step 1 in the bar: the picker, its options and Save on the left, then the
    saved masks as a strip running parallel to the work tree's row below. Scoped
    for the same reason #effect-params is — the edit modal builds this control
