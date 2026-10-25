@@ -353,11 +353,11 @@ def _projected(stacked, image_ids, method: str):
         # truncated blob — where the alternative is a `zip()` that silently drops
         # the tail of the library and looks like a working map.
         if len(coords) == len(stacked):
-            return coords
+            return coords, fingerprint
 
     coords = np.ascontiguousarray(_project(stacked, method), dtype=np.float32)
     db.set_projection(method, fingerprint, coords.tobytes())
-    return coords
+    return coords, fingerprint
 
 
 def _collect_embeddings(images: list[dict]):
@@ -448,13 +448,16 @@ def embedding_map(method: str = "tsne"):
 
     images = db.list_images()
     if not images:
-        return {"method": method, "points": []}
+        return {"method": method, "points": [], "layout": None}
 
     stacked, points = _library_vectors(images)
-    coords = _projected(stacked, [p["image_id"] for p in points], method)
+    coords, layout = _projected(stacked, [p["image_id"] for p in points], method)
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
-    return {"method": method, "points": points}
+    # The fit's own cache key, handed out as the layout's identity: the map
+    # keeps its camera across opens, and pivot and pan are coordinates in one
+    # particular fit, so the browser needs to know when the fit under them moved.
+    return {"method": method, "points": points, "layout": layout}
 
 
 @app.get("/api/embedding-map/search")

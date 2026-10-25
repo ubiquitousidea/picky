@@ -3345,10 +3345,18 @@ const embedMap = {
   // Multiplies the sprite size, 0.1 to 1. Not folded into `zoom`: zoom moves
   // the camera and this resizes the things in front of it, so shrinking the
   // sprites opens gaps between them where zooming out only makes the same
-  // collage smaller. Deliberately outlives an open, like yaw/pitch and unlike
-  // the framing — it is a reading preference for a library of a given density,
-  // not part of where you happen to be looking.
+  // collage smaller. Deliberately outlives an open, like the camera — it is a
+  // reading preference for a library of a given density.
   spriteScale: 1,
+  // The fit the camera above was framed in: the server's fingerprint of the
+  // projection, or null before the first load. Yaw, pitch, zoom, pan and pivot
+  // all outlive an open — the map is a place you step out of to work on a
+  // neighbour and come back to — but pivot and pan are coordinates in *one*
+  // fit, so a library that changed in between (an upload, a delete, a
+  // re-frame) or a swapped method leaves them pointing at nothing. Comparing
+  // this is how loadEmbedMap() tells the two apart. Memory only: a reload
+  // starts framed on the whole cloud again.
+  layout: null,
   // Thumbnails to draw at each point, keyed by URL (see embedSprite). Kept
   // across opens: a baked sprite is immutable for its key, so a reopened map
   // should be instant rather than re-fetching a library it already has.
@@ -3357,9 +3365,9 @@ const embedMap = {
   // running", which is the whole off state: null means every point draws, so
   // there is no second flag anywhere saying whether filtering is on.
   //
-  // These reset on every open, unlike yaw/pitch/spriteScale and like the
-  // framing — a query is a thing you were looking for once, not a reading
-  // preference for a library of a given density.
+  // These reset on every open, unlike the camera and spriteScale — a query is
+  // a thing you were looking for once, not a reading preference for a library
+  // of a given density.
   query: "",
   scores: null,
   // How strong a match to keep, in standard deviations above the query's own
@@ -3383,11 +3391,14 @@ const embedMap = {
   // and how to be rid of it.
   pinned: null,
   // The Near filter's slider position, 0..1 — an exponent, not a radius (see
-  // embedNearRadius), and 1 is the whole travel's worth of "off". Resets on
-  // every open, like the query and unlike matchZ: hiding all but a
-  // neighbourhood is something you did once, and a map that reopens showing
-  // three images reads as broken. It is anchored on `selected`, so it also does
-  // nothing at all until something is picked.
+  // embedNearRadius), and 1 is the whole travel's worth of "off". Outlives an
+  // open, like the camera and unlike the query: stepping through a
+  // neighbourhood means opening one photo of it, working on it and coming back
+  // for the next, and a slider back at ∞ every time undid the one thing you had
+  // set up. It is anchored on `selected`, which an open sets to the image you
+  // are working on, so a reopened map is the neighbourhood of the photo you
+  // just opened — and the status line says so, which is what keeps a map
+  // showing a handful of images from reading as broken.
   nearT: 1,
   // The edit filter: a Set of tokens, or null for off — the same single-sentinel
   // shape `scores` uses, so there is still no second boolean anywhere saying
@@ -3537,12 +3548,12 @@ function pivotOnSelection() {
 // invisibility by re-anchoring the pan so the pick stays exactly where it
 // already was, which is what you want when the view is already framed on
 // something. This is for the moments where the view is not framed on anything
-// yet — opening the map, or re-projecting, where the coordinates just changed
-// under it. It needs no cached p.sx for the same reason, so it can run before
+// yet — the first open, or any load whose fit moved under the camera (see
+// `layout`). It needs no cached p.sx for the same reason, so it can run before
 // the first frame has been drawn.
 //
 // Zoom is left alone: at 1x the whole cloud is framed, so this only slides that
-// framing over to the pick.
+// framing over to the pick, and zoomed in it keeps how closely you were reading.
 function centerOnSelection() {
   const p = embedMap.selected;
   if (!p) return;
@@ -3565,18 +3576,16 @@ function pickEmbedPoint(point) {
 async function openEmbedMap(pin = null) {
   embedMap.open = true;
   embedMap.selected = null;
-  // yaw/pitch persist across opens on purpose, but the framing does not: a map
-  // reopened still parked at 16x on some corner reads as a broken map.
-  resetEmbedView();
-  // A query is part of the framing, not part of the viewpoint: reopening the
-  // map still filtered to a search you finished last time hides most of the
-  // library for no visible reason.
+  // The camera is left exactly where the last open left it — see `layout`,
+  // which is how loadEmbedMap() knows whether that framing still means
+  // anything. Near rides along with it (see `nearT`), so the slider is told
+  // its remembered position, as the two checkboxes below are.
+  setNearSlider(embedMap.nearT);
+  // A query is not part of the camera: reopening the map still filtered to a
+  // search you finished last time hides most of the library for no visible
+  // reason.
   $("embed-search").value = "";
   clearEmbedSearch();
-  // Part of the framing too, and for a stronger version of the same reason: a
-  // map reopened still hiding everything but one neighbourhood is a map with
-  // most of the library missing and nothing on screen saying why.
-  setNearSlider(1);
   // Same argument again for the edit chips, which hide even more than Near can.
   embedMap.edits = null;
   // And for the tag chips, which are the same control one row down.
@@ -3589,7 +3598,7 @@ async function openEmbedMap(pin = null) {
   // here and re-applied below, so one place still decides what an opened map
   // looks like and `pin` is an explicit override rather than leftover state.
   embedMap.pinned = null;
-  // The two checkboxes are the other direction: their flags outlive the open, so
+  // The two checkboxes are Near's direction: their flags outlive the open, so
   // the markup has to be told what they are. Without this the box and the flag
   // are two sources of truth that agree only until you toggle one.
   $("embed-orbit").checked = embedMap.orbit;
@@ -3747,9 +3756,11 @@ function embedCanvasPoint(e) {
   ];
 }
 
-// `center` says the coordinates the view is framed on have just changed — the
-// map is opening, or the projection was swapped — so the framing has to be
-// rebuilt around the pick. A re-fetch that leaves the layout alone passes
+// `center` says the coordinates the view is framed on may have changed — the
+// map is opening, or the projection was swapped — so the framing is rebuilt
+// around the pick *if the fit under it moved* (see `layout`). An unchanged fit
+// keeps the camera exactly as it was left, which is the whole of the map
+// remembering where you were. A re-fetch that leaves the layout alone passes
 // false — prepareDetect() does, when a sweep finishes and the tags need
 // picking up — or the view would be yanked out from under whoever is reading
 // it.
@@ -3786,7 +3797,15 @@ async function loadEmbedMap(center = false) {
     // start clear; a search survives the re-fetch anyway, since `scores` is
     // keyed by image_id, which re-projecting the same library cannot change.
     pickEmbedPoint(embedMap.points.find((p) => p.image_id === keepId) || null);
-    if (center) centerOnSelection();
+    const moved = data.layout !== embedMap.layout;
+    embedMap.layout = data.layout;
+    // Zoom is kept even then — it is how closely you were reading, which a new
+    // fit does not change. Only with nothing picked is there no point to slide
+    // the framing over to, and then the whole cloud is the honest framing.
+    if (center && moved) {
+      if (embedMap.selected) centerOnSelection();
+      else resetEmbedView();
+    }
     markEmbedDirty();
     startEmbedLoop();
   } catch (err) {
@@ -4600,10 +4619,10 @@ function initEmbedMap() {
   $("embed-spin").onchange = (e) => setEmbedSpin(e.target.checked);
   $("embed-method").onchange = (e) => {
     embedMap.method = e.target.value;
-    // Keep yaw/pitch, so re-projecting doesn't also throw away the viewpoint —
-    // and keep the pick, which is the same image wherever the new fit puts it.
-    // The framing cannot be kept: pivot and pan are in the old space, so
-    // loadEmbedMap re-centres on the pick.
+    // Keep yaw/pitch and zoom, so re-projecting doesn't also throw away the
+    // viewpoint — and keep the pick, which is the same image wherever the new
+    // fit puts it. Pivot and pan cannot be kept: they are in the old space, and
+    // the new fit's `layout` differs, so loadEmbedMap re-centres on the pick.
     $("embed-status").textContent = "Projecting…";
     loadEmbedMap(true);
   };

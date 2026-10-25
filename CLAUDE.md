@@ -615,8 +615,9 @@ one place silently breaks another.
   far worse thing to ship than a fifth of a second of lag. `setEmbedSpin()` is
   the single write path, since two controls ask for the spin (the checkbox and
   the canvas's double-click) and a flag written by one leaves the other lying.
-  `openEmbedMap()` pushes both checkboxes from their flags for the same reason:
-  `orbit` and `spin` outlive an open, so the markup cannot be a second truth.
+  `openEmbedMap()` pushes both checkboxes (and the Near slider) from their
+  flags for the same reason: `orbit`, `spin` and `nearT` outlive an open, so
+  the markup cannot be a second truth.
 - **The Image map's search filter is display-only, and `embedMap.scores === null`
   is the off state.** Nothing is re-fitted on the survivors: matches keep the
   coordinates they already had, so the cloud you learned stays put. `p.hidden` is
@@ -681,10 +682,15 @@ one place silently breaks another.
   not cosmetic: a stale store both flattens every thumbnail and puts every click
   tens of pixels above where it was aimed, which is one bug wearing two faces.
 - **The map opens on the image you are working on** (`state.imageId`), picked
-  and centred by `centerOnSelection()` — which is `pivotOnSelection()`'s
-  opposite, and needs no drawn frame behind it. That is what makes Orbit worth
-  defaulting on, and what a re-projection re-runs: pivot and pan are in the
-  *old* space, so swapping the method has to reframe. The pick itself survives
+  — and the camera is wherever the last open left it. Yaw, pitch, zoom, pan,
+  pivot and Near's `nearT` all outlive an open (in memory, not across a
+  reload), because the map is where you step out of to work on a neighbour and
+  come back for the next one. Pivot and pan are coordinates in *one fit*, so
+  `GET /api/embedding-map` returns the projection's fingerprint as `layout`
+  (`main._projected`'s cache key, which is what moves when the library or the
+  method does), and `loadEmbedMap()` reframes with `centerOnSelection()` only
+  when that changed — `pivotOnSelection()`'s opposite, which needs no drawn
+  frame behind it. The search and the chips still reset. The pick itself survives
   any re-fetch by `image_id`, never by identity — `loadEmbedMap()` replaces
   every point object, so the draw loop's `p === embedMap.selected` would never
   match again.
