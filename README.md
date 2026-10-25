@@ -186,7 +186,12 @@ restarts.
   reports itself — the status line counts the megabytes down and then the
   images — instead of leaving the modal blank for a minute. The fitted layout is
   cached too, keyed by the vectors that produced it, so reopening the map is
-  instant until the library itself changes.
+  instant until the library itself changes. The map also keeps its view between
+  opens — rotation, zoom, pan and the **Near** radius — so you can open one
+  photo of a neighbourhood, work on it, and come back for the next. It opens
+  with the photo you just worked on picked, so Near measures from that one. A
+  reload starts fresh, and so does a library change: when the layout itself
+  moves, the map recentres on the pick and keeps the zoom.
 - **Preview zoom** — scroll to zoom (cursor-anchored), drag to pan,
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
@@ -196,7 +201,18 @@ restarts.
   like Export (`photo-blur-cutout.png`). Any selection works — a click, a named
   object, or ticked saved masks, with `invert` honoured — and it opens in
   Photoshop as a layer with real transparency.
-- **Library stats** — image, node, preset, and mask counts plus disk usage. The
+- **Collage** — **Add to collage**, beside Export cut-out, freezes the same
+  cut-out into the current collage instead of downloading it. **Collage** in the
+  header opens the artboard. Drag a piece to move it, drag a corner to scale it
+  and the knob above it to rotate it (Shift snaps to 15°). Below the artboard
+  are opacity, a feathered edge and a drop shadow, plus Flip and stacking order.
+  Arrow keys nudge a piece and Delete removes it. Scroll zooms the view and
+  dragging the background pans it. Collages are named and kept in the library;
+  the artboard size and background (a colour, or transparent) are set in the
+  header. **Export PNG** renders the collage at full size with the same code
+  that draws the preview, so the file is what you see. A piece holds its own
+  pixels, so editing or deleting the photo it came from never changes a collage.
+- **Library stats** — image, node, preset, mask, and collage counts plus disk usage. The
   render cache and the downloaded model weights are reported apart from the
   database, originals, and saved masks: between them they are the bulk of the
   bytes and both come back on their own (one regenerates, the other
@@ -359,7 +375,7 @@ written.
 ```
 server/
   main.py       FastAPI routes + static file serving
-  db.py         SQLite schema and queries (images, nodes, presets, masks)
+  db.py         SQLite schema and queries (images, nodes, presets, masks, collages)
   effects.py    effect registry: each effect maps an RGB numpy array -> array
   rendering.py  node render pipeline with per-node JPEG cache
   sam.py        MobileSAM via onnxruntime: click a point, get a mask
@@ -519,7 +535,7 @@ the preset is replayed against.
 | GET    | `/api/masks/{id}/thumb` | the mask's silhouette as a small grayscale PNG — the icon in the mask grid; computed per request and served `immutable`, so cache-bust on the mask's `created_at` |
 | PATCH  | `/api/masks/{id}` | rename a mask (`name`) |
 | DELETE | `/api/masks/{id}` | delete a mask and its PNG; 409 while any node still references it |
-| GET    | `/api/embedding-map` | the whole library as 3D points (`method`: `tsne`\|`pca`). Embeds anything it finds missing, so it answers with or without a `prepare`; the fit itself is cached against the vectors that produced it |
+| GET    | `/api/embedding-map` | the whole library as 3D points (`method`: `tsne`\|`pca`), plus `layout`, the fingerprint of the fit they come from, so the browser can tell when a kept camera no longer matches the layout. Embeds anything it finds missing, so it answers with or without a `prepare`; the fit itself is cached against the vectors that produced it |
 | GET    | `/api/embedding-map/search` | score every image against a phrase (`q`), as a raw CLIP cosine, the probability the phrase beats 850 rival subjects, and a z-score over this query's own spread; plus `tag`, the COCO class the phrase names, if any. 409s rather than downloading the text tower inside a GET |
 | POST   | `/api/embedding-map/prepare` | start the background embedding pass (~335 MB of weights on a fresh install, then one forward pass per image); answers `done` synchronously when nothing is missing |
 | GET    | `/api/embedding-map/progress` | where that pass got to — `state`, `phase`, `done`/`total` |
@@ -536,4 +552,13 @@ the preset is replayed against.
 | GET    | `/api/sam3-model/progress` | the same answer, pollable; always terminal |
 | GET    | `/api/agent` | whether an `ANTHROPIC_API_KEY` is configured, and which model the command row would talk to; the frontend hides the row when it is not |
 | POST   | `/api/agent` | run one turn (`prompt`, the browser's own `history`, and the `image_id`/`node_id` on screen). Answers with the `reply`, the `steps` it took, the updated `history`, a `focus` to navigate to, a `pending` action awaiting confirmation, and the `wire` record of the API calls the turn actually made |
+| GET    | `/api/collages` | list collages, each with its `pieces` count |
+| POST   | `/api/collages` | create a collage (optional `name`, `width`, `height` (default 4000 × 3000, clamped to 64–16000), `background` as `#rrggbb` or `null` for transparent). If `name` is omitted the server picks the next unused *Collage N*; 409 on a taken name |
+| GET    | `/api/collages/{id}` | one collage with its `pieces` in paint order — each with its source size, `z`, centre `x`/`y` in artboard pixels, `scale`, `rotation` (degrees), `flip`, `opacity`, `feather` and `shadow` |
+| PATCH  | `/api/collages/{id}` | rename, resize or re-colour (`name`, `width`, `height`, `background`). Pieces keep their artboard coordinates |
+| DELETE | `/api/collages/{id}` | delete a collage, its pieces and their PNGs |
+| POST   | `/api/collages/{id}/pieces` | freeze a selection's cut-out into the collage (`node_id`, `selection`, as `/cutout` takes it). It is placed centred, fitted inside 60% of the artboard and on top of the stack |
+| PUT    | `/api/collages/{id}/layout` | save every listed piece's transform in one transaction (`pieces`: `[{id, z, x, y, scale, rotation, flip, opacity, feather, shadow}]`). Values are clamped; 400 if an id belongs to another collage |
+| DELETE | `/api/collage-pieces/{id}` | remove one piece and its PNG |
+| GET    | `/api/collage-pieces/{id}/png` | a piece's frozen cut-out, served `immutable`, so cache-bust on its `created_at` |
 | GET    | `/api/stats` | library counts and disk usage |

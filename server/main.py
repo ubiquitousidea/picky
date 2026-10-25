@@ -2,6 +2,8 @@
 
 import hashlib
 import io
+import math
+import re
 import sqlite3
 from pathlib import Path
 from urllib.parse import quote
@@ -138,6 +140,45 @@ class CropUpdate(BaseModel):
 class CropPreviewRequest(BaseModel):
     node_id: int
     angle: float = 0.0
+
+
+class CollageCreate(BaseModel):
+    # omit `name` to have the server pick one, as masks do
+    name: str | None = None
+    width: int = 4000
+    height: int = 3000
+    background: str | None = None  # "#rrggbb"; null = transparent
+
+
+class CollageUpdate(BaseModel):
+    # every field optional; `background: null` is a value (transparent), so the
+    # endpoint reads model_fields_set rather than testing for None
+    name: str | None = None
+    width: int | None = None
+    height: int | None = None
+    background: str | None = None
+
+
+class PieceCreate(BaseModel):
+    node_id: int
+    selection: dict
+
+
+class PieceLayout(BaseModel):
+    id: int
+    z: int
+    x: float
+    y: float
+    scale: float
+    rotation: float = 0.0
+    flip: bool = False
+    opacity: float = 1.0
+    feather: float = 0.0
+    shadow: float = 0.0
+
+
+class LayoutSave(BaseModel):
+    pieces: list[PieceLayout]
 
 
 class AgentRequest(BaseModel):
@@ -353,11 +394,11 @@ def _projected(stacked, image_ids, method: str):
         # truncated blob — where the alternative is a `zip()` that silently drops
         # the tail of the library and looks like a working map.
         if len(coords) == len(stacked):
-            return coords
+            return coords, fingerprint
 
     coords = np.ascontiguousarray(_project(stacked, method), dtype=np.float32)
     db.set_projection(method, fingerprint, coords.tobytes())
-    return coords
+    return coords, fingerprint
 
 
 def _collect_embeddings(images: list[dict]):
@@ -448,13 +489,16 @@ def embedding_map(method: str = "tsne"):
 
     images = db.list_images()
     if not images:
-        return {"method": method, "points": []}
+        return {"method": method, "points": [], "layout": None}
 
     stacked, points = _library_vectors(images)
-    coords = _projected(stacked, [p["image_id"] for p in points], method)
+    coords, layout = _projected(stacked, [p["image_id"] for p in points], method)
     for point, (x, y, z) in zip(points, coords):
         point["x"], point["y"], point["z"] = float(x), float(y), float(z)
-    return {"method": method, "points": points}
+    # The fit's own cache key, handed out as the layout's identity: the map
+    # keeps its camera across opens, and pivot and pan are coordinates in one
+    # particular fit, so the browser needs to know when the fit under them moved.
+    return {"method": method, "points": points, "layout": layout}
 
 
 @app.get("/api/embedding-map/search")
@@ -959,6 +1003,14 @@ def get_mask(node_id: int, body: MaskRequest):
     return Response(content=data, media_type="image/png")
 
 
+def _cutout_name(node: dict) -> str:
+    """`<image stem>-<effect chain>` — what a cut-out of this node is called,
+    as a download and as a collage piece alike."""
+    image = db.get_image(node["image_id"])
+    stem = Path(image["name"]).stem or "image"
+    return f"{stem}-{'-'.join(_effect_chain(node)) or 'original'}"
+
+
 @app.post("/api/nodes/{node_id}/cutout")
 def get_cutout(node_id: int, body: MaskRequest):
     """The selection cut out of the node's framed render as a transparent PNG,
@@ -976,12 +1028,9 @@ def get_cutout(node_id: int, body: MaskRequest):
         raise HTTPException(400, str(exc))
     except Exception as exc:
         raise HTTPException(500, f"cut-out failed: {exc}")
-    image = db.get_image(node["image_id"])
-    stem = Path(image["name"]).stem or "image"
-    suffix = "-".join(_effect_chain(node)) or "original"
     # FileResponse's spelling of the header, since there is no file to hand it:
     # an image name is the user's, and may be anything latin-1 cannot carry
-    filename = f"{stem}-{suffix}-cutout.png"
+    filename = f"{_cutout_name(node)}-cutout.png"
     quoted = quote(filename)
     disposition = (
         f'attachment; filename="{filename}"'
@@ -1610,6 +1659,226 @@ def agent_turn(body: AgentRequest):
         raise HTTPException(502, f"Claude API error ({exc.status_code}): {exc.message}")
     except anthropic.APIConnectionError:
         raise HTTPException(502, "could not reach the Claude API")
+
+
+# ---------- Collages ----------
+#
+# An artboard of cut-outs, composed in the browser. A piece freezes the same
+# pixels Export cut-out downloads (`rendering.cutout_image`) into
+# `cutouts/<piece_id>.png`, so a collage never changes because a node was
+# edited or deleted — it is user data, which is why it lives outside `renders/`
+# and why nothing here references a node beyond recording where a piece came
+# from. The browser draws both the preview and the exported PNG with one
+# function (`drawCollage`), so there is no server-side compositor to disagree
+# with it; what the server owns is the pieces and their transforms.
+
+COLLAGE_MIN_PX = 64
+COLLAGE_MAX_PX = 16000
+# A new piece is fitted inside this fraction of the artboard, never enlarged —
+# upscaling a cut-out is a choice to make by hand, where the softness shows.
+PIECE_FIT = 0.6
+_HEX_COLOUR = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def _collage_size(n: int) -> int:
+    return max(COLLAGE_MIN_PX, min(COLLAGE_MAX_PX, int(n)))
+
+
+def _collage_background(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not _HEX_COLOUR.fullmatch(value):
+        raise HTTPException(400, "background must be #rrggbb or null")
+    return value.lower()
+
+
+def _auto_collage_name() -> str:
+    """`Collage 1`, `Collage 2`, … — the lowest ordinal not in use, as masks do."""
+    taken = {c["name"] for c in db.list_collages()}
+    n = 1
+    while f"Collage {n}" in taken:
+        n += 1
+    return f"Collage {n}"
+
+
+def _require_collage(collage_id: int) -> dict:
+    collage = db.get_collage(collage_id)
+    if collage is None:
+        raise HTTPException(404, "collage not found")
+    return collage
+
+
+def _sweep_cutouts(piece_ids) -> None:
+    """Unlink pieces' PNGs. Piece ids are rowids SQLite reuses, so a file left
+    behind would be read back as its successor's pixels — always pair a piece
+    delete with this."""
+    for piece_id in piece_ids:
+        rendering.cutout_path(piece_id).unlink(missing_ok=True)
+
+
+@app.get("/api/collages")
+def list_collages():
+    return db.list_collages()
+
+
+@app.post("/api/collages")
+def create_collage(body: CollageCreate):
+    name = _auto_collage_name() if body.name is None else body.name.strip()
+    if not name:
+        raise HTTPException(400, "collage name cannot be empty")
+    for attempt in range(AUTO_NAME_TRIES if body.name is None else 1):
+        try:
+            return db.create_collage(
+                name,
+                _collage_size(body.width),
+                _collage_size(body.height),
+                _collage_background(body.background),
+            )
+        except sqlite3.IntegrityError:
+            if body.name is not None or attempt == AUTO_NAME_TRIES - 1:
+                raise HTTPException(409, f"a collage named '{name}' already exists")
+            name = _auto_collage_name()
+
+
+@app.get("/api/collages/{collage_id}")
+def get_collage(collage_id: int):
+    return _require_collage(collage_id)
+
+
+@app.patch("/api/collages/{collage_id}")
+def update_collage(collage_id: int, body: CollageUpdate):
+    """Rename, resize or re-colour. Resizing keeps every piece at its artboard
+    coordinates — the artboard grows or shrinks about its top-left corner, as a
+    canvas-size change does in other editors."""
+    _require_collage(collage_id)
+    given = body.model_fields_set
+    fields = {}
+    if "name" in given:
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(400, "collage name cannot be empty")
+        fields["name"] = name
+    for key in ("width", "height"):
+        if key in given and getattr(body, key) is not None:
+            fields[key] = _collage_size(getattr(body, key))
+    if "background" in given:
+        fields["background"] = _collage_background(body.background)
+    try:
+        return db.update_collage(collage_id, fields)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"a collage named '{fields.get('name')}' already exists")
+
+
+@app.delete("/api/collages/{collage_id}")
+def delete_collage(collage_id: int):
+    _require_collage(collage_id)
+    _sweep_cutouts(db.delete_collage(collage_id))
+    return {"deleted": collage_id}
+
+
+@app.post("/api/collages/{collage_id}/pieces")
+def add_collage_piece(collage_id: int, body: PieceCreate):
+    """Freeze a selection's cut-out into the collage, on top of what is there.
+
+    Row first, so the file is named by the id, and unwound if the write fails —
+    `_bank_mask`'s ordering, for its reason: a row must never vouch for a
+    missing PNG. Placed centred, fitted inside PIECE_FIT of the artboard, and
+    stepped a little per piece already there so a run of adds fans out rather
+    than stacking into what looks like one piece.
+    """
+    collage = _require_collage(collage_id)
+    node = db.get_node(body.node_id)
+    if node is None:
+        raise HTTPException(404, "node not found")
+    selection = _check_selection(validate_selection(body.selection), node["image_id"])
+    if selection is None:
+        raise HTTPException(400, "a selection needs either a click point or a mask id")
+    try:
+        image = rendering.cutout_image(body.node_id, selection)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"cut-out failed: {exc}")
+
+    width, height = collage["width"], collage["height"]
+    scale = min(1.0, PIECE_FIT * width / image.width, PIECE_FIT * height / image.height)
+    step = (len(collage["pieces"]) % 6) * 0.03
+    piece = db.create_piece(
+        collage_id,
+        _cutout_name(node),
+        body.node_id,
+        image.width,
+        image.height,
+        width * (0.5 + step),
+        height * (0.5 + step),
+        scale,
+    )
+    try:
+        rendering.save_cutout(piece["id"], image)
+    except Exception as exc:
+        db.delete_piece(piece["id"])
+        raise HTTPException(500, f"saving the piece failed: {exc}")
+    return piece
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return lo if not math.isfinite(value) else max(lo, min(hi, value))
+
+
+@app.put("/api/collages/{collage_id}/layout")
+def save_collage_layout(collage_id: int, body: LayoutSave):
+    """Every piece's transform, in one write. The browser debounces its gestures
+    into this rather than patching per piece, because a re-order touches every
+    z at once and must land atomically or two pieces could swap halfway.
+    Values are clamped as `validate_params` clamps an effect's: a slider dragged
+    past an end is a request for the end, not an error."""
+    _require_collage(collage_id)
+    pieces = [
+        {
+            "id": p.id,
+            "z": p.z,
+            "x": _clamp(p.x, -COLLAGE_MAX_PX, 2 * COLLAGE_MAX_PX),
+            "y": _clamp(p.y, -COLLAGE_MAX_PX, 2 * COLLAGE_MAX_PX),
+            "scale": _clamp(p.scale, 0.01, 20.0),
+            "rotation": _clamp(p.rotation, -1e6, 1e6) % 360.0,
+            "flip": int(p.flip),
+            "opacity": _clamp(p.opacity, 0.0, 1.0),
+            "feather": _clamp(p.feather, 0.0, 200.0),
+            "shadow": _clamp(p.shadow, 0.0, 1.0),
+        }
+        for p in body.pieces
+    ]
+    try:
+        db.save_layout(collage_id, pieces)
+    except KeyError as exc:
+        raise HTTPException(400, f"piece #{exc.args[0]} is not in this collage")
+    return db.get_collage(collage_id)
+
+
+@app.delete("/api/collage-pieces/{piece_id}")
+def delete_collage_piece(piece_id: int):
+    if db.get_piece(piece_id) is None:
+        raise HTTPException(404, "piece not found")
+    db.delete_piece(piece_id)
+    _sweep_cutouts([piece_id])
+    return {"deleted": piece_id}
+
+
+@app.get("/api/collage-pieces/{piece_id}/png")
+def get_collage_piece_png(piece_id: int):
+    """The frozen cut-out. `immutable` for the mask thumbnail's reason: the
+    frontend versions the URL with the piece's `created_at`, since ids are
+    reused and nothing can unlink a browser cache entry."""
+    if db.get_piece(piece_id) is None:
+        raise HTTPException(404, "piece not found")
+    path = rendering.cutout_path(piece_id)
+    if not path.is_file():
+        raise HTTPException(404, "piece pixels are missing")
+    return FileResponse(
+        path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/api/stats")
