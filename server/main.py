@@ -4,6 +4,7 @@ import hashlib
 import io
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 import anthropic
 import numpy as np
@@ -956,6 +957,42 @@ def get_mask(node_id: int, body: MaskRequest):
     except Exception as exc:
         raise HTTPException(500, f"segmentation failed: {exc}")
     return Response(content=data, media_type="image/png")
+
+
+@app.post("/api/nodes/{node_id}/cutout")
+def get_cutout(node_id: int, body: MaskRequest):
+    """The selection cut out of the node's framed render as a transparent PNG,
+    for another editor. A POST for `/mask`'s reason: a union of clicks does not
+    fit in a URL."""
+    node = db.get_node(node_id)
+    if node is None:
+        raise HTTPException(404, "node not found")
+    selection = _check_selection(validate_selection(body.model_dump()), node["image_id"])
+    if selection is None:
+        raise HTTPException(400, "a selection needs either a click point or a mask id")
+    try:
+        data = rendering.cutout_png(node_id, selection)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"cut-out failed: {exc}")
+    image = db.get_image(node["image_id"])
+    stem = Path(image["name"]).stem or "image"
+    suffix = "-".join(_effect_chain(node)) or "original"
+    # FileResponse's spelling of the header, since there is no file to hand it:
+    # an image name is the user's, and may be anything latin-1 cannot carry
+    filename = f"{stem}-{suffix}-cutout.png"
+    quoted = quote(filename)
+    disposition = (
+        f'attachment; filename="{filename}"'
+        if quoted == filename
+        else f"attachment; filename*=utf-8''{quoted}"
+    )
+    return Response(
+        content=data,
+        media_type="image/png",
+        headers={"Content-Disposition": disposition},
+    )
 
 
 @app.post("/api/nodes/{node_id}/select-text")

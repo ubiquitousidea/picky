@@ -2379,7 +2379,14 @@ function appendSelectionControls(
   save.type = "button";
   save.className = "sel-save-mask";
   save.textContent = "Save selection";
-  if (allowManage) row.appendChild(save);
+  // The selection itself as a file: the object on a transparent background, for
+  // another editor. Bar only, like Save — the modal's selection is a node's
+  // recipe, not something you are looking at to take away.
+  const cut = document.createElement("button");
+  cut.type = "button";
+  cut.className = "sel-cutout";
+  cut.textContent = "Export cut-out";
+  if (allowManage) row.append(save, cut);
   // after the controls and before the strip: in the bar the note takes a line
   // of its own, and putting it here keeps Save on the line with the pickers
   // rather than pushed below a sentence.
@@ -2549,6 +2556,44 @@ function appendSelectionControls(
     }
   }
 
+  // Not an <a download> like Export: the selection travels in a POST body, so
+  // the PNG arrives as a blob and is handed to a throwaway link.
+  let cutting = false;
+  async function exportCutout() {
+    const sel = current();
+    if (!sel || cutting || sourceNodeId === null) return;
+    cutting = true;
+    cut.classList.add("busy");
+    render(sel);
+    try {
+      const res = await fetch(`/api/nodes/${sourceNodeId}/cutout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sel),
+      });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch {}
+        throw new Error(detail);
+      }
+      const header = res.headers.get("Content-Disposition") || "";
+      const star = header.match(/filename\*=utf-8''([^;]+)/i);
+      const plain = header.match(/filename="([^"]+)"/);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = star ? decodeURIComponent(star[1]) : plain ? plain[1] : "cutout.png";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (err) {
+      say(`Could not export the cut-out: ${err.message}`);
+    } finally {
+      cutting = false;
+      cut.classList.remove("busy");
+      render(current());
+    }
+  }
+
   function render(sel) {
     const points = selPoints(sel);
     coords.textContent = selSummary(sel);
@@ -2576,6 +2621,11 @@ function appendSelectionControls(
     save.title = save.disabled
       ? "Select an object first — a saved mask is already saved"
       : "Save this object now — applying an effect to it saves it too";
+    // any shape exports — a click needs no banking, since no node is made
+    cut.disabled = cutting || state.imageId === null || !sel;
+    cut.title = cut.disabled
+      ? "Select an object first"
+      : "Download the selection as a PNG on a transparent background, trimmed to the object";
     const chosen = selMasks(sel);
     for (const { mask, li, box } of rows) {
       box.checked = chosen.includes(mask.id);
@@ -2628,6 +2678,7 @@ function appendSelectionControls(
   };
   clear.onclick = () => commit(null);
   save.onclick = () => saveMask();
+  cut.onclick = exportCutout;
 
   // seed without dispatching `input` — nothing user-driven happened yet — but do
   // repaint the overlay unconditionally, so it always agrees with the store:

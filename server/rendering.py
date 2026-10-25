@@ -684,6 +684,40 @@ def mask_png(node_id: int, selection: dict) -> bytes:
     return buf.getvalue()
 
 
+def cutout_png(node_id: int, selection: dict) -> bytes:
+    """The selection cut out of the node's render: an RGBA PNG, transparent
+    outside the selection and trimmed to its bounding box — a layer to drop into
+    another editor.
+
+    A viewer, so it is framed like Export (`render_output`) and like the overlay
+    — the selection you see outlined is exactly what comes out. The mask is
+    framed the way `mask_png` frames it, NEAREST so the alpha stays the binary
+    mask `_apply` composites with rather than a bicubic halo; a rotation's
+    corners fill with 0 and so come out transparent.
+
+    Persists nothing, so there is no file kind for `delete_render_files` or
+    `storage_stats` to know about.
+    """
+    rgb = Image.open(render_output(node_id)).convert("RGB")
+    alpha = Image.fromarray(compute_mask(node_id, selection).astype(np.uint8) * 255, "L")
+    node = db.get_node(node_id)
+    crop = image_crop(node["image_id"]) if node else None
+    if not is_identity_crop(crop):
+        alpha = apply_geometry(alpha, crop, Image.Resampling.NEAREST)
+    if alpha.size != rgb.size:
+        raise ValueError(
+            f"mask is {alpha.size[0]}×{alpha.size[1]}, "
+            f"image is {rgb.size[0]}×{rgb.size[1]}"
+        )
+    bbox = alpha.getbbox()
+    if bbox is None:
+        raise ValueError("selection is empty after framing")
+    rgb.putalpha(alpha)
+    buf = io.BytesIO()
+    rgb.crop(bbox).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 HIST_SAMPLE = 512
 
 

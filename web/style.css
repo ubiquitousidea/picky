@@ -603,7 +603,8 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
    circular in a shrink-to-fit row — the select claims the whole row and the
    invert checkbox gets laid out on top of the next control */
 #select-controls .sel-level { flex: none; width: 11rem; }
-#select-controls .sel-save-mask { flex: none; width: auto; margin-top: 0; }
+#select-controls .sel-save-mask,
+#select-controls .sel-cutout { flex: none; width: auto; margin-top: 0; }
 /* the box does not grow with the row, for the reason .sel-level is pinned: a
    `flex: 1` item in a shrink-to-fit row claims the width the row was measured
    at and lays the next control out on top of it */
@@ -738,7 +739,7 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
 .node-del:hover { color: var(--rb-red); background: var(--panel); }
 
 /* Presets and saved masks — same row/button shapes, different hue */
-#save-preset-btn, .sel-save-mask {
+#save-preset-btn, .sel-save-mask, .sel-cutout {
   width: 100%;
   padding: 0.45rem;
   border: 1px solid var(--rb-teal);
@@ -748,9 +749,11 @@ body.dragging #preview-panel { outline: 3px dashed var(--rb-blue); outline-offse
   cursor: pointer;
 }
 #save-preset-btn:hover:not(:disabled) { background: var(--rb-teal); color: var(--bg); }
-#save-preset-btn:disabled, .sel-save-mask:disabled { opacity: 0.4; cursor: default; }
-.sel-save-mask { margin-top: 0.5rem; border-color: var(--rb-pink); color: var(--rb-pink); }
-.sel-save-mask:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
+#save-preset-btn:disabled, .sel-save-mask:disabled, .sel-cutout:disabled { opacity: 0.4; cursor: default; }
+.sel-save-mask, .sel-cutout { margin-top: 0.5rem; border-color: var(--rb-pink); color: var(--rb-pink); }
+.sel-save-mask:hover:not(:disabled),
+.sel-cutout:hover:not(:disabled) { background: var(--rb-pink); color: var(--bg); }
+.sel-cutout.busy { opacity: 0.7; }
 #preset-list, .sel-mask-list { list-style: none; margin-top: 0.5rem; font-size: 0.85rem; }
 #preset-list .hint, .sel-mask-list .hint { padding: 0 0.1rem; }
 .preset-row {

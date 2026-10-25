@@ -191,6 +191,11 @@ restarts.
   double-click to reset.
 - **Export** — download any node's render as a JPG named after its effect
   chain (e.g. `photo-posterize-blur.jpg`).
+- **Export cut-out** — beside **Save selection**: download just the selected
+  object as a PNG on a transparent background, trimmed to the object and framed
+  like Export (`photo-blur-cutout.png`). Any selection works — a click, a named
+  object, or ticked saved masks, with `invert` honoured — and it opens in
+  Photoshop as a layer with real transparency.
 - **Library stats** — image, node, preset, and mask counts plus disk usage. The
   render cache and the downloaded model weights are reported apart from the
   database, originals, and saved masks: between them they are the bulk of the
@@ -498,6 +503,7 @@ the preset is replayed against.
 | GET    | `/api/nodes/{id}/render` | rendered JPEG (`?thumb=1` thumbnail, `?download=1` attachment) |
 | POST   | `/api/nodes/{id}/preview` | render an effect on top of a node in memory — no node created, nothing cached |
 | POST   | `/api/nodes/{id}/mask` | outline PNG for a selection — `points` segmented on the fly, or `masks` (saved ids) read back, plus an optional `invert`; persists nothing but the node's cached embedding |
+| POST   | `/api/nodes/{id}/cutout` | the selection cut out of the node's framed render — an RGBA PNG, transparent outside the selection and trimmed to its bounding box, as an attachment; same body as `/mask`, persists nothing |
 | POST   | `/api/nodes/{id}/select-text` | find a named object (`query`) in a node's pixels, with `method` choosing the model. `clipseg` answers with the `x`, `y` and `level` a click would have produced and stores nothing. `sam3` (the default) answers with pixels no click would reproduce, so it freezes them into a saved mask and returns its `mask_id` plus the `instances` count — nothing is banked when the match is weak. Both carry `score`, `coverage` and `confident`, and both 409 rather than fetching a model inside the request |
 | GET    | `/api/nodes/{id}/clusters` | k-means scatter data for posterize nodes |
 | GET    | `/api/nodes/{id}/histogram` | 256-bin luma histogram of a node's render, for the tone-curve editor's backdrop |
