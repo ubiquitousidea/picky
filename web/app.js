@@ -5008,6 +5008,9 @@ async function init() {
   };
 
   document.body.addEventListener("dragover", (e) => {
+    // only a drag carrying files is an upload: a link or text dragged within
+    // the page would light the drop zone for something drop() then ignores
+    if (!e.dataTransfer.types.includes("Files")) return;
     e.preventDefault();
     document.body.classList.add("dragging");
   });
