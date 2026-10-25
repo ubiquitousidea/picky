@@ -236,6 +236,27 @@ one place silently breaks another.
   validated before the loop starts, so a foreign mask is a 400 rather than a
   half-written chain.
 
+### Collages
+
+- **A piece holds pixels, never a node reference.** `main.add_collage_piece`
+  freezes `rendering.cutout_image`, the same function behind Export cut-out,
+  into `data/cutouts/<piece_id>.png`, so editing or deleting a node cannot
+  change a composition. That makes the file user data like a mask's, so it
+  lives outside `renders/`. The row is written first and the file after it,
+  unwound on failure. Every piece delete is paired with `main._sweep_cutouts`,
+  because piece ids are rowids that SQLite reuses.
+- **The server stores transforms; it never composites.** `drawCollage()` in
+  `web/app.js` paints both the preview (at the fit scale) and the exported PNG
+  (at 1:1 into an offscreen canvas). One function is what guarantees the export
+  is what was on screen, so do not add a server-side renderer beside it. Canvas
+  shadows ignore the transform, so blur and offset are computed in artboard
+  pixels and multiplied by the scale; feather is baked per piece at source
+  resolution.
+- **The layout is saved whole.** Gestures debounce into one `PUT
+  /api/collages/{id}/layout`, serialized on `collage.saving`, because a
+  re-order rewrites every `z` and must land atomically. A piece left out of the
+  list is left alone, and an id from another collage is a 400.
+
 ### Crop, embeddings, schema
 
 - **Crop & rotate is an output stage, not a node.** One framing per image

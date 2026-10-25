@@ -30,6 +30,9 @@ const state = {
   // as the API saw it, one entry per turn, kept for the Wire dialog to read —
   // it is a record, never posted back, and dies with the history it describes.
   agent: { history: [], wire: [], busy: false },
+  // The collage "Add to collage" puts pieces in — the one the Collage dialog
+  // last showed. Outlives the session, like the last image.
+  collageId: Number(localStorage.getItem("picky:collage")) || null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -2386,7 +2389,13 @@ function appendSelectionControls(
   cut.type = "button";
   cut.className = "sel-cutout";
   cut.textContent = "Export cut-out";
-  if (allowManage) row.append(save, cut);
+  // The same pixels, frozen into a collage instead of downloaded — so stepping
+  // through a neighbourhood of the map gathers pieces without a file per step.
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "sel-collage";
+  add.textContent = "Add to collage";
+  if (allowManage) row.append(save, cut, add);
   // after the controls and before the strip: in the bar the note takes a line
   // of its own, and putting it here keeps Save on the line with the pickers
   // rather than pushed below a sentence.
@@ -2594,6 +2603,24 @@ function appendSelectionControls(
     }
   }
 
+  let adding = false;
+  async function addSelectionToCollage() {
+    const sel = current();
+    if (!sel || adding || sourceNodeId === null) return;
+    adding = true;
+    add.classList.add("busy");
+    render(sel);
+    try {
+      say(await addToCollage(sourceNodeId, sel));
+    } catch (err) {
+      say(`Could not add to the collage: ${err.message}`);
+    } finally {
+      adding = false;
+      add.classList.remove("busy");
+      render(current());
+    }
+  }
+
   function render(sel) {
     const points = selPoints(sel);
     coords.textContent = selSummary(sel);
@@ -2626,6 +2653,10 @@ function appendSelectionControls(
     cut.title = cut.disabled
       ? "Select an object first"
       : "Download the selection as a PNG on a transparent background, trimmed to the object";
+    add.disabled = adding || state.imageId === null || !sel || sourceNodeId === null;
+    add.title = add.disabled
+      ? "Select an object first"
+      : "Put this cut-out in the current collage (open Collage in the header to arrange it)";
     const chosen = selMasks(sel);
     for (const { mask, li, box } of rows) {
       box.checked = chosen.includes(mask.id);
@@ -2679,6 +2710,7 @@ function appendSelectionControls(
   clear.onclick = () => commit(null);
   save.onclick = () => saveMask();
   cut.onclick = exportCutout;
+  add.onclick = addSelectionToCollage;
 
   // seed without dispatching `input` — nothing user-driven happened yet — but do
   // repaint the overlay unconditionally, so it always agrees with the store:
@@ -2968,6 +3000,7 @@ async function openStats() {
   statRow(body, "Nodes", `${s.nodes} (${s.edits} effects + ${s.images} originals)`);
   statRow(body, "Presets", s.presets);
   statRow(body, "Masks", s.masks);
+  statRow(body, "Collages", s.collages);
   for (const e of s.by_effect) {
     // nodeLabel() wants a node; here we only have the effect name
     statRow(body, effectLabel(e.effect), e.count, true);
@@ -2978,6 +3011,7 @@ async function openStats() {
   statRow(body, "Database", formatBytes(st.database.bytes));
   statRow(body, "Originals", `${formatBytes(st.originals.bytes)} · ${st.originals.files} files`);
   statRow(body, "Masks", `${formatBytes(st.masks.bytes)} · ${st.masks.files} files`);
+  statRow(body, "Collage pieces", `${formatBytes(st.cutouts.bytes)} · ${st.cutouts.files} files`);
   statRow(body, "Models", `${formatBytes(st.models.bytes)} · ${st.models.files} files`);
   const cacheBytes =
     st.renders.bytes + st.outputs.bytes + st.thumbs.bytes +
@@ -2993,7 +3027,7 @@ async function openStats() {
     "Total",
     formatBytes(
       st.database.bytes + st.originals.bytes + st.masks.bytes +
-      st.models.bytes + cacheBytes
+      st.cutouts.bytes + st.models.bytes + cacheBytes
     )
   );
 
@@ -4664,6 +4698,898 @@ function initEmbedMap() {
   }).observe($("embed-canvas"));
 }
 
+// ---------- Collage (an artboard of frozen cut-outs) ----------
+
+// A collage is a set of pieces on a fixed-size artboard. Each piece is a cut-out
+// frozen on the server when it was added (see main.add_collage_piece) plus a
+// transform the browser owns — so composing is all here, and the server only
+// stores the result of each gesture.
+//
+// One function draws it: drawCollage() paints the preview into the stage at
+// whatever scale fits, and paints the export into an offscreen canvas at 1:1.
+// That is the whole guarantee that the PNG is what was on screen — there is no
+// second compositor anywhere to drift from this one, which is the trap the
+// tone curve's two LUTs have to be kept in step to avoid.
+const collage = {
+  open: false,
+  list: [],
+  // The collage being edited: the GET's shape, with `pieces` kept sorted into
+  // paint order and each z equal to its index, so a re-order is a splice.
+  doc: null,
+  selected: null, // piece id
+  // The view onto the artboard, never saved: zoom multiplies the fit-to-stage
+  // scale, pan offsets the fitted artboard, both in backing-store pixels.
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  gesture: null,
+  saveTimer: null,
+  // Layout saves run one at a time, in order: a slow PUT overtaken by a later
+  // one would otherwise land second and put back a layout you had moved past.
+  saving: Promise.resolve(),
+  raf: null,
+  seq: 0,
+};
+
+// Per-piece pixels, keyed by the versioned URL, so a reopened collage is
+// instant and a reused piece id can never be served a predecessor's entry.
+const collageBitmaps = new Map();
+
+const COLLAGE_SIZES = [
+  [4000, 3000],
+  [3000, 4000],
+  [4000, 4000],
+  [6000, 4000],
+  [4000, 6000],
+  [3840, 2160],
+];
+const COLLAGE_SAVE_MS = 400;
+const COLLAGE_MARGIN_PX = 24; // CSS px kept clear around the fitted artboard
+const COLLAGE_HANDLE_PX = 6; // CSS px, half a corner handle's side
+const COLLAGE_ROTATE_PX = 28; // CSS px from the top edge out to the rotate knob
+const COLLAGE_ALPHA_PX = 256; // long edge of a piece's hit-test alpha map
+const COLLAGE_SNAP_DEG = 15;
+// The shadow, as fractions of the piece's own displayed long edge at full
+// strength — so a small piece casts a small shadow and resizing keeps the look.
+const COLLAGE_SHADOW_BLUR = 0.06;
+const COLLAGE_SHADOW_OFFSET = 0.025;
+
+function collagePieceUrl(piece) {
+  return `/api/collage-pieces/${piece.id}/png?v=${encodeURIComponent(piece.created_at)}`;
+}
+
+// The piece's pixels, starting the fetch the first time they are asked for and
+// repainting when they land. `alpha` is a small copy of the coverage for hit
+// testing: a click on a cut-out's transparent corner should fall through to
+// whatever is underneath, which a bounding box cannot say.
+function collageBitmap(piece) {
+  const url = collagePieceUrl(piece);
+  let entry = collageBitmaps.get(url);
+  if (entry) return entry;
+  entry = { img: new Image(), ready: false, alpha: null, baked: null, bakedFeather: 0 };
+  entry.loaded = new Promise((resolve) => {
+    entry.img.onload = () => {
+      entry.ready = true;
+      const k = Math.min(1, COLLAGE_ALPHA_PX / Math.max(entry.img.width, entry.img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(entry.img.width * k));
+      c.height = Math.max(1, Math.round(entry.img.height * k));
+      const g = c.getContext("2d", { willReadFrequently: true });
+      g.drawImage(entry.img, 0, 0, c.width, c.height);
+      entry.alpha = { w: c.width, h: c.height, data: g.getImageData(0, 0, c.width, c.height).data };
+      markCollageDirty();
+      resolve(entry);
+    };
+    entry.img.onerror = () => resolve(entry); // drawn as nothing; status says why on export
+  });
+  entry.img.src = url;
+  collageBitmaps.set(url, entry);
+  return entry;
+}
+
+// What to blit for a piece: its own pixels, or a feathered copy baked once per
+// feather value. The bake blurs the piece and then keeps only the sharp piece's
+// pixels *inside* that blur (`source-in`), so alpha becomes sharp × blurred and
+// the edge fades inward — the cut never grows a halo past where it was cut.
+function collageSource(entry, feather) {
+  if (!feather) return entry.img;
+  if (entry.baked && entry.bakedFeather === feather) return entry.baked;
+  const c = entry.baked || document.createElement("canvas");
+  c.width = entry.img.width;
+  c.height = entry.img.height;
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  // half the feather as the blur's standard deviation, so the fade reads about
+  // `feather` source pixels wide
+  g.filter = `blur(${feather / 2}px)`;
+  g.drawImage(entry.img, 0, 0);
+  g.filter = "none";
+  g.globalCompositeOperation = "source-in";
+  g.drawImage(entry.img, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  entry.baked = c;
+  entry.bakedFeather = feather;
+  return c;
+}
+
+// Paint the collage with the artboard's origin at (ox, oy) and `s` output
+// pixels per artboard pixel. The preview and the export both come through
+// here; the export is simply s = 1 into a canvas the artboard's own size.
+//
+// Canvas shadows are the one thing a transform does not carry — blur and
+// offset are in the canvas's own pixels whatever the matrix says — so they are
+// worked out in artboard pixels and multiplied by `s` here, which is what keeps
+// a shadow on screen the shadow that exports. It also means the light falls
+// from one direction across the board however a piece is turned.
+//
+// Returns whether every piece had its pixels, so an export can refuse to write
+// a PNG with holes in it.
+function drawCollage(ctx, doc, s, ox, oy) {
+  ctx.save();
+  ctx.setTransform(s, 0, 0, s, ox, oy);
+  ctx.beginPath();
+  ctx.rect(0, 0, doc.width, doc.height);
+  ctx.clip();
+  if (doc.background) {
+    ctx.fillStyle = doc.background;
+    ctx.fillRect(0, 0, doc.width, doc.height);
+  }
+  let complete = true;
+  for (const piece of doc.pieces) {
+    const entry = collageBitmap(piece);
+    if (!entry.ready) {
+      complete = false;
+      continue;
+    }
+    ctx.save();
+    ctx.globalAlpha = piece.opacity;
+    if (piece.shadow > 0) {
+      const size = Math.max(piece.width, piece.height) * piece.scale;
+      ctx.shadowColor = `rgba(0, 0, 0, ${0.75 * piece.shadow})`;
+      ctx.shadowBlur = size * COLLAGE_SHADOW_BLUR * piece.shadow * s;
+      ctx.shadowOffsetX = ctx.shadowOffsetY =
+        size * COLLAGE_SHADOW_OFFSET * piece.shadow * s;
+    }
+    ctx.translate(piece.x, piece.y);
+    ctx.rotate((piece.rotation * Math.PI) / 180);
+    ctx.scale(piece.scale * (piece.flip ? -1 : 1), piece.scale);
+    ctx.drawImage(collageSource(entry, piece.feather), -piece.width / 2, -piece.height / 2);
+    ctx.restore();
+  }
+  ctx.restore();
+  return complete;
+}
+
+// Where the artboard sits on the stage, in backing-store pixels — the map's
+// convention, for its reason: one unit for drawing and hit testing alike.
+function collageCamera() {
+  const canvas = $("collage-canvas");
+  const dpr = canvas.width / Math.max(1, canvas.getBoundingClientRect().width) || 1;
+  const w = canvas.width;
+  const h = canvas.height;
+  const doc = collage.doc;
+  const margin = COLLAGE_MARGIN_PX * dpr;
+  const fit = doc
+    ? Math.min((w - 2 * margin) / doc.width, (h - 2 * margin) / doc.height)
+    : 1;
+  const s = Math.max(1e-4, fit * collage.zoom);
+  const ox = w / 2 - ((doc?.width ?? 0) * s) / 2 + collage.panX;
+  const oy = h / 2 - ((doc?.height ?? 0) * s) / 2 + collage.panY;
+  return { w, h, s, ox, oy, dpr };
+}
+
+let collageChecker = null;
+function collageCheckerPattern(ctx, dpr) {
+  const cell = Math.round(8 * dpr);
+  if (!collageChecker || collageChecker.cell !== cell) {
+    const c = document.createElement("canvas");
+    c.width = c.height = cell * 2;
+    const g = c.getContext("2d");
+    g.fillStyle = "#2a2e37";
+    g.fillRect(0, 0, cell * 2, cell * 2);
+    g.fillStyle = "#3a3f4b";
+    g.fillRect(0, 0, cell, cell);
+    g.fillRect(cell, cell, cell, cell);
+    collageChecker = { cell, canvas: c };
+  }
+  return ctx.createPattern(collageChecker.canvas, "repeat");
+}
+
+// A piece's box on screen: its centre, its four corners in order (top-left
+// first, as the piece's own pixels have it), and the rotate knob above its top
+// edge — all rotated with it.
+function collagePieceFrame(piece, cam) {
+  const rad = (piece.rotation * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const cx = cam.ox + piece.x * cam.s;
+  const cy = cam.oy + piece.y * cam.s;
+  const hw = (piece.width * piece.scale * cam.s) / 2;
+  const hh = (piece.height * piece.scale * cam.s) / 2;
+  const at = (lx, ly) => [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
+  const knob = hh + COLLAGE_ROTATE_PX * cam.dpr;
+  return {
+    cx,
+    cy,
+    corners: [at(-hw, -hh), at(hw, -hh), at(hw, hh), at(-hw, hh)],
+    top: at(0, -hh),
+    knob: at(0, -knob),
+  };
+}
+
+// Whether a screen point lands on the piece's visible pixels.
+function collagePieceCovers(piece, cam, bx, by) {
+  const entry = collageBitmap(piece);
+  if (!entry.alpha) return false;
+  const rad = (-piece.rotation * Math.PI) / 180;
+  const dx = (bx - cam.ox) / cam.s - piece.x;
+  const dy = (by - cam.oy) / cam.s - piece.y;
+  let lx = (dx * Math.cos(rad) - dy * Math.sin(rad)) / piece.scale;
+  const ly = (dx * Math.sin(rad) + dy * Math.cos(rad)) / piece.scale;
+  if (piece.flip) lx = -lx;
+  const u = (lx + piece.width / 2) / piece.width;
+  const v = (ly + piece.height / 2) / piece.height;
+  if (u < 0 || u >= 1 || v < 0 || v >= 1) return false;
+  const { w, h, data } = entry.alpha;
+  return data[(Math.floor(v * h) * w + Math.floor(u * w)) * 4 + 3] > 16;
+}
+
+function collageInsideFrame(frame, bx, by) {
+  // a convex quad: inside when on the same side of all four edges
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const [x0, y0] = frame.corners[i];
+    const [x1, y1] = frame.corners[(i + 1) % 4];
+    const cross = (x1 - x0) * (by - y0) - (y1 - y0) * (bx - x0);
+    if (cross !== 0) {
+      if (sign && Math.sign(cross) !== sign) return false;
+      sign = Math.sign(cross);
+    }
+  }
+  return true;
+}
+
+// What a press at a screen point would grab. The selected piece's handles come
+// first, then its whole box — it is the one you are working on, so a near-miss
+// on its transparent corner should still move it — then the topmost piece
+// whose pixels are under the point.
+function collageHitTest(bx, by) {
+  const doc = collage.doc;
+  if (!doc) return null;
+  const cam = collageCamera();
+  const sel = doc.pieces.find((p) => p.id === collage.selected);
+  if (sel) {
+    const frame = collagePieceFrame(sel, cam);
+    const reach = (COLLAGE_HANDLE_PX + 3) * cam.dpr;
+    const near = ([x, y]) => Math.abs(bx - x) <= reach && Math.abs(by - y) <= reach;
+    if (near(frame.knob)) return { piece: sel, kind: "rotate", frame };
+    if (frame.corners.some(near)) return { piece: sel, kind: "scale", frame };
+    if (collageInsideFrame(frame, bx, by)) return { piece: sel, kind: "move", frame };
+  }
+  for (let i = doc.pieces.length - 1; i >= 0; i--) {
+    const piece = doc.pieces[i];
+    if (collagePieceCovers(piece, cam, bx, by)) {
+      return { piece, kind: "move", frame: collagePieceFrame(piece, cam) };
+    }
+  }
+  return null;
+}
+
+function markCollageDirty() {
+  if (collage.raf !== null || !collage.open) return;
+  collage.raf = requestAnimationFrame(() => {
+    collage.raf = null;
+    paintCollage();
+  });
+}
+
+function paintCollage() {
+  const canvas = $("collage-canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const doc = collage.doc;
+  if (!doc) return;
+  const cam = collageCamera();
+  const board = [cam.ox, cam.oy, doc.width * cam.s, doc.height * cam.s];
+  if (!doc.background) {
+    ctx.fillStyle = collageCheckerPattern(ctx, cam.dpr);
+    ctx.fillRect(...board);
+  }
+  drawCollage(ctx, doc, cam.s, cam.ox, cam.oy);
+  ctx.strokeStyle = "#333947";
+  ctx.lineWidth = cam.dpr;
+  ctx.strokeRect(...board);
+
+  const sel = doc.pieces.find((p) => p.id === collage.selected);
+  if (!sel) return;
+  const frame = collagePieceFrame(sel, cam);
+  const accent = getComputedStyle(document.documentElement)
+    .getPropertyValue("--rb-yellow").trim() || "#c9bd7f";
+  ctx.strokeStyle = accent;
+  ctx.fillStyle = accent;
+  ctx.lineWidth = 1.5 * cam.dpr;
+  ctx.setLineDash([5 * cam.dpr, 4 * cam.dpr]);
+  ctx.beginPath();
+  frame.corners.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(...frame.top);
+  ctx.lineTo(...frame.knob);
+  ctx.stroke();
+  const hs = COLLAGE_HANDLE_PX * cam.dpr;
+  for (const [x, y] of frame.corners) ctx.fillRect(x - hs, y - hs, 2 * hs, 2 * hs);
+  ctx.beginPath();
+  ctx.arc(...frame.knob, hs, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+// The map's sizing rule: a backing store at device resolution, written only
+// here, a no-op when unchanged so the observer can call it freely.
+function sizeCollageCanvas() {
+  const canvas = $("collage-canvas");
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(rect.width * dpr);
+  const h = Math.round(rect.height * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w;
+  canvas.height = h;
+  markCollageDirty();
+}
+
+// embedCanvasPoint()'s scale, read off the canvas, for its reason.
+function collageCanvasPoint(e) {
+  const canvas = $("collage-canvas");
+  const rect = canvas.getBoundingClientRect();
+  return [
+    (e.clientX - rect.left) * (canvas.width / rect.width),
+    (e.clientY - rect.top) * (canvas.height / rect.height),
+  ];
+}
+
+function collageSay(text) {
+  $("collage-status").textContent = text;
+}
+
+function collageIdleStatus() {
+  const doc = collage.doc;
+  if (!doc) return "";
+  if (!doc.pieces.length) {
+    return "Empty — select an object in a photo and press “Add to collage”";
+  }
+  const n = doc.pieces.length;
+  return (
+    `${n} piece${n === 1 ? "" : "s"} · drag to move · corners scale · knob rotates (Shift snaps)` +
+    " · scroll to zoom · drag the background to pan · double-click it to fit"
+  );
+}
+
+function setCollageId(id) {
+  state.collageId = id;
+  localStorage.setItem("picky:collage", id ?? "");
+}
+
+// The header, from `collage.list` and `collage.doc`. Values are pushed into the
+// inputs here and nowhere else, so a failed PATCH can put the truth back by
+// calling this again.
+function renderCollageHeader() {
+  const doc = collage.doc;
+  const select = $("collage-select");
+  select.innerHTML = "";
+  for (const c of collage.list) {
+    const opt = document.createElement("option");
+    opt.value = c.id;
+    opt.textContent = c.name;
+    select.appendChild(opt);
+  }
+  select.value = doc ? doc.id : "";
+  const size = $("collage-size");
+  size.innerHTML = "";
+  const head = document.createElement("option");
+  head.value = "";
+  head.textContent = "Size…";
+  size.appendChild(head);
+  for (const [w, h] of COLLAGE_SIZES) {
+    const opt = document.createElement("option");
+    opt.value = `${w}x${h}`;
+    opt.textContent = `${w} × ${h}`;
+    size.appendChild(opt);
+  }
+  size.value = "";
+  const none = !doc;
+  for (const id of [
+    "collage-select", "collage-name", "collage-delete-btn", "collage-width",
+    "collage-height", "collage-size", "collage-transparent", "collage-bg",
+    "collage-export-btn",
+  ]) {
+    $(id).disabled = none;
+  }
+  $("collage-select").disabled = !collage.list.length;
+  $("collage-name").value = doc ? doc.name : "";
+  $("collage-width").value = doc ? doc.width : "";
+  $("collage-height").value = doc ? doc.height : "";
+  $("collage-transparent").checked = doc ? !doc.background : true;
+  if (doc?.background) $("collage-bg").value = doc.background;
+  $("collage-bg").disabled = none || !doc.background;
+  $("collage-export-btn").disabled = none || !doc.pieces.length;
+}
+
+function selectedCollagePiece() {
+  return collage.doc?.pieces.find((p) => p.id === collage.selected) || null;
+}
+
+function renderCollagePieceRow() {
+  const piece = selectedCollagePiece();
+  $("collage-piece-name").textContent = piece ? piece.name : "";
+  $("collage-piece-name").title = piece ? piece.name : "";
+  for (const id of [
+    "collage-opacity", "collage-feather", "collage-shadow", "collage-flip-btn",
+    "collage-front-btn", "collage-forward-btn", "collage-backward-btn",
+    "collage-back-btn", "collage-remove-btn",
+  ]) {
+    $(id).disabled = !piece;
+  }
+  if (!piece) return;
+  $("collage-opacity").value = piece.opacity;
+  $("collage-feather").value = piece.feather;
+  $("collage-shadow").value = piece.shadow;
+  const last = collage.doc.pieces.length - 1;
+  const at = collage.doc.pieces.indexOf(piece);
+  $("collage-front-btn").disabled = $("collage-forward-btn").disabled = at === last;
+  $("collage-back-btn").disabled = $("collage-backward-btn").disabled = at === 0;
+}
+
+function selectCollagePiece(id) {
+  collage.selected = id;
+  renderCollagePieceRow();
+  markCollageDirty();
+}
+
+// Every gesture lands here. The whole layout goes up in one PUT, debounced, so
+// a drag is one request and a re-order — which rewrites every z — is atomic.
+function scheduleCollageSave() {
+  markCollageDirty();
+  clearTimeout(collage.saveTimer);
+  collage.saveTimer = setTimeout(flushCollageSave, COLLAGE_SAVE_MS);
+}
+
+function flushCollageSave() {
+  clearTimeout(collage.saveTimer);
+  collage.saveTimer = null;
+  const doc = collage.doc;
+  if (!doc) return collage.saving;
+  const body = JSON.stringify({
+    pieces: doc.pieces.map((p) => ({
+      id: p.id, z: p.z, x: p.x, y: p.y, scale: p.scale, rotation: p.rotation,
+      flip: p.flip, opacity: p.opacity, feather: p.feather, shadow: p.shadow,
+    })),
+  });
+  const id = doc.id;
+  collage.saving = collage.saving.then(async () => {
+    try {
+      await api(`/api/collages/${id}/layout`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    } catch (err) {
+      if (collage.doc?.id === id) collageSay(`Could not save the layout: ${err.message}`);
+    }
+  });
+  return collage.saving;
+}
+
+async function loadCollageList() {
+  collage.list = await api("/api/collages");
+  return collage.list;
+}
+
+// Show a collage, or the newest one when `id` names none. The view is reset:
+// a zoom and pan are about one artboard, and mean nothing on another's.
+async function showCollage(id) {
+  await flushCollageSave();
+  const seq = ++collage.seq;
+  const chosen =
+    collage.list.find((c) => c.id === id) ||
+    collage.list[collage.list.length - 1] ||
+    null;
+  collage.selected = null;
+  collage.zoom = 1;
+  collage.panX = collage.panY = 0;
+  if (!chosen) {
+    collage.doc = null;
+    setCollageId(null);
+  } else {
+    const doc = await api(`/api/collages/${chosen.id}`);
+    if (seq !== collage.seq) return;
+    collage.doc = doc;
+    setCollageId(doc.id);
+    for (const piece of doc.pieces) collageBitmap(piece);
+  }
+  renderCollageHeader();
+  renderCollagePieceRow();
+  collageSay(collage.doc ? collageIdleStatus() : "No collages yet — press New, or “Add to collage” under a selection");
+  markCollageDirty();
+}
+
+async function openCollage() {
+  collage.open = true;
+  $("collage-modal").showModal();
+  sizeCollageCanvas();
+  collageSay("Loading…");
+  try {
+    await loadCollageList();
+    await showCollage(state.collageId);
+  } catch (err) {
+    collageSay(`Could not load collages: ${err.message}`);
+  }
+}
+
+function closeCollage() {
+  collage.open = false;
+  collage.gesture = null;
+  collage.seq++;
+  if (collage.raf !== null) cancelAnimationFrame(collage.raf);
+  collage.raf = null;
+  // a gesture finished inside the debounce window would otherwise be lost
+  if (collage.saveTimer !== null) flushCollageSave();
+  $("collage-modal").close();
+}
+
+async function newCollage() {
+  try {
+    const created = await api("/api/collages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // a new board takes the current one's size, which is usually the format
+      // you are working in; the server picks the name
+      body: JSON.stringify(
+        collage.doc ? { width: collage.doc.width, height: collage.doc.height } : {}
+      ),
+    });
+    await loadCollageList();
+    await showCollage(created.id);
+  } catch (err) {
+    collageSay(`Could not create a collage: ${err.message}`);
+  }
+}
+
+async function deleteCollage() {
+  const doc = collage.doc;
+  if (!doc) return;
+  const n = doc.pieces.length;
+  if (!confirm(`Delete “${doc.name}”${n ? ` and its ${n} piece${n === 1 ? "" : "s"}` : ""}?`)) return;
+  clearTimeout(collage.saveTimer);
+  collage.saveTimer = null;
+  try {
+    await api(`/api/collages/${doc.id}`, { method: "DELETE" });
+    collage.doc = null;
+    await loadCollageList();
+    await showCollage(null);
+  } catch (err) {
+    collageSay(`Could not delete the collage: ${err.message}`);
+  }
+}
+
+async function patchCollage(fields) {
+  const doc = collage.doc;
+  if (!doc) return;
+  try {
+    const updated = await api(`/api/collages/${doc.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    });
+    if (collage.doc?.id !== doc.id) return;
+    // the transforms are the browser's: keep the local pieces, which may be
+    // ahead of the server's inside a save's debounce window
+    Object.assign(doc, { ...updated, pieces: doc.pieces });
+    const entry = collage.list.find((c) => c.id === doc.id);
+    if (entry) Object.assign(entry, { name: doc.name, width: doc.width, height: doc.height });
+  } catch (err) {
+    collageSay(`Could not update the collage: ${err.message}`);
+  }
+  renderCollageHeader();
+  markCollageDirty();
+}
+
+// Re-order by moving the selected piece to a new index, then renumbering every
+// z — which is why a re-order is a whole-layout save and not one piece's.
+function moveCollagePiece(where) {
+  const doc = collage.doc;
+  const piece = selectedCollagePiece();
+  if (!piece) return;
+  const from = doc.pieces.indexOf(piece);
+  const last = doc.pieces.length - 1;
+  const to = {
+    front: last,
+    forward: Math.min(last, from + 1),
+    backward: Math.max(0, from - 1),
+    back: 0,
+  }[where];
+  doc.pieces.splice(from, 1);
+  doc.pieces.splice(to, 0, piece);
+  doc.pieces.forEach((p, i) => (p.z = i));
+  renderCollagePieceRow();
+  scheduleCollageSave();
+}
+
+async function removeCollagePiece() {
+  const doc = collage.doc;
+  const piece = selectedCollagePiece();
+  if (!piece) return;
+  // the pending save would name an id that is about to stop existing, and the
+  // server refuses a layout with a stranger in it
+  await flushCollageSave();
+  try {
+    await api(`/api/collage-pieces/${piece.id}`, { method: "DELETE" });
+  } catch (err) {
+    collageSay(`Could not remove the piece: ${err.message}`);
+    return;
+  }
+  if (collage.doc !== doc) return;
+  doc.pieces = doc.pieces.filter((p) => p !== piece);
+  doc.pieces.forEach((p, i) => (p.z = i));
+  collageBitmaps.delete(collagePieceUrl(piece));
+  const entry = collage.list.find((c) => c.id === doc.id);
+  if (entry) entry.pieces = doc.pieces.length;
+  selectCollagePiece(null);
+  renderCollageHeader();
+  collageSay(collageIdleStatus());
+  scheduleCollageSave();
+}
+
+// The export is drawCollage() at 1:1 — see the comment at the top of this
+// section for why that, and not a server render, is the whole design.
+async function exportCollage() {
+  const doc = collage.doc;
+  const btn = $("collage-export-btn");
+  if (!doc || btn.classList.contains("busy")) return;
+  btn.classList.add("busy");
+  collageSay(`Exporting ${doc.width} × ${doc.height}…`);
+  try {
+    await Promise.all(doc.pieces.map((p) => collageBitmap(p).loaded));
+    const canvas = document.createElement("canvas");
+    canvas.width = doc.width;
+    canvas.height = doc.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("the browser could not allocate a canvas this large");
+    if (!drawCollage(ctx, doc, 1, 0, 0)) {
+      throw new Error("a piece's pixels could not be loaded");
+    }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("the browser could not encode a PNG this large");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${doc.name}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    collageSay(collageIdleStatus());
+  } catch (err) {
+    collageSay(`Could not export: ${err.message}`);
+  } finally {
+    btn.classList.remove("busy");
+  }
+}
+
+// The selection row's way in. Puts the cut-out in the collage the dialog last
+// showed, creating a first one if there is none, and answers with a sentence
+// for the row's note.
+async function addToCollage(nodeId, selection) {
+  const list = await api("/api/collages");
+  let target = list.find((c) => c.id === state.collageId);
+  if (!target) {
+    target = list[list.length - 1];
+  }
+  if (!target) {
+    target = await api("/api/collages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    target.pieces = 0;
+  }
+  setCollageId(target.id);
+  await api(`/api/collages/${target.id}/pieces`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: nodeId, selection }),
+  });
+  const n = (typeof target.pieces === "number" ? target.pieces : target.pieces.length) + 1;
+  return `Added to ${target.name} · ${n} piece${n === 1 ? "" : "s"}`;
+}
+
+function initCollage() {
+  const canvas = $("collage-canvas");
+  new ResizeObserver(sizeCollageCanvas).observe(canvas);
+  canvas.oncontextmenu = (e) => e.preventDefault();
+  // Focusable, and focused on every press: the keys below are heard on the
+  // dialog, and a press on a canvas that cannot take focus leaves it on the
+  // body, outside the dialog, where Delete and the arrows would go unheard.
+  canvas.tabIndex = 0;
+
+  canvas.addEventListener("pointerdown", (e) => {
+    const doc = collage.doc;
+    if (!doc) return;
+    canvas.focus({ preventScroll: true });
+    const [bx, by] = collageCanvasPoint(e);
+    const hit = e.button === 0 ? collageHitTest(bx, by) : null;
+    canvas.setPointerCapture(e.pointerId);
+    if (!hit) {
+      if (e.button === 0) selectCollagePiece(null);
+      collage.gesture = { kind: "pan", bx, by, panX: collage.panX, panY: collage.panY };
+      return;
+    }
+    if (hit.piece.id !== collage.selected) selectCollagePiece(hit.piece.id);
+    const p = hit.piece;
+    collage.gesture = {
+      kind: hit.kind,
+      piece: p,
+      bx,
+      by,
+      x: p.x,
+      y: p.y,
+      scale: p.scale,
+      rotation: p.rotation,
+      cx: hit.frame.cx,
+      cy: hit.frame.cy,
+      moved: false,
+    };
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    const [bx, by] = collageCanvasPoint(e);
+    const g = collage.gesture;
+    if (!g) {
+      const hit = collage.doc ? collageHitTest(bx, by) : null;
+      canvas.style.cursor = !hit
+        ? "grab"
+        : hit.kind === "move" ? "move" : hit.kind === "scale" ? "nwse-resize" : "alias";
+      return;
+    }
+    const cam = collageCamera();
+    if (g.kind === "pan") {
+      collage.panX = g.panX + (bx - g.bx);
+      collage.panY = g.panY + (by - g.by);
+      markCollageDirty();
+      return;
+    }
+    const p = g.piece;
+    if (g.kind === "move") {
+      p.x = g.x + (bx - g.bx) / cam.s;
+      p.y = g.y + (by - g.by) / cam.s;
+    } else if (g.kind === "scale") {
+      const d0 = Math.hypot(g.bx - g.cx, g.by - g.cy) || 1;
+      const d1 = Math.hypot(bx - g.cx, by - g.cy);
+      p.scale = Math.max(0.01, Math.min(20, g.scale * (d1 / d0)));
+    } else if (g.kind === "rotate") {
+      const a0 = Math.atan2(g.by - g.cy, g.bx - g.cx);
+      const a1 = Math.atan2(by - g.cy, bx - g.cx);
+      let deg = g.rotation + ((a1 - a0) * 180) / Math.PI;
+      if (e.shiftKey) deg = Math.round(deg / COLLAGE_SNAP_DEG) * COLLAGE_SNAP_DEG;
+      p.rotation = ((deg % 360) + 360) % 360;
+    }
+    g.moved = true;
+    markCollageDirty();
+  });
+
+  const endGesture = () => {
+    const g = collage.gesture;
+    collage.gesture = null;
+    if (g && g.kind !== "pan" && g.moved) scheduleCollageSave();
+  };
+  canvas.addEventListener("pointerup", endGesture);
+  canvas.addEventListener("pointercancel", endGesture);
+
+  canvas.addEventListener("dblclick", (e) => {
+    const [bx, by] = collageCanvasPoint(e);
+    if (collageHitTest(bx, by)) return;
+    collage.zoom = 1;
+    collage.panX = collage.panY = 0;
+    markCollageDirty();
+  });
+
+  // Zoom about the cursor, with the wheel the preview and the map use.
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      if (!collage.doc) return;
+      e.preventDefault();
+      const [bx, by] = collageCanvasPoint(e);
+      const before = collageCamera();
+      const next = Math.min(16, Math.max(0.1, collage.zoom * wheelZoomFactor(e)));
+      // the artboard point under the cursor, which must stay there
+      const ax = (bx - before.ox) / before.s;
+      const ay = (by - before.oy) / before.s;
+      collage.zoom = next;
+      const after = collageCamera();
+      collage.panX += bx - (after.ox + ax * after.s);
+      collage.panY += by - (after.oy + ay * after.s);
+      markCollageDirty();
+    },
+    { passive: false }
+  );
+
+  $("collage-modal").addEventListener("keydown", (e) => {
+    if (e.target.matches("input, select, textarea")) return;
+    const piece = selectedCollagePiece();
+    if (!piece) return;
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      removeCollagePiece();
+      return;
+    }
+    const step = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+    if (!step) return;
+    e.preventDefault();
+    // a nudge is one screen pixel (ten with Shift), whatever the zoom
+    const cam = collageCamera();
+    const px = ((e.shiftKey ? 10 : 1) * cam.dpr) / cam.s;
+    piece.x += step[0] * px;
+    piece.y += step[1] * px;
+    scheduleCollageSave();
+  });
+
+  for (const key of ["opacity", "feather", "shadow"]) {
+    $(`collage-${key}`).addEventListener("input", (e) => {
+      const piece = selectedCollagePiece();
+      if (!piece) return;
+      piece[key] = Number(e.target.value);
+      scheduleCollageSave();
+    });
+  }
+  $("collage-flip-btn").onclick = () => {
+    const piece = selectedCollagePiece();
+    if (!piece) return;
+    piece.flip = !piece.flip;
+    scheduleCollageSave();
+  };
+  for (const where of ["front", "forward", "backward", "back"]) {
+    $(`collage-${where}-btn`).onclick = () => moveCollagePiece(where);
+  }
+  $("collage-remove-btn").onclick = removeCollagePiece;
+
+  $("collage-select").onchange = (e) => showCollage(Number(e.target.value));
+  $("collage-new-btn").onclick = newCollage;
+  $("collage-delete-btn").onclick = deleteCollage;
+  $("collage-name").onchange = (e) => {
+    const name = e.target.value.trim();
+    if (!name || name === collage.doc?.name) return renderCollageHeader();
+    patchCollage({ name });
+  };
+  $("collage-name").onkeydown = (e) => {
+    if (e.key === "Enter") e.target.blur();
+  };
+  for (const key of ["width", "height"]) {
+    $(`collage-${key}`).onchange = (e) => {
+      const value = Math.round(Number(e.target.value));
+      if (!Number.isFinite(value) || value <= 0) return renderCollageHeader();
+      patchCollage({ [key]: value });
+    };
+  }
+  $("collage-size").onchange = (e) => {
+    const [width, height] = e.target.value.split("x").map(Number);
+    if (width && height) patchCollage({ width, height });
+  };
+  $("collage-transparent").onchange = (e) => {
+    patchCollage({ background: e.target.checked ? null : $("collage-bg").value });
+  };
+  // `change`, not `input`: the picker fires `input` continuously while you
+  // drag through colours, and each would be a PATCH
+  $("collage-bg").onchange = (e) => patchCollage({ background: e.target.value });
+  $("collage-export-btn").onclick = exportCollage;
+  $("collage-btn").onclick = openCollage;
+  $("collage-close-btn").onclick = closeCollage;
+  $("collage-modal").addEventListener("close", () => {
+    if (collage.open) closeCollage();
+  });
+}
+
 // ---------- Upload / delete ----------
 
 // Uploads are serialized, not raced: each POST reads a whole JPG into server
@@ -4987,6 +5913,7 @@ async function init() {
   initCropOverlay();
   initClusterPlot();
   initEmbedMap();
+  initCollage();
   $("apply-btn").onclick = applyEffect;
   // the live-preview checkbox is gone — the feature buttons toggle the preview
   // themselves — so sweep the preference it left in browsers that ran the old

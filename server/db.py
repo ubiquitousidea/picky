@@ -16,6 +16,9 @@ RENDERS_DIR = DATA_DIR / "renders"
 # a regenerable cache that delete_render_files sweeps by node id, and a saved
 # mask is user data keyed by mask id that must never be swept.
 MASKS_DIR = DATA_DIR / "masks"
+# A collage piece's frozen cut-out, by piece id — user data like a mask, so not
+# under the regenerable `renders/`, and deleted with its row (ids are reused).
+CUTOUTS_DIR = DATA_DIR / "cutouts"
 DB_PATH = DATA_DIR / "picky.db"
 
 SCHEMA = """
@@ -78,11 +81,42 @@ CREATE TABLE IF NOT EXISTS projections (
 -- `list_images`' correlated subqueries, `image_node_ids`, `get_tree`. At 1426
 -- images over 1891 nodes it takes that list from 90 ms to 2 ms.
 CREATE INDEX IF NOT EXISTS nodes_image ON nodes(image_id);
+-- A collage is an artboard of frozen cut-outs. Pieces hold pixels, not a node
+-- reference: an edited or deleted node must not change a composition, so the
+-- cut-out is copied to `cutouts/<piece_id>.png` when the piece is added.
+CREATE TABLE IF NOT EXISTS collages (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  background TEXT,        -- "#rrggbb"; NULL = transparent
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collage_pieces (
+  id INTEGER PRIMARY KEY,
+  collage_id INTEGER NOT NULL REFERENCES collages(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  node_id INTEGER,        -- provenance only: no FK, like masks.node_id
+  width INTEGER NOT NULL, -- the frozen PNG's own pixels
+  height INTEGER NOT NULL,
+  z INTEGER NOT NULL,     -- paint order, low first
+  x REAL NOT NULL,        -- centre, in artboard pixels
+  y REAL NOT NULL,
+  scale REAL NOT NULL,    -- artboard pixels per source pixel
+  rotation REAL NOT NULL DEFAULT 0, -- degrees, clockwise
+  flip INTEGER NOT NULL DEFAULT 0,
+  opacity REAL NOT NULL DEFAULT 1,
+  feather REAL NOT NULL DEFAULT 0,  -- source pixels
+  shadow REAL NOT NULL DEFAULT 0,   -- 0 = off, 1 = strongest
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS collage_pieces_collage ON collage_pieces(collage_id);
 """
 
 
 def init() -> None:
-    for d in (DATA_DIR, ORIGINALS_DIR, RENDERS_DIR, MASKS_DIR):
+    for d in (DATA_DIR, ORIGINALS_DIR, RENDERS_DIR, MASKS_DIR, CUTOUTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -773,6 +807,7 @@ def stats() -> dict:
             "edits": one("SELECT COUNT(*) FROM nodes WHERE effect IS NOT NULL"),
             "presets": one("SELECT COUNT(*) FROM presets"),
             "masks": one("SELECT COUNT(*) FROM masks"),
+            "collages": one("SELECT COUNT(*) FROM collages"),
             "by_effect": [
                 dict(r)
                 for r in conn.execute(
@@ -782,3 +817,139 @@ def stats() -> dict:
                 )
             ],
         }
+
+
+# ---------- Collages ----------
+
+# The fields a layout save may write. Everything else on a piece — its pixels,
+# their size, where they came from — is fixed when the piece is added.
+PIECE_LAYOUT = ("z", "x", "y", "scale", "rotation", "flip", "opacity", "feather", "shadow")
+
+
+def _piece_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["flip"] = bool(d["flip"])
+    return d
+
+
+def list_collages() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.*, (SELECT COUNT(*) FROM collage_pieces p"
+            "  WHERE p.collage_id = c.id) AS pieces"
+            " FROM collages c ORDER BY c.created_at, c.id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_collage(collage_id: int) -> dict | None:
+    """The collage with its pieces in paint order — `id` breaks a z tie, so two
+    clients that wrote the same z still agree on which is on top."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM collages WHERE id = ?", (collage_id,)).fetchone()
+        if row is None:
+            return None
+        pieces = conn.execute(
+            "SELECT * FROM collage_pieces WHERE collage_id = ? ORDER BY z, id",
+            (collage_id,),
+        ).fetchall()
+    return {**dict(row), "pieces": [_piece_dict(p) for p in pieces]}
+
+
+def create_collage(name: str, width: int, height: int, background: str | None) -> dict:
+    """Raises sqlite3.IntegrityError if the name is taken."""
+    now = _now()
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO collages (name, width, height, background, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (name, width, height, background, now, now),
+        )
+        collage_id = cur.lastrowid
+    return get_collage(collage_id)
+
+
+def update_collage(collage_id: int, fields: dict) -> dict:
+    """`fields` is any of name/width/height/background, already validated.
+    Raises sqlite3.IntegrityError on a rename into a taken name."""
+    allowed = {k: v for k, v in fields.items() if k in ("name", "width", "height", "background")}
+    sets = ", ".join(f"{k} = ?" for k in allowed)
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE collages SET {sets + ', ' if sets else ''}updated_at = ? WHERE id = ?",
+            (*allowed.values(), _now(), collage_id),
+        )
+    return get_collage(collage_id)
+
+
+def delete_collage(collage_id: int) -> list[int]:
+    """Delete the collage and, by cascade, its pieces. Returns the piece ids, so
+    the caller can sweep their PNGs — read in the same transaction as the delete,
+    so a piece added concurrently cannot be orphaned on disk."""
+    with connect() as conn:
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM collage_pieces WHERE collage_id = ?", (collage_id,)
+            )
+        ]
+        conn.execute("DELETE FROM collages WHERE id = ?", (collage_id,))
+    return ids
+
+
+def get_piece(piece_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM collage_pieces WHERE id = ?", (piece_id,)).fetchone()
+    return _piece_dict(row) if row else None
+
+
+def create_piece(
+    collage_id: int, name: str, node_id: int, width: int, height: int,
+    x: float, y: float, scale: float,
+) -> dict:
+    """A new piece on top of everything already in the collage."""
+    with connect() as conn:
+        top = conn.execute(
+            "SELECT COALESCE(MAX(z), -1) FROM collage_pieces WHERE collage_id = ?",
+            (collage_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO collage_pieces"
+            " (collage_id, name, node_id, width, height, z, x, y, scale, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (collage_id, name, node_id, width, height, top + 1, x, y, scale, _now()),
+        )
+        piece_id = cur.lastrowid
+        conn.execute("UPDATE collages SET updated_at = ? WHERE id = ?", (_now(), collage_id))
+    return get_piece(piece_id)
+
+
+def delete_piece(piece_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM collage_pieces WHERE id = ?", (piece_id,))
+
+
+def save_layout(collage_id: int, pieces: list[dict]) -> None:
+    """Write every given piece's PIECE_LAYOUT fields in one transaction.
+
+    Raises KeyError naming the first id that is not a piece of this collage —
+    checked against the same connection that writes, so nothing is half-saved.
+    A piece the list leaves out is left as it is: a layout saved while another
+    tab added a piece must not move that piece.
+    """
+    with connect() as conn:
+        own = {
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM collage_pieces WHERE collage_id = ?", (collage_id,)
+            )
+        }
+        for piece in pieces:
+            if piece["id"] not in own:
+                raise KeyError(piece["id"])
+        sets = ", ".join(f"{k} = ?" for k in PIECE_LAYOUT)
+        conn.executemany(
+            f"UPDATE collage_pieces SET {sets} WHERE id = ?",
+            [(*(piece[k] for k in PIECE_LAYOUT), piece["id"]) for piece in pieces],
+        )
+        conn.execute("UPDATE collages SET updated_at = ? WHERE id = ?", (_now(), collage_id))

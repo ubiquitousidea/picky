@@ -23,6 +23,7 @@
          three lines on a phone. The title carries the full description. -->
     <div id="header-tools">
       <button id="embed-btn" title="See the whole library as a 3D cloud, with similar photos near each other">Map</button>
+      <button id="collage-btn" title="Compose cut-outs from many photos on one artboard, and export it as a PNG">Collage</button>
       <button id="film-btn" title="Show a filmstrip of the library along the bottom">Film</button>
       <button id="frame-btn" title="Crop and straighten the finished image" disabled>Frame</button>
       <button id="presets-btn" title="Save and replay a chain of effects">Presets</button>
@@ -182,6 +183,54 @@
       </div>
     </div>
     <div id="embed-status" class="hint"></div>
+  </dialog>
+
+  <!-- Full viewport like the map: the artboard is the content. Every control is
+       type="button" for the edit chips' reason — inside a <dialog> the default
+       would close it on the first press. -->
+  <dialog id="collage-modal">
+    <div id="collage-header">
+      <h2>Collage</h2>
+      <select id="collage-select" title="Which collage to edit — Add to collage puts pieces in this one"></select>
+      <input id="collage-name" type="text" autocomplete="off" spellcheck="false" title="Rename this collage">
+      <button id="collage-new-btn" type="button" title="Start a new, empty collage">New</button>
+      <button id="collage-delete-btn" type="button" title="Delete this collage and all its pieces">Delete</button>
+      <label class="collage-field" title="Artboard size in pixels — the exported PNG's size">
+        <input id="collage-width" type="number" min="64" max="16000" step="1">
+        ×
+        <input id="collage-height" type="number" min="64" max="16000" step="1">
+      </label>
+      <select id="collage-size" title="Set the artboard to a common size"></select>
+      <label class="collage-field" title="Export with no background, so the PNG is transparent where nothing is placed">
+        <input id="collage-transparent" type="checkbox">
+        Transparent
+      </label>
+      <input id="collage-bg" type="color" value="#ffffff" title="Background colour">
+      <button id="collage-export-btn" type="button" title="Download the collage at full size as a PNG">Export PNG</button>
+      <button id="collage-close-btn" type="button">Close</button>
+    </div>
+    <div id="collage-stage">
+      <canvas id="collage-canvas"></canvas>
+    </div>
+    <div id="collage-piece-row">
+      <span id="collage-piece-name"></span>
+      <label class="collage-field" title="How see-through the piece is">
+        Opacity <input id="collage-opacity" type="range" min="0" max="1" step="0.01">
+      </label>
+      <label class="collage-field" title="Soften the cut-out's edge inward, in the piece's own pixels">
+        Feather <input id="collage-feather" type="range" min="0" max="100" step="1">
+      </label>
+      <label class="collage-field" title="A soft shadow under the piece, to lift it off what is behind it">
+        Shadow <input id="collage-shadow" type="range" min="0" max="1" step="0.01">
+      </label>
+      <button id="collage-flip-btn" type="button" title="Mirror the piece left to right">Flip</button>
+      <button id="collage-front-btn" type="button" title="Bring to front">Front</button>
+      <button id="collage-forward-btn" type="button" title="Bring forward one step">Forward</button>
+      <button id="collage-backward-btn" type="button" title="Send backward one step">Backward</button>
+      <button id="collage-back-btn" type="button" title="Send to back">Back</button>
+      <button id="collage-remove-btn" type="button" title="Remove this piece from the collage">Remove</button>
+    </div>
+    <div id="collage-status" class="hint"></div>
   </dialog>
 
   <dialog id="edit-modal">

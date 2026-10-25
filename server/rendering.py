@@ -684,10 +684,10 @@ def mask_png(node_id: int, selection: dict) -> bytes:
     return buf.getvalue()
 
 
-def cutout_png(node_id: int, selection: dict) -> bytes:
-    """The selection cut out of the node's render: an RGBA PNG, transparent
-    outside the selection and trimmed to its bounding box — a layer to drop into
-    another editor.
+def cutout_image(node_id: int, selection: dict) -> Image.Image:
+    """The selection cut out of the node's render: RGBA, transparent outside the
+    selection and trimmed to its bounding box — a layer to drop into another
+    editor, or into a collage, which freezes exactly this.
 
     A viewer, so it is framed like Export (`render_output`) and like the overlay
     — the selection you see outlined is exactly what comes out. The mask is
@@ -713,9 +713,27 @@ def cutout_png(node_id: int, selection: dict) -> bytes:
     if bbox is None:
         raise ValueError("selection is empty after framing")
     rgb.putalpha(alpha)
+    return rgb.crop(bbox)
+
+
+def cutout_png(node_id: int, selection: dict) -> bytes:
+    """`cutout_image` as PNG bytes — the Export cut-out download."""
     buf = io.BytesIO()
-    rgb.crop(bbox).save(buf, format="PNG")
+    cutout_image(node_id, selection).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def cutout_path(piece_id: int) -> Path:
+    return db.CUTOUTS_DIR / f"{piece_id}.png"
+
+
+def save_cutout(piece_id: int, image: Image.Image) -> None:
+    """Freeze a collage piece's pixels. Written beside and renamed into place, so
+    a crash mid-write cannot leave a truncated PNG that the row then vouches for."""
+    path = cutout_path(piece_id)
+    tmp = path.with_suffix(".png.tmp")
+    image.save(tmp, format="PNG")
+    tmp.replace(path)
 
 
 HIST_SAMPLE = 512
@@ -771,6 +789,8 @@ def storage_stats() -> dict:
         "database": _totals(db.DATA_DIR.glob("picky.db*")),
         "originals": _totals(db.ORIGINALS_DIR.iterdir()),
         "masks": _totals(db.MASKS_DIR.iterdir()),
+        # collage pieces: frozen pixels, user data for a mask's reason
+        "cutouts": _totals(db.CUTOUTS_DIR.iterdir()),
         # ONNX weights (MobileSAM, CLIP, depth, CLIPSeg) — neither user data nor
         # a cache: they re-download rather than rebuild. Reported because at the
         # better part of a gigabyte, once every feature that has a model behind
