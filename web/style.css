@@ -131,8 +131,8 @@ h2 {
 #cluster-btn:hover { border-color: var(--rb-violet); color: var(--rb-violet); }
 #export-btn:hover { border-color: var(--rb-green); color: var(--rb-green); }
 #delete-btn:hover { border-color: var(--rb-red); color: var(--rb-red); }
-/* the filmstrip toggle is the one header button with a state to show */
-#film-btn.on { border-color: var(--rb-teal); color: var(--rb-teal); background: var(--panel-2); }
+/* the filmstrip and Measure toggles are the header buttons with a state to show */
+#film-btn.on, #measure-btn.on { border-color: var(--rb-teal); color: var(--rb-teal); background: var(--panel-2); }
 .upload-btn {
   background: var(--panel-2);
   border: 1px solid var(--rb-blue);
@@ -234,10 +234,11 @@ h2 {
   pointer-events: none;
 }
 #preview-wrap.picking #preview { cursor: crosshair; }
-/* The crop frame, resolving to the same box as the fitted img by the same
-   intrinsic-dimension trick as #mask-overlay — but interactive, since the
-   frame is dragged on it. touch-action: none so a drag is a drag, not a scroll. */
-#crop-overlay {
+/* The crop frame and the measuring line, resolving to the same box as the
+   fitted img by the same intrinsic-dimension trick as #mask-overlay — but
+   interactive, since both are dragged on. touch-action: none so a drag is a
+   drag, not a scroll. */
+#crop-overlay, #measure-overlay {
   position: absolute;
   inset: 0;
   margin: auto;
@@ -247,7 +248,26 @@ h2 {
   touch-action: none;
   cursor: crosshair;
 }
-#crop-overlay[hidden] { display: none; }
+#crop-overlay[hidden], #measure-overlay[hidden] { display: none; }
+/* The ruler's readout. Pinned to the panel rather than the zoomed wrapper, so it
+   stays legible and in place at any zoom; selectable, so a number can be copied. */
+#measure-hud {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  z-index: 1;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  color: var(--text);
+  background: rgba(20, 22, 27, 0.8);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  white-space: pre;
+  user-select: text;
+}
+#measure-hud[hidden] { display: none; }
 #preview-wrap.cropping #preview { cursor: crosshair; }
 #drop-hint { color: var(--muted); font-size: 1.1rem; }
 #zoom-hud {
