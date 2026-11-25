@@ -26,6 +26,7 @@
       <button id="collage-btn" title="Compose cut-outs from many photos on one artboard, and export it as a PNG">Collage</button>
       <button id="film-btn" title="Show a filmstrip of the library along the bottom">Film</button>
       <button id="frame-btn" title="Crop and straighten the finished image" disabled>Frame</button>
+      <button id="measure-btn" title="Drag a line on the image to read its angle and pixel coordinates" disabled>Measure</button>
       <button id="presets-btn" title="Save and replay a chain of effects">Presets</button>
       <button id="cluster-btn" hidden title="See this posterize node's colors as a 3D plot">RGB</button>
       <button id="stats-btn" title="Images, effects, and disk usage">Stats</button>
@@ -40,7 +41,11 @@
       <img id="preview" alt="preview" draggable="false">
       <img id="mask-overlay" hidden alt="" draggable="false">
       <svg id="crop-overlay" hidden></svg>
+      <svg id="measure-overlay" hidden></svg>
     </div>
+    <!-- Outside #preview-wrap so zooming the image does not scale the text.
+         Filled by paintMeasure(); see the Measure section of app.js. -->
+    <div id="measure-hud" hidden></div>
     <div id="zoom-hud" hidden>scroll to zoom · drag to pan · double-click to reset</div>
   </main>
 

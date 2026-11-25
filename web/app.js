@@ -91,6 +91,9 @@ async function selectImage(imageId, nodeId = null) {
   if (imageId !== state.imageId) {
     resetZoom();
     clearOverlayCache(); // overlays are image-scoped, and so are their mask ids
+    // a line is in one image's pixels; across nodes of it the size is shared,
+    // which is what lets the ruler stay up while you step through the tree
+    measure.line = null;
   }
   state.imageId = imageId;
   localStorage.setItem("picky:lastImage", imageId ?? "");
@@ -139,6 +142,8 @@ function renderSelection() {
   $("export-btn").hidden = !hasImage;
   $("apply-btn").disabled = !hasImage;
   $("frame-btn").disabled = !hasImage;
+  $("measure-btn").disabled = !hasImage;
+  if (!hasImage) setMeasure(false);
   if (hasImage) {
     $("preview").src = `/api/nodes/${state.nodeId}/render?t=${Date.now()}`;
     $("export-btn").href = `/api/nodes/${state.nodeId}/render?download=1`;
@@ -1232,6 +1237,7 @@ function buildDepthPick(container, p, sourceNodeId, allowPick) {
   btn.onclick = () => {
     if (selPicker.armed?.owner === btn) return disarmPick(); // a second press cancels
     disarmPick(); // and a first press takes the slot off whoever else held it
+    setMeasure(false); // the ruler's overlay would swallow the click
     selPicker.armed = {
       owner: btn,
       pick: async (x, y) => {
@@ -1706,11 +1712,16 @@ function drawCropOverlay(rect, line) {
       fill: "#fff", stroke: "#000", "stroke-opacity": 0.6, "stroke-width": unit,
     }));
   }
-  if (!line) return;
-  // The straighten line, drawn last so it sits over the dimming. A white core in
-  // a dark casing, like the mask outline: it has to read on any photograph, and
-  // it is dragged across the whole frame. End caps mark the two points, since a
-  // line laid along a horizon is otherwise hard to see against it.
+  // the straighten line, drawn last so it sits over the dimming
+  if (line) drawLine(svg, line, iw, ih, unit);
+}
+
+// A line in an overlay's viewBox: the straighten line and the measuring line.
+// A white core in a dark casing, like the mask outline: it has to read on any
+// photograph, and it is dragged across the whole frame. End caps mark the two
+// points, since a line laid along a horizon is otherwise hard to see against it.
+// `line` is in fractions of the image; `unit` is viewBox units per screen pixel.
+function drawLine(svg, line, iw, ih, unit) {
   const [x0, y0, x1, y1] = [line.x0 * iw, line.y0 * ih, line.x1 * iw, line.y1 * ih];
   const d = `M ${x0} ${y0} L ${x1} ${y1}`;
   for (const [stroke, width] of [["#000", 4 * unit], ["#fff", 1.5 * unit]]) {
@@ -1864,9 +1875,11 @@ function initCropOverlay() {
   // deliberately is not one has to listen for it — otherwise Frame would be the
   // single panel in the app that Esc could not dismiss. The `:modal` guard is
   // for the case where something else is up: that dialog owns the key.
+  // Measure has no dialog at all, so it rides the same listener and guard.
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape" || !$("crop-modal").open) return;
-    if (!document.querySelector("dialog:modal")) $("crop-modal").close();
+    if (e.key !== "Escape" || document.querySelector("dialog:modal")) return;
+    if ($("crop-modal").open) $("crop-modal").close();
+    else if (measure.active) setMeasure(false);
   });
   $("crop-save-btn").onclick = saveCrop;
   $("crop-reset-btn").onclick = () => {
@@ -1952,6 +1965,7 @@ function renderCropControls() {
 
 function enterCropMode() {
   if (state.imageId === null || crop.active) return;
+  setMeasure(false); // Frame takes the pointer over the image (see setMeasure)
   // crop mode owns the preview image, so the effect preview has to let go of it
   exitPreview(false);
   clearMaskOverlay(); // the framed outline means nothing over an unframed proxy
@@ -2040,6 +2054,181 @@ async function saveCrop() {
   // the refreshed image rows or the tile keeps the old framing
   await refreshGallery();
   exitCropMode(true);
+}
+
+// ---------- Measure: a ruler over the preview ----------
+//
+// Drag a line on the image and read off its endpoints and its angles, in the
+// pixels of whatever the preview is showing. That is always the *framed* output
+// (`/render` and the effect preview both frame on the way out), which every node
+// of an image shares in size, so a line outlives a node change or a live preview
+// and its numbers are the exported JPG's. It is a view, never state: nothing is
+// sent to the server and nothing persists.
+//
+// Measure, Frame and the click picker each want the pointer over the image, so
+// only one holds it at a time. `setMeasure()` is the single write path, and the
+// other two turn it off when they arm (enterCropMode, both picker arm sites).
+
+// `line` is in fractions of the displayed image, like Straighten's, so it
+// survives the natural-size change of a preview swapping in. `drag` is which
+// endpoint the pointer holds, or null.
+const measure = { active: false, line: null, drag: null };
+
+function setMeasure(on) {
+  if (on && state.imageId === null) on = false;
+  if (on === measure.active) return;
+  measure.active = on;
+  if (on) {
+    // the other two tenants of the pointer let go first
+    // directly, not via the dialog's `close`: that event is queued, which would
+    // leave crop mode armed under the ruler for a task
+    exitCropMode(true);
+    disarmPick();
+  } else {
+    // a line from a previous visit could predate a re-frame, which moves every
+    // pixel under it — so off means gone, rather than a stale ruler on return
+    measure.line = null;
+    measure.drag = null;
+  }
+  $("measure-btn").classList.toggle("on", on);
+  $("measure-overlay").toggleAttribute("hidden", !on); // SVG: see showCropOverlay
+  $("measure-hud").hidden = !on;
+  paintMeasure();
+}
+
+// Endpoint pixel indices, deltas, length and the two angles, all in the image's
+// natural pixels — never fractions, whose two axes have different denominators
+// (the aspect-ratio skew `lineAngle` documents), and never display pixels, which
+// would read differently at every zoom.
+//
+// Horizontal is signed in (-90, 90], + when the line rises to the right (counter-
+// clockwise, the maths convention with screen y flipped). Vertical is signed the
+// same way from the other axis, + when the top end leans right (clockwise), so
+// |horizontal| + |vertical| is always exactly 90 and the two can never disagree.
+function measureLine(line, iw, ih) {
+  const px = (f, n) => Math.min(n - 1, Math.max(0, Math.floor(f * n)));
+  const a = [px(line.x0, iw), px(line.y0, ih)];
+  const b = [px(line.x1, iw), px(line.y1, ih)];
+  const dx = (line.x1 - line.x0) * iw;
+  const dy = (line.y1 - line.y0) * ih;
+  // a line has no direction: orient it rightward (straight up when vertical)
+  let ux = dx, uy = -dy;
+  if (ux < 0 || (ux === 0 && uy < 0)) { ux = -ux; uy = -uy; }
+  const horiz = ux === 0 && uy === 0 ? 0 : (Math.atan2(uy, ux) * 180) / Math.PI;
+  const vert = horiz >= 0 ? 90 - horiz : -(90 + horiz);
+  return { a, b, dx: b[0] - a[0], dy: b[1] - a[1], len: Math.hypot(dx, dy), horiz, vert };
+}
+
+function paintMeasure() {
+  const svg = $("measure-overlay");
+  const hud = $("measure-hud");
+  svg.replaceChildren();
+  if (!measure.active) return;
+  const img = $("preview");
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  if (!iw || !ih) return; // the load listener comes back here
+  // intrinsic dimensions, so the SVG resolves to the fitted img's box — the
+  // same trick, and the same reasoning, as drawCropOverlay
+  svg.setAttribute("width", iw);
+  svg.setAttribute("height", ih);
+  svg.setAttribute("viewBox", `0 0 ${iw} ${ih}`);
+  // painted but invisible, so the first drag has something to land on (see
+  // drawCropOverlay: SVG hit testing only finds painted geometry)
+  svg.appendChild(svgEl("rect", {
+    x: 0, y: 0, width: iw, height: ih, fill: "#000", "fill-opacity": 0,
+  }));
+  if (!measure.line) {
+    hud.textContent = `drag on the image to measure · ${iw}×${ih} px`;
+    return;
+  }
+  const box = svg.getBoundingClientRect();
+  drawLine(svg, measure.line, iw, ih, box.width ? iw / box.width : 1);
+  const m = measureLine(measure.line, iw, ih);
+  const deg = (v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}°`;
+  hud.textContent = [
+    `A (${m.a[0]}, ${m.a[1]})  →  B (${m.b[0]}, ${m.b[1]})`,
+    `Δx ${m.dx}  Δy ${m.dy}  length ${m.len.toFixed(1)} px`,
+    `to horizontal  ${deg(m.horiz)}   (+ rises to the right)`,
+    `to vertical    ${deg(m.vert)}   (+ top leans right)`,
+  ].join("\n");
+}
+
+// Which endpoint of the line is under the pointer, if either. In fractions with
+// cropAtEvent's per-axis slop, the same units the crop frame is hit-tested in.
+function measureEndAt(pos) {
+  const l = measure.line;
+  if (!l) return null;
+  const near = (x, y) =>
+    Math.abs(pos.x - x) <= pos.slopX && Math.abs(pos.y - y) <= pos.slopY;
+  return near(l.x1, l.y1) ? 1 : near(l.x0, l.y0) ? 0 : null;
+}
+
+function initMeasure() {
+  const svg = $("measure-overlay");
+  // clamped, unlike Straighten's free end: a coordinate off the image names no
+  // pixel, and the line drawn is exactly the line measured either way
+  const at = (e) => {
+    const pos = cropAtEvent(e);
+    pos.x = Math.min(Math.max(pos.x, 0), 1);
+    pos.y = Math.min(Math.max(pos.y, 0), 1);
+    return pos;
+  };
+  // a fresh drag remembers the line it replaced, restored if it was only a tap;
+  // `undefined` when the drag is adjusting an endpoint instead
+  let prev;
+
+  svg.addEventListener("pointerdown", (e) => {
+    if (!measure.active || e.button !== 0) return;
+    e.preventDefault(); // or the wrapper's pan handler takes the drag
+    e.stopPropagation();
+    const pos = at(e);
+    const end = measureEndAt(cropAtEvent(e));
+    prev = undefined;
+    if (end !== null) {
+      measure.drag = end; // grab an endpoint and adjust
+    } else {
+      prev = measure.line;
+      measure.line = { x0: pos.x, y0: pos.y, x1: pos.x, y1: pos.y };
+      measure.drag = 1;
+    }
+    svg.setPointerCapture(e.pointerId);
+    paintMeasure();
+  });
+
+  svg.addEventListener("pointermove", (e) => {
+    if (!measure.active) return;
+    if (measure.drag === null) {
+      svg.style.cursor = measureEndAt(cropAtEvent(e)) !== null ? "move" : "crosshair";
+      return;
+    }
+    const pos = at(e);
+    const k = measure.drag;
+    measure.line = { ...measure.line, [`x${k}`]: pos.x, [`y${k}`]: pos.y };
+    paintMeasure(); // no render behind it, so the readout tracks the pointer
+  });
+
+  const endDrag = (e) => {
+    if (measure.drag === null) return;
+    measure.drag = null;
+    svg.releasePointerCapture(e.pointerId);
+    // a tap is not a line: put back whatever it replaced, so a stray click
+    // does not wipe the measurement you were reading
+    const l = measure.line;
+    const r = $("preview").getBoundingClientRect();
+    if (prev !== undefined && l &&
+        Math.hypot((l.x1 - l.x0) * r.width, (l.y1 - l.y0) * r.height) < CROP.minLinePx) {
+      measure.line = prev;
+    }
+    prev = undefined;
+    paintMeasure();
+  };
+  svg.addEventListener("pointerup", endDrag);
+  svg.addEventListener("pointercancel", endDrag);
+
+  // a preview or render swapping in can change the natural size
+  $("preview").addEventListener("load", () => measure.active && paintMeasure());
+  $("measure-btn").onclick = () => setMeasure(!measure.active);
 }
 
 // ---------- Click-to-segment selection ----------
@@ -2675,6 +2864,7 @@ function appendSelectionControls(
         return;
       }
       disarmPick();
+      setMeasure(false); // the ruler's overlay would swallow the click
       // single-shot: the click handler in initZoom does not disarm, so the
       // closure does it before committing
       selPicker.armed = {
@@ -5911,6 +6101,7 @@ async function init() {
 
   initZoom();
   initCropOverlay();
+  initMeasure();
   initClusterPlot();
   initEmbedMap();
   initCollage();

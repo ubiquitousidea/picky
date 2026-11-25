@@ -622,6 +622,15 @@ one place silently breaks another.
   key. Opening the dialog and entering crop mode are one thing: `exitCropMode()`
   closes it, `close` re-enters `exitCropMode()`, and the `crop.active` guard is
   what makes that loop terminate.
+- **Measure is the third thing that wants the pointer over the preview**, with
+  Frame and the click picker, and only one holds it at a time: `setMeasure()` is
+  the single write path, turning it on exits crop mode and disarms the picker,
+  and `enterCropMode()` and both picker arm sites turn it off. The ruler is a
+  view — nothing reaches the server. Its readout is in the preview's *natural*
+  pixels, which are the framed output's (`/render` and the effect preview both
+  frame), so the numbers are the exported JPG's and a line survives a node
+  change; it is cleared on an image change and whenever Measure turns off, since
+  a re-frame moves every pixel under it.
 - **A `requestAnimationFrame` loop ends itself**; it does not trust callers to
   stop it. The RGB cluster plot's `tick` returns when `#cluster-modal` is closed,
   so "it only runs while you are looking at it" holds however the dialog was
